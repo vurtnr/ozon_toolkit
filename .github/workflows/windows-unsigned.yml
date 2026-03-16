@@ -30,6 +30,10 @@ jobs:
       - name: Install frontend dependencies
         run: bun install --frozen-lockfile
 
+      - name: Install sidecar dependencies
+        working-directory: src-sidecar
+        run: bun install --frozen-lockfile
+
       - name: Build Windows sidecar
         shell: bash
         run: bun run src-sidecar/scripts/build-sidecar.ts --target bun-windows-x64

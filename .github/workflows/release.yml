@@ -31,6 +31,10 @@ jobs:
       - name: Install frontend dependencies
         run: bun install
 
+      - name: Install sidecar dependencies
+        working-directory: src-sidecar
+        run: bun install
+
       - name: Build sidecar binaries for runner platform
         shell: bash
         run: bash src-sidecar/scripts/build-all-targets.sh
