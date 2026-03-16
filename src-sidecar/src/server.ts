@@ -33,6 +33,8 @@ type SessionStateHandlerDependencies = {
   ensureBrowserAndPageAlive: () => Promise<Page>;
   collectSessionSnapshot: (page: Page) => Promise<SessionSnapshot>;
   classifySessionState: (snapshot: SessionSnapshot) => SessionState;
+  classifySessionStates: (snapshots: SessionSnapshot[]) => SessionState;
+  listCandidatePages: (primaryPage: Page) => Promise<Page[]>;
   buildErrorPayload: (error: unknown) => SidecarErrorPayload;
 };
 
@@ -57,7 +59,7 @@ const LOGIN_URL_HINTS = [
   "passport.alibaba.com",
 ];
 const LOGIN_TEXT_HINTS = ["请登录", "免费注册", "会员登录", "登录后可", "登录后"];
-const LOGGED_IN_TEXT_HINTS = ["我的阿里", "我的1688", "买家工作台", "采购车", "进货单", "消息"];
+const LOGGED_IN_TEXT_HINTS = ["我的阿里", "我的1688", "买家工作台"];
 const ANTI_BOT_URL_HINTS = ["sec.", "punish", "captcha", "verify"];
 const ANTI_BOT_TEXT_HINTS = [
   "请完成验证",
@@ -202,6 +204,21 @@ export function classifySessionState(snapshot: SessionSnapshot): SessionState {
   return "ready";
 }
 
+export function classifySessionStates(snapshots: SessionSnapshot[]): SessionState {
+  if (snapshots.length === 0) {
+    return "login_required";
+  }
+
+  const states = snapshots.map((snapshot) => classifySessionState(snapshot));
+  if (states.includes("anti_bot_challenge")) {
+    return "anti_bot_challenge";
+  }
+  if (states.includes("ready")) {
+    return "ready";
+  }
+  return "login_required";
+}
+
 async function collectSessionSnapshot(page: Page): Promise<SessionSnapshot> {
   return page.evaluate(() => ({
     url: window.location.href,
@@ -229,6 +246,11 @@ async function collectSessionSnapshot(page: Page): Promise<SessionSnapshot> {
       ].some((selector) => document.querySelector(selector) !== null) ||
       Array.from(document.querySelectorAll<HTMLElement>("button, a, div, span"))
         .some((element) => {
+          const style = window.getComputedStyle(element);
+          const rect = element.getBoundingClientRect();
+          if (style.display === "none" || style.visibility === "hidden" || rect.width <= 0 || rect.height <= 0) {
+            return false;
+          }
           const text = (element.innerText || element.textContent || "").replace(/\s+/g, "");
           return text === "登录" || text === "请登录" || text === "免费注册";
         }),
@@ -236,21 +258,32 @@ async function collectSessionSnapshot(page: Page): Promise<SessionSnapshot> {
       [
         'a[href*="work.1688.com"]',
         'a[href*="member.1688.com/member"]',
-        'a[href*="message.1688.com"]',
-        'a[href*="trade.1688.com"]',
       ].some((selector) => document.querySelector(selector) !== null) ||
       Array.from(document.querySelectorAll<HTMLElement>("button, a, div, span"))
         .some((element) => {
+          const style = window.getComputedStyle(element);
+          const rect = element.getBoundingClientRect();
+          if (style.display === "none" || style.visibility === "hidden" || rect.width <= 0 || rect.height <= 0) {
+            return false;
+          }
           const text = (element.innerText || element.textContent || "").replace(/\s+/g, "");
           return (
             text.includes("我的阿里") ||
             text.includes("我的1688") ||
-            text.includes("买家工作台") ||
-            text.includes("采购车") ||
-            text.includes("进货单")
+            text.includes("买家工作台")
           );
         }),
   }));
+}
+
+async function listCandidatePages(primaryPage: Page): Promise<Page[]> {
+  const pages = new Set<Page>([primaryPage]);
+  if (globalBrowser && globalBrowser.isConnected()) {
+    for (const page of await globalBrowser.pages().catch(() => [])) {
+      pages.add(page);
+    }
+  }
+  return [...pages].filter((page) => !page.isClosed());
 }
 
 async function ensure1688SessionReady(page: Page): Promise<void> {
@@ -476,15 +509,33 @@ export function createSessionStateHandler(
     ensureBrowserAndPageAlive,
     collectSessionSnapshot,
     classifySessionState,
+    classifySessionStates,
+    listCandidatePages,
     buildErrorPayload,
   },
 ) {
   return async (_req: Request, res: Response) => {
     try {
       const activeHomePage = await dependencies.ensureBrowserAndPageAlive();
-      const status = dependencies.classifySessionState(
-        await dependencies.collectSessionSnapshot(activeHomePage),
+      const pages = await dependencies.listCandidatePages(activeHomePage);
+      const snapshots = await Promise.all(
+        pages.map(async (page) => {
+          try {
+            return await dependencies.collectSessionSnapshot(page);
+          } catch {
+            return null;
+          }
+        }),
       );
+      const availableSnapshots = snapshots.filter(
+        (snapshot): snapshot is SessionSnapshot => snapshot !== null,
+      );
+      const status =
+        availableSnapshots.length > 0
+          ? dependencies.classifySessionStates(availableSnapshots)
+          : dependencies.classifySessionState(
+              await dependencies.collectSessionSnapshot(activeHomePage),
+            );
       return res.json({ success: true, status });
     } catch (error) {
       const payload = dependencies.buildErrorPayload(error);

@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
+  classifySessionStates,
   classifySessionState,
   shutdownRuntimeResources,
   type SessionSnapshot,
@@ -82,5 +83,62 @@ describe("classifySessionState", () => {
     };
 
     expect(classifySessionState(snapshot)).toBe("ready");
+  });
+
+  test("does not treat generic header words like cart or messages as authenticated state", () => {
+    const snapshot: SessionSnapshot = {
+      url: "https://www.1688.com/",
+      visibleText: "采购车 进货单 消息",
+      links: [],
+      hasAntiBotChallenge: false,
+      hasLoginEntry: false,
+      hasLoggedInEntry: false,
+    };
+
+    expect(classifySessionState(snapshot)).toBe("login_required");
+  });
+});
+
+describe("classifySessionStates", () => {
+  test("keeps login_required while a login page is still open and no authenticated page is present", () => {
+    const home: SessionSnapshot = {
+      url: "https://www.1688.com/",
+      visibleText: "欢迎来到1688",
+      links: [],
+      hasAntiBotChallenge: false,
+      hasLoginEntry: false,
+      hasLoggedInEntry: false,
+    };
+    const loginPopup: SessionSnapshot = {
+      url: "https://login.1688.com/member/signin.htm",
+      visibleText: "请登录 免费注册",
+      links: [],
+      hasAntiBotChallenge: false,
+      hasLoginEntry: true,
+      hasLoggedInEntry: false,
+    };
+
+    expect(classifySessionStates([home, loginPopup])).toBe("login_required");
+  });
+
+  test("returns ready once any open page exposes a strong authenticated marker", () => {
+    const home: SessionSnapshot = {
+      url: "https://www.1688.com/",
+      visibleText: "欢迎来到1688",
+      links: [],
+      hasAntiBotChallenge: false,
+      hasLoginEntry: false,
+      hasLoggedInEntry: false,
+    };
+    const workbench: SessionSnapshot = {
+      url: "https://work.1688.com/home/page/index.htm",
+      visibleText: "买家工作台",
+      links: [],
+      hasAntiBotChallenge: false,
+      hasLoginEntry: false,
+      hasLoggedInEntry: true,
+    };
+
+    expect(classifySessionStates([home, workbench])).toBe("ready");
   });
 });
