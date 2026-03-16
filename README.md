@@ -58,7 +58,9 @@ Use the `Windows Unsigned Build` GitHub Actions workflow when you need an intern
 
 - The workflow runs automatically on `main` pushes and can also be triggered manually from GitHub Actions.
 - Download the `desktop-app-windows-unsigned-<sha>` artifact after the run finishes.
-- The artifact contains the Windows bundle output under `src-tauri/target/x86_64-pc-windows-msvc/release/bundle/`.
+- The artifact contains only ready-to-share installers, not the whole Tauri `bundle/` directory.
+- Output files are normalized as `desktop-app-windows-x64-unsigned-<short-sha>.msi` and `desktop-app-windows-x64-unsigned-<short-sha>.exe` when present.
+- `SHA256SUMS.txt` is included for quick integrity checks during internal distribution.
 - SmartScreen and `Unknown publisher` warnings are expected because the installer is unsigned.
 - `src-tauri/binaries/engine-*` is built in CI and does not need to be committed.
 

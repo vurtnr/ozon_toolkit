@@ -12,6 +12,8 @@ permissions:
 jobs:
   build-windows-unsigned:
     runs-on: windows-latest
+    env:
+      DIST_DIR: dist/windows-unsigned
 
     steps:
       - name: Checkout
@@ -35,15 +37,54 @@ jobs:
       - name: Build unsigned Windows bundle
         run: bunx tauri build --ci --target x86_64-pc-windows-msvc --no-sign
 
-      - name: Collect bundle file list
-        shell: bash
+      - name: Stage distributable installers
+        shell: pwsh
         run: |
-          echo "Built bundle files:" >> "$GITHUB_STEP_SUMMARY"
-          find src-tauri/target/x86_64-pc-windows-msvc/release/bundle -type f | sort >> "$GITHUB_STEP_SUMMARY"
+          $bundleRoot = "src-tauri/target/x86_64-pc-windows-msvc/release/bundle"
+          $distDir = $env:DIST_DIR
+          $shortSha = $env:GITHUB_SHA.Substring(0, 7)
+          $stagedFiles = @()
 
-      - name: Upload Windows unsigned bundle
+          New-Item -ItemType Directory -Force -Path $distDir | Out-Null
+
+          $msi = Get-ChildItem -Path (Join-Path $bundleRoot "msi") -Recurse -File -Filter *.msi -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($msi) {
+            $dest = Join-Path $distDir "desktop-app-windows-x64-unsigned-$shortSha.msi"
+            Copy-Item $msi.FullName $dest
+            $stagedFiles += $dest
+          }
+
+          $exe = Get-ChildItem -Path (Join-Path $bundleRoot "nsis") -Recurse -File -Filter *.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($exe) {
+            $dest = Join-Path $distDir "desktop-app-windows-x64-unsigned-$shortSha.exe"
+            Copy-Item $exe.FullName $dest
+            $stagedFiles += $dest
+          }
+
+          if ($stagedFiles.Count -eq 0) {
+            throw "No MSI or EXE installers found under $bundleRoot"
+          }
+
+          $checksums = foreach ($file in $stagedFiles) {
+            $hash = (Get-FileHash -Path $file -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$hash *$(Split-Path $file -Leaf)"
+          }
+          Set-Content -Path (Join-Path $distDir "SHA256SUMS.txt") -Value $checksums
+
+      - name: Summarize packaged installers
+        shell: pwsh
+        run: |
+          "Packaged files:" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          Get-ChildItem -Path $env:DIST_DIR -File |
+            Sort-Object Name |
+            ForEach-Object {
+              "- $($_.Name) ($([Math]::Round($_.Length / 1MB, 2)) MB)" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+            }
+
+      - name: Upload Windows unsigned installers
         uses: actions/upload-artifact@v4
         with:
           name: desktop-app-windows-unsigned-${{ github.sha }}
-          path: src-tauri/target/x86_64-pc-windows-msvc/release/bundle/**
+          path: ${{ env.DIST_DIR }}/*
           if-no-files-found: error
+          retention-days: 14
