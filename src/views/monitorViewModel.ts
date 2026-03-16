@@ -1,0 +1,124 @@
+import type {
+  LogEventPayload,
+  MonitorRow,
+  ProgressEventPayload,
+} from "../types/events";
+
+export type StageTone = "info" | "ready" | "warn" | "danger";
+export type StageEmphasis = "live" | "terminal";
+
+export interface StagePresentation {
+  label: string;
+  tone: StageTone;
+  emphasis: StageEmphasis;
+}
+
+export interface MonitorBoardSummary {
+  progressText: string;
+  activeRow: MonitorRow | null;
+  completedCount: number;
+  failedCount: number;
+  pendingCount: number;
+  recentLogs: LogEventPayload[];
+}
+
+const STAGE_PRESENTATIONS: Record<string, StagePresentation> = {
+  queued: { label: "排队中", tone: "info", emphasis: "live" },
+  planning_search_image: { label: "生成搜索图", tone: "info", emphasis: "live" },
+  searching_1688_primary: {
+    label: "1688 首轮搜索",
+    tone: "info",
+    emphasis: "live",
+  },
+  searching_1688_fallback: {
+    label: "1688 兜底搜索",
+    tone: "warn",
+    emphasis: "live",
+  },
+  candidates_recalled: {
+    label: "候选已召回",
+    tone: "info",
+    emphasis: "live",
+  },
+  screening_candidates: {
+    label: "AI 初筛中",
+    tone: "info",
+    emphasis: "live",
+  },
+  final_review: { label: "严格终审", tone: "warn", emphasis: "live" },
+  writing_diagnostics: {
+    label: "写入诊断",
+    tone: "warn",
+    emphasis: "live",
+  },
+  completed: { label: "处理完成", tone: "ready", emphasis: "terminal" },
+  failed: { label: "执行失败", tone: "danger", emphasis: "terminal" },
+};
+
+export function hasLockedResult(row: Pick<MonitorRow, "itemUrl">): boolean {
+  return Boolean(row.itemUrl);
+}
+
+export function getStagePresentation(
+  row: Pick<MonitorRow, "stage" | "status" | "isFinal" | "itemUrl">,
+): StagePresentation {
+  if (row.stage === "failed") {
+    return STAGE_PRESENTATIONS.failed;
+  }
+
+  if (row.isFinal && hasLockedResult(row)) {
+    return {
+      label: "结果已锁定",
+      tone: "ready",
+      emphasis: "terminal",
+    };
+  }
+
+  if (row.isFinal) {
+    return {
+      label: "未锁定结果",
+      tone: row.status.includes("失败") ? "danger" : "warn",
+      emphasis: "terminal",
+    };
+  }
+
+  return (
+    STAGE_PRESENTATIONS[row.stage] || {
+      label: "处理中",
+      tone: "info",
+      emphasis: "live",
+    }
+  );
+}
+
+export function summarizeMonitorBoard(
+  rows: MonitorRow[],
+  logs: LogEventPayload[],
+  progress: ProgressEventPayload,
+): MonitorBoardSummary {
+  const lastRow = rows.length > 0 ? rows[rows.length - 1] : null;
+  const activeRow = rows.find((row) => !row.isFinal) || lastRow;
+  const completedCount = rows.filter(
+    (row) => row.isFinal && hasLockedResult(row),
+  ).length;
+  const failedCount = rows.filter(
+    (row) => row.isFinal && !hasLockedResult(row),
+  ).length;
+  const pendingCount = rows.filter((row) => !row.isFinal).length;
+
+  return {
+    progressText: `${progress.processed} / ${progress.total}`,
+    activeRow,
+    completedCount,
+    failedCount,
+    pendingCount,
+    recentLogs: logs.slice(-5).reverse(),
+  };
+}
+
+export function getLogTone(level: string): StageTone {
+  if (level === "error") return "danger";
+  if (level === "warn") return "warn";
+  if (level === "info") return "info";
+  return "ready";
+}

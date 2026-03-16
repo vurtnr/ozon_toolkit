@@ -1,0 +1,49 @@
+name: Windows Unsigned Build
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows-unsigned:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Install frontend dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Build Windows sidecar
+        shell: bash
+        run: bun run src-sidecar/scripts/build-sidecar.ts --target bun-windows-x64
+
+      - name: Build unsigned Windows bundle
+        run: bunx tauri build --ci --target x86_64-pc-windows-msvc --no-sign
+
+      - name: Collect bundle file list
+        shell: bash
+        run: |
+          echo "Built bundle files:" >> "$GITHUB_STEP_SUMMARY"
+          find src-tauri/target/x86_64-pc-windows-msvc/release/bundle -type f | sort >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload Windows unsigned bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-app-windows-unsigned-${{ github.sha }}
+          path: src-tauri/target/x86_64-pc-windows-msvc/release/bundle/**
+          if-no-files-found: error

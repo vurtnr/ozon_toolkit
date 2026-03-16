@@ -1,0 +1,16 @@
+{
+  "name": "desktop-app-sidecar",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "express": "^5.2.1",
+    "puppeteer": "^24.37.5"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.6"
+  },
+  "scripts": {
+    "test": "bun test",
+    "build:sidecar": "bun run scripts/build-sidecar.ts --all"
+  }
+}

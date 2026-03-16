@@ -1,0 +1,201 @@
+import { describe, expect, test } from "bun:test";
+import {
+  executeResultPageRecall,
+  shouldStopResultScroll,
+  shouldNavigateTo1688Home,
+  waitForSearchResults,
+  openCropDialogAndWaitForCanvas,
+  type SearchResult,
+} from "./1688_engine";
+
+type CropDialogPageLike = {
+  waitForFunction: (fn: unknown, options: { timeout: number }) => Promise<void>;
+  evaluate: (fn: unknown) => Promise<void>;
+  waitForSelector: (
+    selector: string,
+    options: { visible: boolean; timeout: number },
+  ) => Promise<void>;
+};
+
+type ResultReadyPageLike = {
+  waitForSelector: (
+    selector: string,
+    options: { timeout: number },
+  ) => Promise<unknown>;
+  waitForNetworkIdle: (options: { timeout: number }) => Promise<void>;
+};
+
+const sampleResults: SearchResult[] = [
+  {
+    title: "sample",
+    price: "¥12.34",
+    sales: "",
+    moq: "",
+    shopName: "shop",
+    itemUrl: "https://detail.1688.com/offer/1.html",
+    imageUrl: "https://img.1688.com/1.jpg",
+    isAd: false,
+    cosScore: 0.88,
+  },
+];
+
+describe("executeResultPageRecall", () => {
+  test("keeps default search path when forceFullCrop is false", async () => {
+    let cropCalls = 0;
+    let scrapeCalls = 0;
+
+    const results = await executeResultPageRecall({
+      forceFullCrop: false,
+      scrapeCurrentPage: async () => {
+        scrapeCalls += 1;
+        return sampleResults;
+      },
+      applyFullCanvasCrop: async () => {
+        cropCalls += 1;
+      },
+    });
+
+    expect(results).toEqual(sampleResults);
+    expect(scrapeCalls).toBe(1);
+    expect(cropCalls).toBe(0);
+  });
+
+  test("enters crop expansion path when forceFullCrop is true", async () => {
+    const calls: string[] = [];
+
+    const results = await executeResultPageRecall({
+      forceFullCrop: true,
+      scrapeCurrentPage: async () => {
+        calls.push("scrape");
+        return sampleResults;
+      },
+      applyFullCanvasCrop: async () => {
+        calls.push("crop");
+      },
+    });
+
+    expect(results).toEqual(sampleResults);
+    expect(calls).toEqual(["crop", "scrape"]);
+  });
+
+  test("preserves FULL_CROP_NOT_APPLIED errors from crop expansion path", async () => {
+    await expect(
+      executeResultPageRecall({
+        forceFullCrop: true,
+        scrapeCurrentPage: async () => sampleResults,
+        applyFullCanvasCrop: async () => {
+          throw new Error("[FULL_CROP_NOT_APPLIED] crop failed");
+        },
+      }),
+    ).rejects.toThrow("[FULL_CROP_NOT_APPLIED] crop failed");
+  });
+});
+
+describe("openCropDialogAndWaitForCanvas", () => {
+  test("requires croper canvas before continuing full crop flow", async () => {
+    const selectors: string[] = [];
+    const page: CropDialogPageLike = {
+      waitForFunction: async () => {},
+      evaluate: async () => {},
+      waitForSelector: async (selector) => {
+        selectors.push(selector);
+      },
+    };
+
+    await openCropDialogAndWaitForCanvas(page as never);
+
+    expect(selectors).toEqual(["#croper-canvas"]);
+  });
+});
+
+describe("shouldNavigateTo1688Home", () => {
+  test("reuses existing home page when already on 1688 root", () => {
+    expect(shouldNavigateTo1688Home("https://www.1688.com/")).toBe(false);
+    expect(shouldNavigateTo1688Home("https://www.1688.com/?spm=a260k")).toBe(false);
+  });
+
+  test("requires navigation when current page is not the home entry", () => {
+    expect(shouldNavigateTo1688Home("https://s.1688.com/selloffer/offer_search.htm")).toBe(true);
+    expect(shouldNavigateTo1688Home("https://login.1688.com/member/signin.htm")).toBe(true);
+    expect(shouldNavigateTo1688Home("about:blank")).toBe(true);
+  });
+});
+
+describe("waitForSearchResults", () => {
+  test("returns immediately when product cards appear without waiting for network idle", async () => {
+    const calls: string[] = [];
+    const page: ResultReadyPageLike = {
+      waitForSelector: async () => {
+        calls.push("selector");
+        return {};
+      },
+      waitForNetworkIdle: async () => {
+        calls.push("idle");
+      },
+    };
+
+    await waitForSearchResults(page as never);
+
+    expect(calls).toEqual(["selector"]);
+  });
+
+  test("falls back to a shorter network idle path when selector is late", async () => {
+    const calls: string[] = [];
+    let selectorCalls = 0;
+    const page: ResultReadyPageLike = {
+      waitForSelector: async () => {
+        selectorCalls += 1;
+        calls.push(`selector-${selectorCalls}`);
+        if (selectorCalls === 1) {
+          throw new Error("late cards");
+        }
+        return {};
+      },
+      waitForNetworkIdle: async () => {
+        calls.push("idle");
+      },
+    };
+
+    await waitForSearchResults(page as never);
+
+    expect(calls).toEqual(["selector-1", "idle", "selector-2"]);
+  });
+});
+
+describe("shouldStopResultScroll", () => {
+  test("stops immediately once enough visible candidates are present", () => {
+    expect(
+      shouldStopResultScroll({
+        visibleResultCount: 36,
+        targetResultCount: 36,
+        reachedBottom: false,
+        totalScrolled: 600,
+        maxScrollDistance: 4000,
+      }),
+    ).toBe(true);
+  });
+
+  test("stops when the page bottom has already been reached", () => {
+    expect(
+      shouldStopResultScroll({
+        visibleResultCount: 18,
+        targetResultCount: 36,
+        reachedBottom: true,
+        totalScrolled: 1200,
+        maxScrollDistance: 4000,
+      }),
+    ).toBe(true);
+  });
+
+  test("keeps scrolling when candidate budget is still insufficient and more page remains", () => {
+    expect(
+      shouldStopResultScroll({
+        visibleResultCount: 18,
+        targetResultCount: 36,
+        reachedBottom: false,
+        totalScrolled: 1200,
+        maxScrollDistance: 4000,
+      }),
+    ).toBe(false);
+  });
+});
