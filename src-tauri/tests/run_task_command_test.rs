@@ -8,8 +8,9 @@ use std::time::{Duration, Instant};
 
 use calamine::{open_workbook, Reader, Xlsx};
 use desktop_app_lib::commands::run_task::{
-    run_task_with_original_source_and_sink, run_task_with_sink, shutdown_managed_sidecar,
-    sidecar_runtime_dir_for_base, RunTaskSummary,
+    choose_sidecar_profile_base_dir, run_task_with_original_source_and_sink, run_task_with_sink,
+    shutdown_managed_sidecar, sidecar_profile_dir_for_base, sidecar_runtime_dir_for_base,
+    RunTaskSummary,
 };
 use desktop_app_lib::events::{
     EventSink, EVENT_LOG, EVENT_PROGRESS, EVENT_ROW_RESULT, EVENT_TASK_DONE,
@@ -270,6 +271,40 @@ fn sidecar_runtime_dir_lives_outside_watched_source_tree() {
     assert!(
         !runtime_dir.to_string_lossy().contains("src-tauri"),
         "runtime dir must not point into the watched source tree"
+    );
+}
+
+#[test]
+fn sidecar_profile_base_prefers_local_data_over_cache() {
+    let local_data = PathBuf::from("/tmp/desktop-app-local");
+    let cache = PathBuf::from("/tmp/desktop-app-cache");
+    let fallback = PathBuf::from("/tmp/desktop-app-fallback");
+
+    assert_eq!(
+        choose_sidecar_profile_base_dir(Some(&local_data), Some(&cache), &fallback),
+        local_data
+    );
+    assert_eq!(
+        choose_sidecar_profile_base_dir(None, Some(&cache), &fallback),
+        cache
+    );
+    assert_eq!(
+        choose_sidecar_profile_base_dir(None, None, &fallback),
+        fallback
+    );
+}
+
+#[test]
+fn sidecar_profile_dir_lives_under_dedicated_state_folder() {
+    let profile_dir = sidecar_profile_dir_for_base(&PathBuf::from("/tmp/desktop-app-local"));
+
+    assert_eq!(
+        profile_dir,
+        PathBuf::from("/tmp/desktop-app-local/sidecar-profile/1688_profile")
+    );
+    assert!(
+        !profile_dir.to_string_lossy().contains("src-tauri"),
+        "profile dir must not point into the watched source tree"
     );
 }
 

@@ -74,6 +74,8 @@ const DEFAULT_RESULT_LIMIT = 36;
 const CAMERA_READY_SETTLE_MS = 500;
 const SEARCH_CONFIRM_POLL_INTERVAL_MS = 350;
 const SEARCH_CONFIRM_MAX_ATTEMPTS = 20;
+const RESULT_ENTRY_TIMEOUT_MS = 15_000;
+const RESULT_ENTRY_POLL_INTERVAL_MS = 250;
 const RESULT_SELECTOR_TIMEOUT_MS = 8_000;
 const RESULT_IDLE_TIMEOUT_MS = 5_000;
 const RESULT_SECONDARY_SELECTOR_TIMEOUT_MS = 4_000;
@@ -83,9 +85,21 @@ const RESULT_SCROLL_DISTANCE_MAX = 200;
 const RESULT_SCROLL_MAX_DISTANCE = 4_000;
 const RESULT_POST_SCROLL_SETTLE_MS = 450;
 const RESULT_BOTTOM_GAP_PX = 120;
+const SEARCH_CONFIRM_LABELS = ["搜索图片", "开始搜索", "立即搜索"];
+const RESULT_URL_HINTS = [
+  "youyuan",
+  "offer_search",
+  "imagesearch",
+  "tab=imagesearch",
+  "tab=imageSearch",
+];
 
 function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value));
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function normalizeCursor(cursor: string): string {
@@ -330,6 +344,15 @@ export function shouldNavigateTo1688Home(currentUrl: string): boolean {
   }
 }
 
+export function isLikelySearchResultsUrl(currentUrl: string): boolean {
+  const url = (currentUrl || "").trim().toLowerCase();
+  if (!url.startsWith("http")) {
+    return false;
+  }
+
+  return RESULT_URL_HINTS.some((hint) => url.includes(hint));
+}
+
 export function assemblePriceFromFragments(
   majorFragment: string,
   minorFragment: string,
@@ -408,7 +431,7 @@ export async function openCropDialogAndWaitForCanvas(
 
 export async function waitForSearchResults(
   resultPage: SearchResultsPageLike,
-): Promise<void> {
+): Promise<boolean> {
   const selector = 'div[class*="searchOfferWrapper"]';
   const cardsReady = await resultPage
     .waitForSelector(selector, { timeout: RESULT_SELECTOR_TIMEOUT_MS })
@@ -416,13 +439,124 @@ export async function waitForSearchResults(
     .catch(() => false);
 
   if (cardsReady) {
-    return;
+    return true;
   }
 
   await resultPage.waitForNetworkIdle({ timeout: RESULT_IDLE_TIMEOUT_MS }).catch(() => {});
-  await resultPage
+  return resultPage
     .waitForSelector(selector, { timeout: RESULT_SECONDARY_SELECTOR_TIMEOUT_MS })
-    .catch(() => {});
+    .then(() => true)
+    .catch(() => false);
+}
+
+async function clickSearchConfirmIfPresent(
+  page: Pick<Page, "evaluate">,
+): Promise<boolean> {
+  return page.evaluate(
+    async ({ labels, maxAttempts, pollIntervalMs }) => {
+      const normalizedLabels = labels.map((label) => label.replace(/\s+/g, ""));
+      const isVisible = (element: HTMLElement): boolean => {
+        const style = window.getComputedStyle(element);
+        const rect = element.getBoundingClientRect();
+        return (
+          style.display !== "none" &&
+          style.visibility !== "hidden" &&
+          style.pointerEvents !== "none" &&
+          rect.width > 0 &&
+          rect.height > 0
+        );
+      };
+
+      const clickLikeUser = (element: HTMLElement) => {
+        element.scrollIntoView({ block: "center", inline: "center" });
+        const events = [
+          "pointerover",
+          "mouseover",
+          "pointerenter",
+          "mouseenter",
+          "pointerdown",
+          "mousedown",
+          "pointerup",
+          "mouseup",
+          "click",
+        ];
+        for (const eventName of events) {
+          element.dispatchEvent(new MouseEvent(eventName, { bubbles: true, cancelable: true, composed: true }));
+        }
+        element.click();
+      };
+
+      return new Promise<boolean>((resolve) => {
+        let attempts = 0;
+        const timer = setInterval(() => {
+          attempts += 1;
+          const candidates = Array.from(
+            document.querySelectorAll<HTMLElement>("button, a, div, span"),
+          ).filter((element) => {
+            const text = (element.innerText || element.textContent || "").replace(/\s+/g, "");
+            return normalizedLabels.includes(text) && isVisible(element);
+          });
+
+          if (candidates.length > 0) {
+            clearInterval(timer);
+            clickLikeUser(candidates[0]);
+            resolve(true);
+            return;
+          }
+
+          if (attempts >= maxAttempts) {
+            clearInterval(timer);
+            resolve(false);
+          }
+        }, pollIntervalMs);
+      });
+    },
+    {
+      labels: SEARCH_CONFIRM_LABELS,
+      maxAttempts: SEARCH_CONFIRM_MAX_ATTEMPTS,
+      pollIntervalMs: SEARCH_CONFIRM_POLL_INTERVAL_MS,
+    },
+  );
+}
+
+async function resolveResultPageAfterUpload(
+  browser: Browser,
+  sourcePage: Page,
+  newTargetPromise: Promise<import("puppeteer").Target | null>,
+): Promise<Page | null> {
+  let promisedPage: Page | null = null;
+  void newTargetPromise.then(async (target) => {
+    promisedPage = target ? await target.page().catch(() => null) : null;
+  });
+
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < RESULT_ENTRY_TIMEOUT_MS) {
+    if (promisedPage && isLikelySearchResultsUrl(promisedPage.url())) {
+      return promisedPage;
+    }
+
+    if (isLikelySearchResultsUrl(sourcePage.url())) {
+      return sourcePage;
+    }
+
+    const currentPageHasCards =
+      (await sourcePage.$('div[class*="searchOfferWrapper"]')) !== null;
+    if (currentPageHasCards) {
+      return sourcePage;
+    }
+
+    const allPages = await browser.pages();
+    const latestResultPage = [...allPages]
+      .reverse()
+      .find((candidate) => isLikelySearchResultsUrl(candidate.url()));
+    if (latestResultPage) {
+      return latestResultPage;
+    }
+
+    await delay(RESULT_ENTRY_POLL_INTERVAL_MS);
+  }
+
+  return null;
 }
 
 export async function search1688ByImage(
@@ -587,35 +721,20 @@ export async function search1688ByImage(
     await fileChooser.accept([absoluteImgPath]);
 
     // 阶段二：侦测有些账号上传后需要二次确认的弹窗
-    await page.evaluate(async () => {
-      return new Promise((resolve) => {
-        let attempts = 0;
-        const timer = setInterval(() => {
-          attempts++;
-          const btn = Array.from(document.querySelectorAll("button, div, span")).find((el) => el.innerText && el.innerText.trim() === "搜索图片");
-          if (btn) {
-            clearInterval(timer);
-            btn.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
-            btn.click();
-            resolve(true);
-          }
-          if (attempts >= SEARCH_CONFIRM_MAX_ATTEMPTS) { clearInterval(timer); resolve(false); }
-        }, SEARCH_CONFIRM_POLL_INTERVAL_MS);
-      });
-    });
+    let searchConfirmed = await clickSearchConfirmIfPresent(page);
+    resultPage = await resolveResultPageAfterUpload(browser, page, newTargetPromise);
 
-    const newTarget = await newTargetPromise;
-    if (newTarget) {
-      resultPage = await newTarget.page();
-    } else {
-      const allPages = await browser.pages();
-      if (allPages.length > 1) resultPage = allPages[allPages.length - 1];
-      else resultPage = page;
+    if (!resultPage && !searchConfirmed) {
+      searchConfirmed = await clickSearchConfirmIfPresent(page);
+      resultPage = await resolveResultPageAfterUpload(browser, page, newTargetPromise);
     }
 
     if (!resultPage) throw new Error("[IMAGE_SEARCH_NOT_ENTERED_RESULT_PAGE] 未能成功进入搜索结果页");
     await resultPage.bringToFront();
-    await waitForSearchResults(resultPage);
+    const resultsReady = await waitForSearchResults(resultPage);
+    if (!resultsReady && !isLikelySearchResultsUrl(resultPage.url())) {
+      throw new Error("[IMAGE_SEARCH_NOT_ENTERED_RESULT_PAGE] 未能成功进入搜索结果页");
+    }
 
     return await executeResultPageRecall({
       forceFullCrop,

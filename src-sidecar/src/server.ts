@@ -23,6 +23,8 @@ export interface SessionSnapshot {
   visibleText: string;
   links: string[];
   hasAntiBotChallenge: boolean;
+  hasLoginEntry: boolean;
+  hasLoggedInEntry: boolean;
 }
 
 export type SessionState = "ready" | "login_required" | "anti_bot_challenge";
@@ -47,15 +49,8 @@ type RuntimeResources = {
 const app = express();
 app.use(express.json());
 
-const CHROME_ARGS = [
-  "--start-maximized",
-  "--disable-blink-features=AutomationControlled",
-  "--disable-infobars",
-  "--no-default-browser-check",
-  "--disable-dev-shm-usage",
-  "--user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-];
 const SIDECAR_PROFILE_DIR_ENV = "SIDECAR_PROFILE_DIR";
+const HOME_URL_HINTS = ["https://www.1688.com/", "https://m.1688.com/"];
 const LOGIN_URL_HINTS = [
   "login.1688.com",
   "member.1688.com/member/signin",
@@ -72,6 +67,45 @@ const ANTI_BOT_TEXT_HINTS = [
   "网络环境存在异常",
   "请先通过验证",
 ];
+
+export function browserUserAgentForPlatform(
+  platform: NodeJS.Platform = process.platform,
+): string {
+  if (platform === "win32") {
+    return "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36";
+  }
+
+  if (platform === "darwin") {
+    return "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36";
+  }
+
+  return "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36";
+}
+
+export function browserNavigatorPlatformForPlatform(
+  platform: NodeJS.Platform = process.platform,
+): string {
+  if (platform === "win32") {
+    return "Win32";
+  }
+  if (platform === "darwin") {
+    return "MacIntel";
+  }
+  return "Linux x86_64";
+}
+
+function buildChromeArgs(
+  platform: NodeJS.Platform = process.platform,
+): string[] {
+  return [
+    "--start-maximized",
+    "--disable-blink-features=AutomationControlled",
+    "--disable-infobars",
+    "--no-default-browser-check",
+    "--disable-dev-shm-usage",
+    `--user-agent=${browserUserAgentForPlatform(platform)}`,
+  ];
+}
 
 let globalBrowser: Browser | null = null;
 let globalHomePage: Page | null = null;
@@ -120,6 +154,11 @@ function normalizeVisibleText(value: string): string {
   return (value || "").replace(/\s+/g, "");
 }
 
+function is1688HomeUrl(url: string): boolean {
+  const normalized = (url || "").trim().toLowerCase();
+  return HOME_URL_HINTS.some((hint) => normalized.startsWith(hint));
+}
+
 export function classifyLoginRequirement(
   snapshot: SessionSnapshot,
 ): SidecarErrorCode | null {
@@ -140,15 +179,23 @@ export function classifySessionState(snapshot: SessionSnapshot): SessionState {
     return "anti_bot_challenge";
   }
 
-  if (LOGGED_IN_TEXT_HINTS.some((hint) => visibleText.includes(hint))) {
+  if (
+    snapshot.hasLoggedInEntry ||
+    LOGGED_IN_TEXT_HINTS.some((hint) => visibleText.includes(hint))
+  ) {
     return "ready";
   }
 
   if (
+    snapshot.hasLoginEntry ||
     LOGIN_URL_HINTS.some((hint) => url.includes(hint)) ||
     LOGIN_TEXT_HINTS.some((hint) => visibleText.includes(hint)) ||
     LOGIN_URL_HINTS.some((hint) => links.includes(hint))
   ) {
+    return "login_required";
+  }
+
+  if (is1688HomeUrl(url)) {
     return "login_required";
   }
 
@@ -158,7 +205,7 @@ export function classifySessionState(snapshot: SessionSnapshot): SessionState {
 async function collectSessionSnapshot(page: Page): Promise<SessionSnapshot> {
   return page.evaluate(() => ({
     url: window.location.href,
-    visibleText: (document.body?.innerText || "").slice(0, 4000),
+    visibleText: (document.body?.innerText || "").slice(0, 12000),
     links: Array.from(document.querySelectorAll<HTMLAnchorElement>("a[href]"))
       .slice(0, 200)
       .map((element) => element.href || element.getAttribute("href") || "")
@@ -174,6 +221,35 @@ async function collectSessionSnapshot(page: Page): Promise<SessionSnapshot> {
       /请完成验证|请先完成验证|滑动验证|访问验证|网络环境存在异常/.test(
         document.body?.innerText || "",
       ),
+    hasLoginEntry:
+      [
+        'a[href*="login.1688.com"]',
+        'a[href*="member/signin"]',
+        'a[href*="passport.alibaba.com"]',
+      ].some((selector) => document.querySelector(selector) !== null) ||
+      Array.from(document.querySelectorAll<HTMLElement>("button, a, div, span"))
+        .some((element) => {
+          const text = (element.innerText || element.textContent || "").replace(/\s+/g, "");
+          return text === "登录" || text === "请登录" || text === "免费注册";
+        }),
+    hasLoggedInEntry:
+      [
+        'a[href*="work.1688.com"]',
+        'a[href*="member.1688.com/member"]',
+        'a[href*="message.1688.com"]',
+        'a[href*="trade.1688.com"]',
+      ].some((selector) => document.querySelector(selector) !== null) ||
+      Array.from(document.querySelectorAll<HTMLElement>("button, a, div, span"))
+        .some((element) => {
+          const text = (element.innerText || element.textContent || "").replace(/\s+/g, "");
+          return (
+            text.includes("我的阿里") ||
+            text.includes("我的1688") ||
+            text.includes("买家工作台") ||
+            text.includes("采购车") ||
+            text.includes("进货单")
+          );
+        }),
   }));
 }
 
@@ -188,7 +264,8 @@ async function ensure1688SessionReady(page: Page): Promise<void> {
 }
 
 async function applyBrowserEvasions(page: Page): Promise<void> {
-  await page.evaluateOnNewDocument(() => {
+  const navigatorPlatform = browserNavigatorPlatformForPlatform();
+  await page.evaluateOnNewDocument((injectedPlatform: string) => {
     Object.defineProperty(navigator, "webdriver", {
       get: () => undefined,
       configurable: true,
@@ -205,7 +282,7 @@ async function applyBrowserEvasions(page: Page): Promise<void> {
     });
 
     Object.defineProperty(navigator, "platform", {
-      get: () => "MacIntel",
+      get: () => injectedPlatform,
       configurable: true,
     });
 
@@ -227,7 +304,7 @@ async function applyBrowserEvasions(page: Page): Promise<void> {
         return originalQuery.call(window.navigator.permissions, parameters);
       }) as typeof window.navigator.permissions.query;
     }
-  });
+  }, navigatorPlatform);
 }
 
 async function ensureBrowserAndPageAliveInner(): Promise<Page> {
@@ -243,7 +320,7 @@ async function ensureBrowserAndPageAliveInner(): Promise<Page> {
       defaultViewport: null,
       userDataDir: resolveProfileDir(),
       ignoreDefaultArgs: ["--enable-automation"],
-      args: CHROME_ARGS,
+      args: buildChromeArgs(),
     });
     globalHomePage = null;
   }

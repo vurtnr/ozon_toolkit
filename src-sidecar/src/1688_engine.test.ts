@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   executeResultPageRecall,
+  isLikelySearchResultsUrl,
   shouldStopResultScroll,
   shouldNavigateTo1688Home,
   waitForSearchResults,
@@ -134,8 +135,9 @@ describe("waitForSearchResults", () => {
       },
     };
 
-    await waitForSearchResults(page as never);
+    const ready = await waitForSearchResults(page as never);
 
+    expect(ready).toBe(true);
     expect(calls).toEqual(["selector"]);
   });
 
@@ -156,9 +158,48 @@ describe("waitForSearchResults", () => {
       },
     };
 
-    await waitForSearchResults(page as never);
+    const ready = await waitForSearchResults(page as never);
 
+    expect(ready).toBe(true);
     expect(calls).toEqual(["selector-1", "idle", "selector-2"]);
+  });
+
+  test("returns false when neither current page nor follow-up check yields result cards", async () => {
+    const calls: string[] = [];
+    const page: ResultReadyPageLike = {
+      waitForSelector: async () => {
+        calls.push("selector");
+        throw new Error("no cards");
+      },
+      waitForNetworkIdle: async () => {
+        calls.push("idle");
+      },
+    };
+
+    const ready = await waitForSearchResults(page as never);
+
+    expect(ready).toBe(false);
+    expect(calls).toEqual(["selector", "idle", "selector"]);
+  });
+});
+
+describe("isLikelySearchResultsUrl", () => {
+  test("recognizes common 1688 image-search result urls across platform variants", () => {
+    expect(
+      isLikelySearchResultsUrl(
+        "https://s.1688.com/youyuan/index.htm?tab=imageSearch&imageType=offer",
+      ),
+    ).toBe(true);
+    expect(
+      isLikelySearchResultsUrl(
+        "https://s.1688.com/selloffer/offer_search.htm?keywords=test",
+      ),
+    ).toBe(true);
+  });
+
+  test("does not treat the 1688 home page as a result page", () => {
+    expect(isLikelySearchResultsUrl("https://www.1688.com/")).toBe(false);
+    expect(isLikelySearchResultsUrl("about:blank")).toBe(false);
   });
 });
 

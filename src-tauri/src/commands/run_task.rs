@@ -1929,6 +1929,42 @@ pub fn sidecar_runtime_dir_for_base(base_dir: &Path) -> PathBuf {
     base_dir.join("sidecar-runtime")
 }
 
+pub fn choose_sidecar_profile_base_dir(
+    local_data_dir: Option<&Path>,
+    cache_dir: Option<&Path>,
+    fallback_dir: &Path,
+) -> PathBuf {
+    local_data_dir
+        .map(Path::to_path_buf)
+        .or_else(|| cache_dir.map(Path::to_path_buf))
+        .unwrap_or_else(|| fallback_dir.to_path_buf())
+}
+
+pub fn sidecar_profile_dir_for_base(base_dir: &Path) -> PathBuf {
+    base_dir.join("sidecar-profile").join("1688_profile")
+}
+
+fn copy_dir_recursive(source: &Path, target: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(target)
+        .map_err(|e| format!("create sidecar profile dir failed: {e}"))?;
+
+    for entry in std::fs::read_dir(source)
+        .map_err(|e| format!("read legacy sidecar profile dir failed: {e}"))?
+    {
+        let entry = entry.map_err(|e| format!("read legacy sidecar profile entry failed: {e}"))?;
+        let entry_path = entry.path();
+        let target_path = target.join(entry.file_name());
+        if entry_path.is_dir() {
+            copy_dir_recursive(&entry_path, &target_path)?;
+        } else {
+            std::fs::copy(&entry_path, &target_path)
+                .map_err(|e| format!("copy legacy sidecar profile file failed: {e}"))?;
+        }
+    }
+
+    Ok(())
+}
+
 pub fn shutdown_managed_sidecar() {
     if let Ok(client) = Client::builder().timeout(Duration::from_secs(2)).build() {
         let _ = client.post(sidecar_shutdown_url()).send();
@@ -1970,6 +2006,36 @@ fn resolve_sidecar_runtime_dir(app: &tauri::AppHandle) -> Result<PathBuf, String
         .map_err(|e| format!("create sidecar runtime dir failed: {e}"))?;
 
     Ok(runtime_dir)
+}
+
+fn resolve_sidecar_profile_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    let local_data_dir = app.path().app_local_data_dir().ok();
+    let cache_dir = app.path().app_cache_dir().ok();
+    let fallback_dir = std::env::temp_dir().join("desktop_app");
+    let preferred_base_dir =
+        choose_sidecar_profile_base_dir(local_data_dir.as_deref(), cache_dir.as_deref(), &fallback_dir);
+    let profile_dir = sidecar_profile_dir_for_base(&preferred_base_dir);
+
+    if let Some(parent) = profile_dir.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("create sidecar profile parent dir failed: {e}"))?;
+    }
+
+    if !profile_dir.exists() {
+        if let Some(cache_dir) = cache_dir.as_deref() {
+            let legacy_profile_dir = sidecar_runtime_dir_for_base(cache_dir).join("1688_profile");
+            if legacy_profile_dir.exists() && legacy_profile_dir != profile_dir {
+                if std::fs::rename(&legacy_profile_dir, &profile_dir).is_err() {
+                    copy_dir_recursive(&legacy_profile_dir, &profile_dir)?;
+                }
+            }
+        }
+    }
+
+    std::fs::create_dir_all(&profile_dir)
+        .map_err(|e| format!("create sidecar profile dir failed: {e}"))?;
+
+    Ok(profile_dir)
 }
 
 fn find_sidecar_binary_in_dir(dir: &Path) -> Option<PathBuf> {
@@ -2104,7 +2170,7 @@ fn ensure_sidecar_running(
 
     let binary = resolve_sidecar_executable(app)?;
     let runtime_dir = resolve_sidecar_runtime_dir(app)?;
-    let profile_dir = runtime_dir.join("1688_profile");
+    let profile_dir = resolve_sidecar_profile_dir(app)?;
     let mut cmd = Command::new(&binary);
     cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
