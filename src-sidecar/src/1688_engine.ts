@@ -41,6 +41,10 @@ interface FullCanvasCropPlan {
 }
 
 type SearchResultsPageLike = Pick<Page, "waitForSelector" | "waitForNetworkIdle">;
+type ClosableTabLike = {
+  url: () => string;
+  isClosed?: () => boolean;
+};
 
 interface SearchResultRecord {
   title: string;
@@ -72,8 +76,9 @@ export interface ResultScrollState {
 const CROP_EDGE_PADDING = 6;
 const DEFAULT_RESULT_LIMIT = 36;
 const CAMERA_READY_SETTLE_MS = 500;
-const SEARCH_CONFIRM_POLL_INTERVAL_MS = 350;
-const SEARCH_CONFIRM_MAX_ATTEMPTS = 20;
+const SEARCH_CONFIRM_POLL_INTERVAL_MS = 250;
+const SEARCH_CONFIRM_MAX_ATTEMPTS = 14;
+const IMMEDIATE_RESULT_ENTRY_TIMEOUT_MS = 2_500;
 const RESULT_ENTRY_TIMEOUT_MS = 15_000;
 const RESULT_ENTRY_POLL_INTERVAL_MS = 250;
 const RESULT_SELECTOR_TIMEOUT_MS = 8_000;
@@ -344,6 +349,28 @@ export function shouldNavigateTo1688Home(currentUrl: string): boolean {
   }
 }
 
+export function shouldEnsureHomePageBeforeSessionCheck(currentUrl: string): boolean {
+  const url = (currentUrl || "").trim().toLowerCase();
+  if (!url.startsWith("http")) {
+    return true;
+  }
+  if (shouldNavigateTo1688Home(url)) {
+    if (
+      url.includes("login.1688.com") ||
+      url.includes("member/signin") ||
+      url.includes("passport.alibaba.com") ||
+      url.includes("sec.") ||
+      url.includes("punish") ||
+      url.includes("captcha") ||
+      url.includes("verify")
+    ) {
+      return false;
+    }
+    return true;
+  }
+  return false;
+}
+
 export function isLikelySearchResultsUrl(currentUrl: string): boolean {
   const url = (currentUrl || "").trim().toLowerCase();
   if (!url.startsWith("http")) {
@@ -351,6 +378,42 @@ export function isLikelySearchResultsUrl(currentUrl: string): boolean {
   }
 
   return RESULT_URL_HINTS.some((hint) => url.includes(hint));
+}
+
+export function shouldKeepWaitingForSearchConfirm(
+  currentUrl: string,
+  hasVisibleResults: boolean,
+): boolean {
+  if (hasVisibleResults) {
+    return false;
+  }
+
+  return !isLikelySearchResultsUrl(currentUrl);
+}
+
+function shouldAutoCloseTab(currentUrl: string): boolean {
+  const url = (currentUrl || "").trim().toLowerCase();
+  return url === "about:blank" || url.includes("1688.com");
+}
+
+export function selectClosableTabs<T extends ClosableTabLike>(
+  pages: T[],
+  keepPages: T[],
+): T[] {
+  const keepSet = new Set(keepPages);
+  return pages.filter((page) => {
+    if (keepSet.has(page)) return false;
+    if (page.isClosed?.()) return false;
+    return shouldAutoCloseTab(page.url());
+  });
+}
+
+async function cleanupAutomationTabs(browser: Pick<Browser, "pages">, keepPages: Page[]): Promise<void> {
+  const pages = await browser.pages();
+  const closableTabs = selectClosableTabs(pages, keepPages);
+  for (const tab of closableTabs) {
+    await tab.close().catch(() => undefined);
+  }
 }
 
 export function assemblePriceFromFragments(
@@ -453,7 +516,7 @@ async function clickSearchConfirmIfPresent(
   page: Pick<Page, "evaluate">,
 ): Promise<boolean> {
   return page.evaluate(
-    async ({ labels, maxAttempts, pollIntervalMs }) => {
+    async ({ labels, maxAttempts, pollIntervalMs, resultUrlHints, resultSelector }) => {
       const normalizedLabels = labels.map((label) => label.replace(/\s+/g, ""));
       const isVisible = (element: HTMLElement): boolean => {
         const style = window.getComputedStyle(element);
@@ -490,6 +553,18 @@ async function clickSearchConfirmIfPresent(
         let attempts = 0;
         const timer = setInterval(() => {
           attempts += 1;
+          const currentUrl = (window.location.href || "").trim().toLowerCase();
+          const hasVisibleResults = document.querySelector(resultSelector) !== null;
+          const alreadyEnteredResults =
+            hasVisibleResults ||
+            resultUrlHints.some((hint) => currentUrl.includes(hint));
+
+          if (alreadyEnteredResults) {
+            clearInterval(timer);
+            resolve(false);
+            return;
+          }
+
           const candidates = Array.from(
             document.querySelectorAll<HTMLElement>("button, a, div, span"),
           ).filter((element) => {
@@ -515,6 +590,8 @@ async function clickSearchConfirmIfPresent(
       labels: SEARCH_CONFIRM_LABELS,
       maxAttempts: SEARCH_CONFIRM_MAX_ATTEMPTS,
       pollIntervalMs: SEARCH_CONFIRM_POLL_INTERVAL_MS,
+      resultUrlHints: RESULT_URL_HINTS,
+      resultSelector: 'div[class*="searchOfferWrapper"]',
     },
   );
 }
@@ -523,6 +600,7 @@ async function resolveResultPageAfterUpload(
   browser: Browser,
   sourcePage: Page,
   newTargetPromise: Promise<import("puppeteer").Target | null>,
+  timeoutMs: number = RESULT_ENTRY_TIMEOUT_MS,
 ): Promise<Page | null> {
   let promisedPage: Page | null = null;
   void newTargetPromise.then(async (target) => {
@@ -530,7 +608,7 @@ async function resolveResultPageAfterUpload(
   });
 
   const startedAt = Date.now();
-  while (Date.now() - startedAt < RESULT_ENTRY_TIMEOUT_MS) {
+  while (Date.now() - startedAt < timeoutMs) {
     if (promisedPage && isLikelySearchResultsUrl(promisedPage.url())) {
       return promisedPage;
     }
@@ -686,6 +764,8 @@ export async function search1688ByImage(
   };
 
   try {
+    await cleanupAutomationTabs(browser, [page]);
+
     // 阶段一：激活常驻主阵地，防止页面休眠
     await page.bringToFront();
     const needsHomeNavigation =
@@ -720,13 +800,28 @@ export async function search1688ByImage(
 
     await fileChooser.accept([absoluteImgPath]);
 
-    // 阶段二：侦测有些账号上传后需要二次确认的弹窗
-    let searchConfirmed = await clickSearchConfirmIfPresent(page);
-    resultPage = await resolveResultPageAfterUpload(browser, page, newTargetPromise);
+    // 阶段二：先快速探测是否已自动进入结果页，只有未进入时才等待“搜索图片/开始搜索”确认按钮。
+    resultPage = await resolveResultPageAfterUpload(
+      browser,
+      page,
+      newTargetPromise,
+      IMMEDIATE_RESULT_ENTRY_TIMEOUT_MS,
+    );
+    let searchConfirmed = false;
+
+    if (!resultPage) {
+      searchConfirmed = await clickSearchConfirmIfPresent(page);
+      resultPage = await resolveResultPageAfterUpload(browser, page, newTargetPromise);
+    }
 
     if (!resultPage && !searchConfirmed) {
       searchConfirmed = await clickSearchConfirmIfPresent(page);
-      resultPage = await resolveResultPageAfterUpload(browser, page, newTargetPromise);
+      resultPage = await resolveResultPageAfterUpload(
+        browser,
+        page,
+        newTargetPromise,
+        IMMEDIATE_RESULT_ENTRY_TIMEOUT_MS,
+      );
     }
 
     if (!resultPage) throw new Error("[IMAGE_SEARCH_NOT_ENTERED_RESULT_PAGE] 未能成功进入搜索结果页");
@@ -1025,9 +1120,7 @@ export async function search1688ByImage(
     // 🌟 核心修改：绝对不吞没致命报错，将其透传回 server.ts 和 Rust！
     throw error; 
   } finally {
-    // 阶段四：阅后即焚，关掉结果页，把干净的 1688 首页留给下一次搜索
-    if (resultPage && !resultPage.isClosed() && resultPage !== page) {
-      await resultPage.close(); 
-    }
+    // 阶段四：阅后即焚，关掉所有自动化遗留页，把干净的 1688 首页留给下一次搜索
+    await cleanupAutomationTabs(browser, [page]);
   }
 }

@@ -9,7 +9,7 @@ use super::vlm::normalize_match_ids;
 pub const GRID_CANDIDATE_SIZE: usize = 9;
 pub const MAX_VERIFY_GROUPS: usize = 3;
 pub const MAX_VERIFY_CANDIDATES: usize = GRID_CANDIDATE_SIZE * MAX_VERIFY_GROUPS;
-pub const FINAL_REVIEW_CANDIDATE_LIMIT: usize = 8;
+pub const FINAL_REVIEW_CANDIDATE_LIMIT: usize = 16;
 const SCREENING_RELEVANCE_LIMIT: usize = 18;
 const ADAPTIVE_SCREENING_LIMIT: usize = 18;
 const MIN_FRONTIER_RELEVANCE_SCORE: f32 = 0.25;
@@ -211,21 +211,27 @@ pub fn prepare_final_review_candidates(candidates: Vec<Candidate>, limit: usize)
         return Vec::new();
     }
 
-    let deduped = dedupe_candidates_by_url(candidates);
-    if deduped.len() <= limit {
-        return deduped;
+    let priced = dedupe_candidates_by_url(candidates)
+        .into_iter()
+        .filter(|item| parse_positive_price_value(&item.price).is_some())
+        .collect::<Vec<_>>();
+    if priced.len() <= limit {
+        let mut selected = priced;
+        sort_candidates_by_price(&mut selected);
+        return selected;
     }
 
-    let primary_window = (limit.saturating_sub(1)).max(1).min(deduped.len());
-    let mut selected_urls = deduped
+    let late_price_slots = 2.min(limit.saturating_sub(1));
+    let rank_window = limit.saturating_sub(late_price_slots).max(1).min(priced.len());
+    let mut selected_urls = priced
         .iter()
-        .take(primary_window)
+        .take(rank_window)
         .map(|candidate| candidate.item_url.clone())
         .collect::<HashSet<_>>();
 
-    let mut cheapest_late_candidates = deduped
+    let mut cheapest_late_candidates = priced
         .iter()
-        .skip(primary_window)
+        .skip(rank_window)
         .filter_map(|candidate| {
             parse_positive_price_value(&candidate.price).map(|price_value| (price_value, candidate))
         })
@@ -243,10 +249,11 @@ pub fn prepare_final_review_candidates(candidates: Vec<Candidate>, limit: usize)
         }
     }
 
-    let mut selected = deduped
+    let mut selected = priced
         .into_iter()
         .filter(|candidate| selected_urls.contains(&candidate.item_url))
         .collect::<Vec<_>>();
+    sort_candidates_by_price(&mut selected);
     selected.truncate(limit);
     selected
 }

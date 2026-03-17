@@ -19,12 +19,10 @@ const DASHSCOPE_API_URL: &str =
     "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions";
 const DASHSCOPE_MODEL_NAME: &str = "qwen3-vl-plus";
 const MAX_PARALLEL_TILE_DOWNLOADS: usize = 4;
-const MAX_PARALLEL_VLM_BATCHES: usize = 2;
+const DEFAULT_MAX_PARALLEL_VLM_BATCHES: usize = 3;
 
 #[derive(Debug, Deserialize)]
 struct VlmResponse {
-    #[serde(default)]
-    reasoning: String,
     #[serde(default)]
     match_ids: Vec<usize>,
 }
@@ -204,7 +202,10 @@ impl VlmClient for DashScopeVlmClient {
             .collect::<Vec<_>>();
         let ozon_name = ozon_name_opt.map(str::to_string);
 
-        parallel_map_limited(owned_requests, MAX_PARALLEL_VLM_BATCHES, |request| {
+        parallel_map_limited(
+            owned_requests,
+            resolve_parallel_vlm_batch_limit(requests.len()),
+            |request| {
             match_candidate_grid_with_shared_cache(
                 &self.client,
                 &self.api_key,
@@ -218,8 +219,13 @@ impl VlmClient for DashScopeVlmClient {
                 &request.candidates,
                 ozon_name.as_deref(),
             )
-        })
+            },
+        )
     }
+}
+
+fn resolve_parallel_vlm_batch_limit(request_count: usize) -> usize {
+    request_count.clamp(1, DEFAULT_MAX_PARALLEL_VLM_BATCHES)
 }
 
 impl SearchImagePlanner for DashScopeVlmClient {
@@ -244,9 +250,47 @@ pub fn normalize_match_ids(match_ids: &[usize], valid_count: usize) -> Vec<usize
 }
 
 pub fn parse_vlm_response_content(content: &str, valid_count: usize) -> Vec<usize> {
-    serde_json::from_str::<VlmResponse>(content)
-        .map(|parsed| normalize_match_ids(&parsed.match_ids, valid_count))
+    if let Ok(parsed) = serde_json::from_str::<VlmResponse>(content) {
+        return normalize_match_ids(&parsed.match_ids, valid_count);
+    }
+
+    if let Ok(parsed) = serde_json::from_str::<Vec<usize>>(content) {
+        return normalize_match_ids(&parsed, valid_count);
+    }
+
+    recover_match_ids_from_partial_content(content, valid_count)
+}
+
+fn recover_match_ids_from_partial_content(content: &str, valid_count: usize) -> Vec<usize> {
+    extract_match_ids_from_array_fragment(content)
+        .map(|match_ids| normalize_match_ids(&match_ids, valid_count))
         .unwrap_or_default()
+}
+
+fn extract_match_ids_from_array_fragment(content: &str) -> Option<Vec<usize>> {
+    let trimmed = content.trim();
+    if trimmed.starts_with('[') {
+        return Some(parse_usize_array_fragment(trimmed));
+    }
+
+    let match_ids_anchor = trimmed
+        .find("\"match_ids\"")
+        .or_else(|| trimmed.find("match_ids"))?;
+    let array_anchor = trimmed[match_ids_anchor..].find('[')? + match_ids_anchor;
+    Some(parse_usize_array_fragment(&trimmed[array_anchor..]))
+}
+
+fn parse_usize_array_fragment(content: &str) -> Vec<usize> {
+    let Some(array_start) = content.find('[') else {
+        return Vec::new();
+    };
+    let array_body = &content[array_start + 1..];
+    let array_end = array_body.find(']').unwrap_or(array_body.len());
+    array_body[..array_end]
+        .split(|ch: char| !ch.is_ascii_digit())
+        .filter(|fragment| !fragment.is_empty())
+        .filter_map(|fragment| fragment.parse::<usize>().ok())
+        .collect()
 }
 
 fn parallel_map_limited<T, U, F>(items: Vec<T>, limit: usize, worker: F) -> Vec<U>
@@ -682,9 +726,11 @@ fn build_screening_prompts(
         1. 这是初筛召回，不是最终定版。请召回所有可能同款或高度相似、值得进入下一轮严格复核的候选。\n\
         2. 只要商品主体结构、核心部件、连接方式大体一致，或疑似同模具/同系列变体，就应该先召回。\n\
         3. 只有在主体结构明显不同、几乎不可能是同款时才排除。\n\
-        4. 宁可多召回少量疑似项，也不要漏掉潜在真实同款。\n\
+        4. 若商品名称参考偏泛类目或与候选语言不同，以图片主体结构为准，不要因名称泛化而漏召回。\n\
+        5. 宁可多召回少量疑似项，也不要漏掉潜在真实同款。\n\
+        6. 只输出 JSON，不要输出 reasoning 字段，不要解释，不要 markdown。\n\
         严格输出 JSON：\n\
-        {{\n  \"reasoning\": \"简短结论\",\n  \"match_ids\": [1,2]\n}}",
+        {{\n  \"match_ids\": [1,2]\n}}",
         valid_count, product_name_context, title_context
     );
 
@@ -732,10 +778,13 @@ fn build_final_review_prompts(
             {}\
             规则：\n\
             1. 以图 A 的处理后搜索图为主参考，必要时用图 B 的原始商品图辅助确认，忽略背景、文字、水印、角度。\n\
-            2. 仅当核心结构、部件形态、连接方式都一致才算同款；拿不准必须排除。\n\
-            3. 若是同款就返回编号；无同款返回空数组。\n\
+            2. 图 B 中的营销文案、赠品、配件拆解图、背景植物或汽车、悬挂绳、挂钩、插头、包装盒、摆拍道具都不是必须一致的判定条件；除非这些部件明确属于商品主体本体，否则忽略。\n\
+            3. 商品名称只作辅助；若名称偏泛类目或与候选语言不同，仍以图片主体结构为准。\n\
+            4. 仅当核心结构、部件形态、连接方式都一致才算同款；拿不准必须排除。\n\
+            5. 只输出 JSON，不要输出 reasoning 字段，不要解释，不要 markdown。\n\
+            6. 若是同款就返回编号；无同款返回空数组。\n\
             严格输出 JSON：\n\
-            {{\n  \"reasoning\": \"简短结论\",\n  \"match_ids\": [1]\n}}",
+            {{\n  \"match_ids\": [1]\n}}",
             reference_context, valid_count, name, candidate_title_context
         )
     } else {
@@ -746,10 +795,13 @@ fn build_final_review_prompts(
             {}\
             规则：\n\
             1. 以图 A 的处理后搜索图为主参考，必要时用图 B 的原始商品图辅助确认，忽略背景、文字、水印、角度。\n\
-            2. 仅当核心结构、部件形态、连接方式都一致才算同款；拿不准必须排除。\n\
-            3. 若是同款就返回编号；无同款返回空数组。\n\
+            2. 参考图中的营销文案、赠品、配件拆解图、背景、悬挂绳、挂钩、插头、包装盒、摆拍道具都不是必须一致的判定条件；除非这些部件明确属于商品主体本体，否则忽略。\n\
+            3. 商品名称只作辅助；若名称偏泛类目或与候选语言不同，仍以图片主体结构为准。\n\
+            4. 仅当核心结构、部件形态、连接方式都一致才算同款；拿不准必须排除。\n\
+            5. 只输出 JSON，不要输出 reasoning 字段，不要解释，不要 markdown。\n\
+            6. 若是同款就返回编号；无同款返回空数组。\n\
             严格输出 JSON：\n\
-            {{\n  \"reasoning\": \"简短结论\",\n  \"match_ids\": [1]\n}}",
+            {{\n  \"match_ids\": [1]\n}}",
             reference_context, valid_count, candidate_title_context
         )
     };
@@ -859,10 +911,6 @@ fn verify_with_qwen_vl(
         .map_err(|e| format!("parse dashscope response failed: {e}"))?;
     let content = extract_message_content_text(&body["choices"][0]["message"]["content"]);
 
-    if let Ok(parsed) = serde_json::from_str::<VlmResponse>(&content) {
-        let _ = parsed.reasoning;
-    }
-
     Ok(VlmMatchResult {
         match_ids: parse_vlm_response_content(&content, valid_count),
         trace: VlmCallTrace {
@@ -958,8 +1006,9 @@ mod tests {
     use reqwest::blocking::Client;
 
     use super::{
-        build_prompts, create_grid_artifact, fit_within_dimensions, parallel_map_limited,
-        Candidate, ReferenceImages, VlmBatchRequest, VlmCallTrace, VlmClient, VlmMatchResult,
+        build_prompts, build_screening_prompts, create_grid_artifact, fit_within_dimensions,
+        parallel_map_limited, Candidate, ReferenceImages, VlmBatchRequest, VlmCallTrace,
+        VlmClient, VlmMatchResult,
     };
 
     fn candidate(title: &str) -> Candidate {
@@ -991,6 +1040,31 @@ mod tests {
     }
 
     #[test]
+    fn screening_prompt_keeps_image_structure_as_source_of_truth_when_title_is_generic() {
+        let (_, user_prompt) = build_screening_prompts(
+            &[
+                candidate("Marine boarding ladder"),
+                candidate("Inflatable boat ladder"),
+            ],
+            Some("Accessories and components"),
+        );
+
+        assert!(user_prompt.contains("名称参考偏泛类目或与候选语言不同"));
+    }
+
+    #[test]
+    fn screening_prompt_requests_match_ids_only_without_reasoning() {
+        let (_, user_prompt) = build_screening_prompts(
+            &[candidate("Portable travel bag"), candidate("Waterproof duffel bag")],
+            Some("ozon bag"),
+        );
+
+        assert!(user_prompt.contains("\"match_ids\""));
+        assert!(user_prompt.contains("不要输出 reasoning"));
+        assert!(!user_prompt.contains("\"reasoning\""));
+    }
+
+    #[test]
     fn single_candidate_prompt_remains_strict_for_final_review() {
         let (_, user_prompt) =
             build_prompts(&[candidate("Portable travel bag")], Some("ozon bag"), false);
@@ -1006,6 +1080,11 @@ mod tests {
 
         assert!(user_prompt.contains("原始商品图（仅作辅助复核）"));
         assert!(user_prompt.contains("以图 A 的处理后搜索图为主参考"));
+        assert!(user_prompt.contains("营销文案"));
+        assert!(user_prompt.contains("赠品"));
+        assert!(user_prompt.contains("配件拆解图"));
+        assert!(user_prompt.contains("悬挂绳"));
+        assert!(!user_prompt.contains("\"reasoning\""));
     }
 
     #[test]
@@ -1091,6 +1170,15 @@ mod tests {
 
         assert_eq!(results, vec![10, 20, 30, 40]);
         assert_eq!(peak.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn resolve_parallel_vlm_batch_limit_uses_three_way_parallelism_by_default() {
+        assert_eq!(super::resolve_parallel_vlm_batch_limit(0), 1);
+        assert_eq!(super::resolve_parallel_vlm_batch_limit(1), 1);
+        assert_eq!(super::resolve_parallel_vlm_batch_limit(2), 2);
+        assert_eq!(super::resolve_parallel_vlm_batch_limit(3), 3);
+        assert_eq!(super::resolve_parallel_vlm_batch_limit(4), 3);
     }
 
     #[derive(Default)]

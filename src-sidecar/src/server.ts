@@ -3,7 +3,10 @@ import os from "node:os";
 import type { Server } from "node:http";
 import express, { type Request, type Response } from "express";
 import puppeteer, { type Browser, type Page } from "puppeteer";
-import { search1688ByImage } from "./1688_engine";
+import {
+  search1688ByImage,
+  shouldEnsureHomePageBeforeSessionCheck,
+} from "./1688_engine";
 import { ChromeNotFoundError, findChromePath } from "./chrome-path";
 import { ERROR_CODES, type SidecarErrorCode } from "./error-codes";
 
@@ -59,7 +62,7 @@ const LOGIN_URL_HINTS = [
   "passport.alibaba.com",
 ];
 const LOGIN_TEXT_HINTS = ["请登录", "免费注册", "会员登录", "登录后可", "登录后"];
-const LOGGED_IN_TEXT_HINTS = ["我的阿里", "我的1688", "买家工作台"];
+const LOGGED_IN_TEXT_HINTS = ["买家工作台"];
 const ANTI_BOT_URL_HINTS = ["sec.", "punish", "captcha", "verify"];
 const ANTI_BOT_TEXT_HINTS = [
   "请完成验证",
@@ -172,6 +175,9 @@ export function classifySessionState(snapshot: SessionSnapshot): SessionState {
   const url = (snapshot.url || "").toLowerCase();
   const visibleText = normalizeVisibleText(snapshot.visibleText);
   const links = snapshot.links.join(" ").toLowerCase();
+  const hasStrongLoggedInSignal =
+    snapshot.hasLoggedInEntry ||
+    LOGGED_IN_TEXT_HINTS.some((hint) => visibleText.includes(hint));
 
   if (
     snapshot.hasAntiBotChallenge ||
@@ -181,10 +187,7 @@ export function classifySessionState(snapshot: SessionSnapshot): SessionState {
     return "anti_bot_challenge";
   }
 
-  if (
-    snapshot.hasLoggedInEntry ||
-    LOGGED_IN_TEXT_HINTS.some((hint) => visibleText.includes(hint))
-  ) {
+  if (hasStrongLoggedInSignal) {
     return "ready";
   }
 
@@ -201,7 +204,11 @@ export function classifySessionState(snapshot: SessionSnapshot): SessionState {
     return "login_required";
   }
 
-  return "ready";
+  if (LOGIN_URL_HINTS.some((hint) => links.includes(hint))) {
+    return "login_required";
+  }
+
+  return "login_required";
 }
 
 export function classifySessionStates(snapshots: SessionSnapshot[]): SessionState {
@@ -220,60 +227,70 @@ export function classifySessionStates(snapshots: SessionSnapshot[]): SessionStat
 }
 
 async function collectSessionSnapshot(page: Page): Promise<SessionSnapshot> {
-  return page.evaluate(() => ({
-    url: window.location.href,
-    visibleText: (document.body?.innerText || "").slice(0, 12000),
-    links: Array.from(document.querySelectorAll<HTMLAnchorElement>("a[href]"))
-      .slice(0, 200)
-      .map((element) => element.href || element.getAttribute("href") || "")
-      .filter((value) => value.length > 0),
-    hasAntiBotChallenge:
-      [
-        ".nc-container",
-        "#baxia-dialog-content",
-        "#nc_1_n1z",
-        'iframe[src*="punish"]',
-        'iframe[src*="captcha"]',
-      ].some((selector) => document.querySelector(selector) !== null) ||
-      /请完成验证|请先完成验证|滑动验证|访问验证|网络环境存在异常/.test(
-        document.body?.innerText || "",
-      ),
-    hasLoginEntry:
-      [
-        'a[href*="login.1688.com"]',
-        'a[href*="member/signin"]',
-        'a[href*="passport.alibaba.com"]',
-      ].some((selector) => document.querySelector(selector) !== null) ||
-      Array.from(document.querySelectorAll<HTMLElement>("button, a, div, span"))
-        .some((element) => {
-          const style = window.getComputedStyle(element);
-          const rect = element.getBoundingClientRect();
-          if (style.display === "none" || style.visibility === "hidden" || rect.width <= 0 || rect.height <= 0) {
-            return false;
-          }
+  return page.evaluate(() => {
+    const isVisible = (element: Element | null) => {
+      if (!(element instanceof HTMLElement)) {
+        return false;
+      }
+      const style = window.getComputedStyle(element);
+      const rect = element.getBoundingClientRect();
+      return (
+        style.display !== "none" &&
+        style.visibility !== "hidden" &&
+        rect.width > 0 &&
+        rect.height > 0
+      );
+    };
+
+    const visibleAnchors = Array.from(
+      document.querySelectorAll<HTMLAnchorElement>("a[href]"),
+    ).filter((element) => isVisible(element));
+    const visibleElements = Array.from(
+      document.querySelectorAll<HTMLElement>("button, a, div, span"),
+    ).filter((element) => isVisible(element));
+
+    return {
+      url: window.location.href,
+      visibleText: (document.body?.innerText || "").slice(0, 12000),
+      links: visibleAnchors
+        .slice(0, 200)
+        .map((element) => element.href || element.getAttribute("href") || "")
+        .filter((value) => value.length > 0),
+      hasAntiBotChallenge:
+        [
+          ".nc-container",
+          "#baxia-dialog-content",
+          "#nc_1_n1z",
+          'iframe[src*="punish"]',
+          'iframe[src*="captcha"]',
+        ].some((selector) => document.querySelector(selector) !== null) ||
+        /请完成验证|请先完成验证|滑动验证|访问验证|网络环境存在异常/.test(
+          document.body?.innerText || "",
+        ),
+      hasLoginEntry:
+        visibleAnchors.some((element) => {
+          const href = element.href || element.getAttribute("href") || "";
+          return (
+            href.includes("login.1688.com") ||
+            href.includes("member/signin") ||
+            href.includes("passport.alibaba.com")
+          );
+        }) ||
+        visibleElements.some((element) => {
           const text = (element.innerText || element.textContent || "").replace(/\s+/g, "");
           return text === "登录" || text === "请登录" || text === "免费注册";
         }),
-    hasLoggedInEntry:
-      [
-        'a[href*="work.1688.com"]',
-        'a[href*="member.1688.com/member"]',
-      ].some((selector) => document.querySelector(selector) !== null) ||
-      Array.from(document.querySelectorAll<HTMLElement>("button, a, div, span"))
-        .some((element) => {
-          const style = window.getComputedStyle(element);
-          const rect = element.getBoundingClientRect();
-          if (style.display === "none" || style.visibility === "hidden" || rect.width <= 0 || rect.height <= 0) {
-            return false;
-          }
+      hasLoggedInEntry:
+        visibleAnchors.some((element) => {
+          const href = element.href || element.getAttribute("href") || "";
+          return href.includes("work.1688.com/home/page");
+        }) ||
+        visibleElements.some((element) => {
           const text = (element.innerText || element.textContent || "").replace(/\s+/g, "");
-          return (
-            text.includes("我的阿里") ||
-            text.includes("我的1688") ||
-            text.includes("买家工作台")
-          );
+          return text.includes("买家工作台");
         }),
-  }));
+    };
+  });
 }
 
 async function listCandidatePages(primaryPage: Page): Promise<Page[]> {
@@ -286,8 +303,25 @@ async function listCandidatePages(primaryPage: Page): Promise<Page[]> {
   return [...pages].filter((page) => !page.isClosed());
 }
 
+async function ensurePageReadyForSessionCheck(page: Page): Promise<Page> {
+  try {
+    await page.bringToFront();
+  } catch {}
+
+  if (shouldEnsureHomePageBeforeSessionCheck(page.url())) {
+    await page.goto("https://www.1688.com/", {
+      waitUntil: "domcontentloaded",
+      timeout: 60_000,
+    });
+  }
+
+  return page;
+}
+
 async function ensure1688SessionReady(page: Page): Promise<void> {
-  const state = classifySessionState(await collectSessionSnapshot(page));
+  const state = classifySessionState(
+    await collectSessionSnapshot(await ensurePageReadyForSessionCheck(page)),
+  );
   if (state === "login_required") {
     throw new Error("[LOGIN_REQUIRED] 当前 1688 未登录，请先在浏览器完成登录");
   }
@@ -383,7 +417,7 @@ async function ensureBrowserAndPageAliveInner(): Promise<Page> {
     });
   }
 
-  return globalHomePage;
+  return ensurePageReadyForSessionCheck(globalHomePage);
 }
 
 const ensureBrowserAndPageAlive = createSharedAsyncRunner(
@@ -516,7 +550,9 @@ export function createSessionStateHandler(
 ) {
   return async (_req: Request, res: Response) => {
     try {
-      const activeHomePage = await dependencies.ensureBrowserAndPageAlive();
+      const activeHomePage = await ensurePageReadyForSessionCheck(
+        await dependencies.ensureBrowserAndPageAlive(),
+      );
       const pages = await dependencies.listCandidatePages(activeHomePage);
       const snapshots = await Promise.all(
         pages.map(async (page) => {

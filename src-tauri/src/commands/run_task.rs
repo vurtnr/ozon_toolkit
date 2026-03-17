@@ -986,6 +986,31 @@ fn resolve_search_image_plan(
     vlm_client.plan_search_images(ozon_image_base64, ozon_name)
 }
 
+pub fn build_match_hint(ozon_name: &str, target_product: &str) -> String {
+    let normalized_ozon_name = ozon_name.trim();
+    let normalized_target_product = target_product.trim();
+
+    if normalized_target_product.is_empty() {
+        return normalized_ozon_name.to_string();
+    }
+    if normalized_ozon_name.is_empty() {
+        return normalized_target_product.to_string();
+    }
+    if normalized_target_product == normalized_ozon_name {
+        return normalized_ozon_name.to_string();
+    }
+    if normalized_ozon_name.contains(normalized_target_product) {
+        return normalized_ozon_name.to_string();
+    }
+    if normalized_target_product.contains(normalized_ozon_name) {
+        return normalized_target_product.to_string();
+    }
+
+    format!(
+        "{normalized_target_product}；原始标题：{normalized_ozon_name}"
+    )
+}
+
 fn build_mock_source_png() -> Result<Vec<u8>, String> {
     let image = RgbaImage::from_fn(320, 320, |x, y| {
         if x > 70 && x < 250 && y > 50 && y < 270 {
@@ -1553,6 +1578,11 @@ pub fn run_task_with_original_source_and_sink(
                                                 Ok(primary_search_base64),
                                                 Ok(fallback_search_base64),
                                             ) => {
+                                                let match_hint =
+                                                    build_match_hint(
+                                                        &row.ozon_name,
+                                                        &search_plan.target_product,
+                                                    );
                                                 let fetcher = SidecarCandidateFetcher::new(
                                                     sink,
                                                     &client,
@@ -1574,7 +1604,7 @@ pub fn run_task_with_original_source_and_sink(
                                                             &fallback_search_base64,
                                                     },
                                                     &ozon_base64,
-                                                    Some(&row.ozon_name),
+                                                    Some(&match_hint),
                                                 );
                                                 let search_timings = fetcher.timings();
                                                 row_stage_timings.primary_search_ms =

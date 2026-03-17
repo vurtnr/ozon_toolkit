@@ -72,6 +72,19 @@ describe("classifySessionState", () => {
     expect(classifySessionState(snapshot)).toBe("login_required");
   });
 
+  test("does not treat generic my-1688 header copy as authenticated state", () => {
+    const snapshot: SessionSnapshot = {
+      url: "https://www.1688.com/",
+      visibleText: "我的1688 我的阿里 采购车 消息",
+      links: ["https://member.1688.com/member/default.htm"],
+      hasAntiBotChallenge: false,
+      hasLoginEntry: true,
+      hasLoggedInEntry: false,
+    };
+
+    expect(classifySessionState(snapshot)).toBe("login_required");
+  });
+
   test("treats logged-in workbench markers as ready even when generic login copy is absent", () => {
     const snapshot: SessionSnapshot = {
       url: "https://www.1688.com/",
@@ -90,6 +103,35 @@ describe("classifySessionState", () => {
       url: "https://www.1688.com/",
       visibleText: "采购车 进货单 消息",
       links: [],
+      hasAntiBotChallenge: false,
+      hasLoginEntry: false,
+      hasLoggedInEntry: false,
+    };
+
+    expect(classifySessionState(snapshot)).toBe("login_required");
+  });
+
+  test("does not treat generic member-center links as authenticated state without strong workbench markers", () => {
+    const snapshot: SessionSnapshot = {
+      url: "https://www.1688.com/",
+      visibleText: "欢迎来到1688",
+      links: [
+        "https://member.1688.com/member/default.htm",
+        "https://member.1688.com/member/buyer_orders.htm",
+      ],
+      hasAntiBotChallenge: false,
+      hasLoginEntry: true,
+      hasLoggedInEntry: false,
+    };
+
+    expect(classifySessionState(snapshot)).toBe("login_required");
+  });
+
+  test("does not treat generic workbench links as authenticated state without visible logged-in markers", () => {
+    const snapshot: SessionSnapshot = {
+      url: "https://www.1688.com/",
+      visibleText: "欢迎来到1688",
+      links: ["https://work.1688.com/home/page/index.htm"],
       hasAntiBotChallenge: false,
       hasLoginEntry: false,
       hasLoggedInEntry: false,
@@ -119,6 +161,27 @@ describe("classifySessionStates", () => {
     };
 
     expect(classifySessionStates([home, loginPopup])).toBe("login_required");
+  });
+
+  test("does not let restored generic result pages bypass login gating", () => {
+    const home: SessionSnapshot = {
+      url: "https://www.1688.com/",
+      visibleText: "欢迎来到1688",
+      links: [],
+      hasAntiBotChallenge: false,
+      hasLoginEntry: false,
+      hasLoggedInEntry: false,
+    };
+    const restoredResultPage: SessionSnapshot = {
+      url: "https://s.1688.com/selloffer/offer_search.htm?keywords=test",
+      visibleText: "商品列表 排序 筛选",
+      links: [],
+      hasAntiBotChallenge: false,
+      hasLoginEntry: false,
+      hasLoggedInEntry: false,
+    };
+
+    expect(classifySessionStates([home, restoredResultPage])).toBe("login_required");
   });
 
   test("returns ready once any open page exposes a strong authenticated marker", () => {

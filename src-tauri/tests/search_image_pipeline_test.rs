@@ -78,7 +78,31 @@ fn parse_search_image_plan_accepts_strict_json_and_normalizes_boxes() {
 }
 
 #[test]
-fn parse_search_image_plan_rejects_non_json_and_out_of_bounds_boxes() {
+fn parse_search_image_plan_clamps_minor_bbox_overflow() {
+    let content = r#"{
+      "target_product":"bag",
+      "scene_type":"single_product",
+      "primary_bbox":{"x":0.82,"y":-0.04,"width":0.28,"height":0.72},
+      "fallback_bbox":{"x":0.08,"y":0.04,"width":0.96,"height":0.92},
+      "background_strategy":"remove_and_whitefill",
+      "subject_confidence":0.92,
+      "needs_fallback_context":true
+    }"#;
+
+    let plan = parse_search_image_plan(content).expect("plan should clamp into bounds");
+
+    assert!((0.0..=1.0).contains(&plan.primary_bbox.x));
+    assert!((0.0..=1.0).contains(&plan.primary_bbox.y));
+    assert!(plan.primary_bbox.width > 0.0);
+    assert!(plan.primary_bbox.height > 0.0);
+    assert!(plan.primary_bbox.x + plan.primary_bbox.width <= 1.0);
+    assert!(plan.primary_bbox.y + plan.primary_bbox.height <= 1.0);
+    assert!(plan.fallback_bbox.x + plan.fallback_bbox.width <= 1.0);
+    assert!(plan.fallback_bbox.y + plan.fallback_bbox.height <= 1.0);
+}
+
+#[test]
+fn parse_search_image_plan_rejects_non_json_and_far_out_of_bounds_boxes() {
     assert!(parse_search_image_plan("not-json").is_err());
 
     let invalid = r#"{

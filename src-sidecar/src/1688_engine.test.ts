@@ -2,6 +2,9 @@ import { describe, expect, test } from "bun:test";
 import {
   executeResultPageRecall,
   isLikelySearchResultsUrl,
+  shouldKeepWaitingForSearchConfirm,
+  shouldEnsureHomePageBeforeSessionCheck,
+  selectClosableTabs,
   shouldStopResultScroll,
   shouldNavigateTo1688Home,
   waitForSearchResults,
@@ -122,6 +125,30 @@ describe("shouldNavigateTo1688Home", () => {
   });
 });
 
+describe("shouldEnsureHomePageBeforeSessionCheck", () => {
+  test("requires resetting generic result pages back to home before session checks", () => {
+    expect(
+      shouldEnsureHomePageBeforeSessionCheck(
+        "https://s.1688.com/selloffer/offer_search.htm?keywords=test",
+      ),
+    ).toBe(true);
+    expect(
+      shouldEnsureHomePageBeforeSessionCheck(
+        "https://detail.1688.com/offer/123.html",
+      ),
+    ).toBe(true);
+  });
+
+  test("keeps current page when already at home or login flow", () => {
+    expect(shouldEnsureHomePageBeforeSessionCheck("https://www.1688.com/")).toBe(false);
+    expect(
+      shouldEnsureHomePageBeforeSessionCheck(
+        "https://login.1688.com/member/signin.htm",
+      ),
+    ).toBe(false);
+  });
+});
+
 describe("waitForSearchResults", () => {
   test("returns immediately when product cards appear without waiting for network idle", async () => {
     const calls: string[] = [];
@@ -200,6 +227,70 @@ describe("isLikelySearchResultsUrl", () => {
   test("does not treat the 1688 home page as a result page", () => {
     expect(isLikelySearchResultsUrl("https://www.1688.com/")).toBe(false);
     expect(isLikelySearchResultsUrl("about:blank")).toBe(false);
+  });
+});
+
+describe("shouldKeepWaitingForSearchConfirm", () => {
+  test("stops confirm polling once the image-search result page is already open", () => {
+    expect(
+      shouldKeepWaitingForSearchConfirm(
+        "https://s.1688.com/youyuan/index.htm?tab=imageSearch&imageType=offer",
+        false,
+      ),
+    ).toBe(false);
+  });
+
+  test("stops confirm polling once result cards are already visible on the current page", () => {
+    expect(
+      shouldKeepWaitingForSearchConfirm("https://www.1688.com/", true),
+    ).toBe(false);
+    expect(
+      shouldKeepWaitingForSearchConfirm("https://www.1688.com/", false),
+    ).toBe(true);
+  });
+});
+
+describe("selectClosableTabs", () => {
+  test("closes stale 1688 result tabs and blank tabs while keeping the home page", () => {
+    const homePage = {
+      url: () => "https://www.1688.com/",
+      isClosed: () => false,
+    };
+    const resultPage = {
+      url: () => "https://s.1688.com/youyuan/index.htm?tab=imageSearch",
+      isClosed: () => false,
+    };
+    const blankPage = {
+      url: () => "about:blank",
+      isClosed: () => false,
+    };
+    const externalPage = {
+      url: () => "https://example.com/",
+      isClosed: () => false,
+    };
+
+    expect(
+      selectClosableTabs([homePage, resultPage, blankPage, externalPage], [homePage]),
+    ).toEqual([resultPage, blankPage]);
+  });
+
+  test("skips already closed pages and explicitly kept result tabs", () => {
+    const homePage = {
+      url: () => "https://www.1688.com/",
+      isClosed: () => false,
+    };
+    const keptResultPage = {
+      url: () => "https://s.1688.com/selloffer/offer_search.htm",
+      isClosed: () => false,
+    };
+    const closedResultPage = {
+      url: () => "https://s.1688.com/youyuan/index.htm?tab=imageSearch",
+      isClosed: () => true,
+    };
+
+    expect(
+      selectClosableTabs([homePage, keptResultPage, closedResultPage], [homePage, keptResultPage]),
+    ).toEqual([]);
   });
 });
 

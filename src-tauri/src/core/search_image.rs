@@ -8,6 +8,7 @@ use image::{DynamicImage, Rgba, RgbaImage};
 const OUTPUT_CANVAS_SIZE: u32 = 1024;
 const PRIMARY_OCCUPANCY_RATIO: f32 = 0.84;
 const FALLBACK_OCCUPANCY_RATIO: f32 = 0.68;
+const MIN_NORMALIZED_BBOX_SIZE: f32 = 0.01;
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct NormalizedBBox {
@@ -97,14 +98,44 @@ pub fn parse_search_image_plan(content: &str) -> Result<SearchImagePlan, String>
 }
 
 fn normalize_bbox(raw: RawNormalizedBBox) -> Result<NormalizedBBox, String> {
+    let x = sanitize_coordinate(raw.x, "x")?;
+    let y = sanitize_coordinate(raw.y, "y")?;
+    let mut width = sanitize_size(raw.width, "width")?;
+    let mut height = sanitize_size(raw.height, "height")?;
+
+    width = width.min(1.0 - x);
+    height = height.min(1.0 - y);
+    if width < MIN_NORMALIZED_BBOX_SIZE || height < MIN_NORMALIZED_BBOX_SIZE {
+        return Err("bbox must leave a visible area within normalized image bounds".to_string());
+    }
+
     let bbox = NormalizedBBox {
-        x: raw.x,
-        y: raw.y,
-        width: raw.width,
-        height: raw.height,
+        x,
+        y,
+        width,
+        height,
     };
     bbox.validate()?;
     Ok(bbox)
+}
+
+fn sanitize_coordinate(value: f32, field: &str) -> Result<f32, String> {
+    if !value.is_finite() {
+        return Err(format!("bbox {field} must be finite"));
+    }
+
+    Ok(value.clamp(0.0, 1.0))
+}
+
+fn sanitize_size(value: f32, field: &str) -> Result<f32, String> {
+    if !value.is_finite() {
+        return Err(format!("bbox {field} must be finite"));
+    }
+    if value <= 0.0 {
+        return Err("bbox size must be positive".to_string());
+    }
+
+    Ok(value.clamp(MIN_NORMALIZED_BBOX_SIZE, 1.0))
 }
 
 fn parse_background_strategy(value: &str) -> Result<BackgroundStrategy, String> {

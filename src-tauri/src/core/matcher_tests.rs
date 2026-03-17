@@ -141,7 +141,7 @@ fn build_verification_chunks_keeps_three_groups_when_tail_is_still_competitive()
 }
 
 #[test]
-fn prepare_final_review_candidates_deduplicates_and_preserves_match_order() {
+fn prepare_final_review_candidates_deduplicates_and_sorts_by_price() {
     let candidates = vec![
         candidate_with_price_and_url("¥3.5", "u1"),
         candidate_with_price_and_url("¥2.0", "u2"),
@@ -151,11 +151,10 @@ fn prepare_final_review_candidates_deduplicates_and_preserves_match_order() {
     ];
 
     let prepared = prepare_final_review_candidates(candidates, 10);
-    assert_eq!(prepared.len(), 4);
-    assert_eq!(prepared[0].item_url, "u1");
+    assert_eq!(prepared.len(), 3);
+    assert_eq!(prepared[0].item_url, "u4");
     assert_eq!(prepared[1].item_url, "u2");
-    assert_eq!(prepared[2].item_url, "u3");
-    assert_eq!(prepared[3].item_url, "u4");
+    assert_eq!(prepared[2].item_url, "u1");
 }
 
 #[test]
@@ -180,14 +179,15 @@ fn select_screening_candidates_keeps_relevant_low_price_frontier_items() {
 }
 
 #[test]
-fn prepare_final_review_candidates_adds_late_cheapest_match_for_final_check() {
+fn prepare_final_review_candidates_prioritizes_late_cheaper_matches() {
     let prepared = prepare_final_review_candidates(
         vec![
-            candidate_with_price_and_url("¥18.0", "u1"),
-            candidate_with_price_and_url("¥19.0", "u2"),
-            candidate_with_price_and_url("¥20.0", "u3"),
-            candidate_with_price_and_url("¥21.0", "u4"),
+            candidate_with_price_and_url("¥28.0", "u1"),
+            candidate_with_price_and_url("¥29.0", "u2"),
+            candidate_with_price_and_url("¥30.0", "u3"),
+            candidate_with_price_and_url("¥31.0", "u4"),
             candidate_with_price_and_url("¥4.8", "u5"),
+            candidate_with_price_and_url("¥5.2", "u6"),
         ],
         4,
     );
@@ -196,7 +196,32 @@ fn prepare_final_review_candidates_adds_late_cheapest_match_for_final_check() {
         .iter()
         .map(|candidate| candidate.item_url.as_str())
         .collect::<Vec<_>>();
-    assert_eq!(urls, vec!["u1", "u2", "u3", "u5"]);
+    assert_eq!(urls, vec!["u5", "u6", "u1", "u2"]);
+}
+
+#[test]
+fn prepare_final_review_candidates_preserves_top_rank_window_before_late_price_fill() {
+    let prepared = prepare_final_review_candidates(
+        vec![
+            candidate_with_price_and_url("¥28.0", "u1"),
+            candidate_with_price_and_url("¥29.0", "u2"),
+            candidate_with_price_and_url("¥30.0", "u3"),
+            candidate_with_price_and_url("¥31.0", "u4"),
+            candidate_with_price_and_url("¥32.0", "u5"),
+            candidate_with_price_and_url("¥33.0", "u6"),
+            candidate_with_price_and_url("¥34.0", "u7"),
+            candidate_with_price_and_url("¥1.2", "u8"),
+            candidate_with_price_and_url("¥1.5", "u9"),
+            candidate_with_price_and_url("¥1.8", "u10"),
+        ],
+        8,
+    );
+
+    let urls = prepared
+        .iter()
+        .map(|candidate| candidate.item_url.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(urls, vec!["u8", "u9", "u1", "u2", "u3", "u4", "u5", "u6"]);
 }
 
 #[test]

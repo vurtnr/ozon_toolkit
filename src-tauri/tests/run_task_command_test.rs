@@ -8,8 +8,9 @@ use std::time::{Duration, Instant};
 
 use calamine::{open_workbook, Reader, Xlsx};
 use desktop_app_lib::commands::run_task::{
-    choose_sidecar_profile_base_dir, run_task_with_original_source_and_sink, run_task_with_sink,
-    shutdown_managed_sidecar, sidecar_profile_dir_for_base, sidecar_runtime_dir_for_base,
+    build_match_hint, choose_sidecar_profile_base_dir, run_task_with_original_source_and_sink,
+    run_task_with_sink, shutdown_managed_sidecar, sidecar_profile_dir_for_base,
+    sidecar_runtime_dir_for_base,
     RunTaskSummary,
 };
 use desktop_app_lib::events::{
@@ -117,6 +118,19 @@ fn create_single_row_workbook(path: &PathBuf) {
         .expect("write row 1 sku");
 
     workbook.save(path).expect("save workbook");
+}
+
+#[test]
+fn build_match_hint_prefers_planner_target_product_without_losing_original_title() {
+    assert_eq!(
+        build_match_hint(
+            "Аксессуары и комплектующие для судов",
+            "船用绳梯（带金属挂钩和红色踏步带）",
+        ),
+        "船用绳梯（带金属挂钩和红色踏步带）；原始标题：Аксессуары и комплектующие для судов"
+    );
+    assert_eq!(build_match_hint("sample title", "sample title"), "sample title");
+    assert_eq!(build_match_hint("sample title", ""), "sample title");
 }
 
 fn remove_if_exists(path: &PathBuf) {

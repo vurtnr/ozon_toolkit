@@ -299,6 +299,16 @@ fn parse_vlm_response_content_returns_empty_array_for_malformed_content() {
 }
 
 #[test]
+fn parse_vlm_response_content_recovers_match_ids_from_truncated_json() {
+    let match_ids = parse_vlm_response_content(
+        "{\n  \"reasoning\": \"too long\",\n  \"match_ids\": [1, 2, 4, 7",
+        4,
+    );
+
+    assert_eq!(match_ids, vec![1, 2, 4]);
+}
+
+#[test]
 fn verify_single_candidate_returns_true_when_slot_one_matches() {
     let vlm = ScriptedVlm::with_replies(vec![Ok(vec![1])]);
     let matched = verify_single_candidate(
@@ -315,7 +325,7 @@ fn verify_single_candidate_returns_true_when_slot_one_matches() {
 
 #[test]
 fn pick_cheapest_after_final_review_returns_cheapest_confirmed_candidate() {
-    let vlm = ScriptedVlm::with_replies(vec![Ok(vec![2])]);
+    let vlm = ScriptedVlm::with_replies(vec![Ok(vec![1])]);
     let result = pick_cheapest_after_final_review(
         &vlm,
         "data:image/png;base64,processed-search",
@@ -335,7 +345,7 @@ fn pick_cheapest_after_final_review_returns_cheapest_confirmed_candidate() {
 
 #[test]
 fn pick_cheapest_after_final_review_batches_strict_reviews() {
-    let vlm = ScriptedVlm::with_replies(vec![Ok(vec![1, 4]), Ok(vec![2])]);
+    let vlm = ScriptedVlm::with_replies(vec![Ok(vec![]), Ok(vec![2])]);
     let result = pick_cheapest_after_final_review(
         &vlm,
         "data:image/png;base64,processed-search",
@@ -355,7 +365,7 @@ fn pick_cheapest_after_final_review_batches_strict_reviews() {
 
     assert_eq!(
         result,
-        MatchSummary::Cheapest(candidate("¥6.20", "candidate-6"))
+        MatchSummary::Cheapest(candidate("¥18.20", "candidate-3"))
     );
     assert_eq!(
         vlm.recorded_calls(),
@@ -370,6 +380,53 @@ fn pick_cheapest_after_final_review_batches_strict_reviews() {
                 primary_reference_image_base64: "data:image/png;base64,processed-search"
                     .to_string(),
                 auxiliary_reference_image_base64: Some("data:image/jpeg;base64,source".to_string()),
+                candidate_count: 4,
+            },
+        ]
+    );
+}
+
+#[test]
+fn pick_cheapest_after_final_review_prefers_first_matching_price_batch_while_still_finishing_review_wave() {
+    let vlm = ScriptedVlm::with_replies(vec![Ok(vec![2]), Ok(vec![1])]);
+    let result = pick_cheapest_after_final_review(
+        &vlm,
+        "data:image/png;base64,processed-search",
+        Some("data:image/jpeg;base64,source"),
+        vec![
+            candidate("¥12.80", "candidate-1"),
+            candidate("¥15.90", "candidate-2"),
+            candidate("¥18.20", "candidate-3"),
+            candidate("¥9.60", "candidate-4"),
+            candidate("¥7.80", "candidate-5"),
+            candidate("¥6.20", "candidate-6"),
+            candidate("¥20.10", "candidate-7"),
+            candidate("¥22.40", "candidate-8"),
+        ],
+        Some("sample ozon name"),
+    );
+
+    assert_eq!(
+        result,
+        MatchSummary::Cheapest(candidate("¥7.80", "candidate-5"))
+    );
+    assert_eq!(
+        vlm.recorded_calls(),
+        vec![
+            RecordedVlmCall {
+                primary_reference_image_base64: "data:image/png;base64,processed-search"
+                    .to_string(),
+                auxiliary_reference_image_base64: Some(
+                    "data:image/jpeg;base64,source".to_string()
+                ),
+                candidate_count: 4,
+            },
+            RecordedVlmCall {
+                primary_reference_image_base64: "data:image/png;base64,processed-search"
+                    .to_string(),
+                auxiliary_reference_image_base64: Some(
+                    "data:image/jpeg;base64,source".to_string()
+                ),
                 candidate_count: 4,
             },
         ]
