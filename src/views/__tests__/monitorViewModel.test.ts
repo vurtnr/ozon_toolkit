@@ -12,12 +12,14 @@ function buildRow(overrides: Partial<MonitorRow> = {}): MonitorRow {
     stage: "queued",
     status: "排队中",
     imageUrl: null,
+    originalImageUrl: null,
+    matchedImageUrl: null,
     itemUrl: null,
     price: null,
     elapsedText: null,
     isFinal: false,
     ...overrides,
-  };
+  } as MonitorRow;
 }
 
 describe("monitorViewModel", () => {

@@ -33,6 +33,10 @@ const doneSummary = computed(() => {
   return `${monitor.state.done.processed_rows}/${monitor.state.done.total_rows}`;
 });
 
+function resolveMatchedImage(url: string | null, fallback: string | null): string | null {
+  return url || fallback;
+}
+
 function dismissAlert() {
   monitor.state.alert = null;
 }
@@ -106,6 +110,8 @@ function dismissAlert() {
                 <th>行号</th>
                 <th>SKU / 状态</th>
                 <th>阶段</th>
+                <th>原图</th>
+                <th>匹配图</th>
                 <th>耗时</th>
                 <th>价格</th>
                 <th>链接</th>
@@ -126,6 +132,32 @@ function dismissAlert() {
                   <span class="stage-pill" :data-tone="getStagePresentation(row).tone">
                     {{ getStagePresentation(row).label }}
                   </span>
+                </td>
+                <td class="thumb-cell">
+                  <div v-if="row.originalImageUrl" class="thumb-frame">
+                    <img
+                      class="thumb-image"
+                      :src="row.originalImageUrl"
+                      :alt="`${row.sku} 原图`"
+                      loading="lazy"
+                    />
+                  </div>
+                  <span v-else class="muted-token">--</span>
+                </td>
+                <td class="thumb-cell">
+                  <div
+                    v-if="resolveMatchedImage(row.matchedImageUrl, row.imageUrl)"
+                    class="thumb-frame"
+                  >
+                    <img
+                      class="thumb-image"
+                      :src="resolveMatchedImage(row.matchedImageUrl, row.imageUrl) || undefined"
+                      :alt="`${row.sku} 匹配图`"
+                      loading="lazy"
+                      referrerpolicy="no-referrer"
+                    />
+                  </div>
+                  <span v-else class="muted-token">--</span>
                 </td>
                 <td>{{ row.elapsedText || "--" }}</td>
                 <td class="price-cell">{{ row.price || "--" }}</td>
@@ -278,7 +310,7 @@ function dismissAlert() {
 .monitor-table {
   width: 100%;
   border-collapse: collapse;
-  min-width: 52rem;
+  min-width: 72rem;
 }
 
 .monitor-table th,
@@ -305,6 +337,10 @@ function dismissAlert() {
   white-space: nowrap;
 }
 
+.thumb-cell {
+  width: 7.5rem;
+}
+
 .status-cell {
   min-width: 16rem;
 }
@@ -322,6 +358,28 @@ function dismissAlert() {
 .price-cell {
   color: var(--accent-green);
   font-weight: 700;
+}
+
+.thumb-frame {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 5.5rem;
+  height: 5.5rem;
+  overflow: hidden;
+  border-radius: 1rem;
+  border: 1px solid rgba(111, 232, 255, 0.14);
+  background:
+    linear-gradient(160deg, rgba(9, 25, 39, 0.92), rgba(5, 12, 19, 0.94));
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.05),
+    0 18px 32px rgba(0, 0, 0, 0.18);
+}
+
+.thumb-image {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
 }
 
 .stage-pill,

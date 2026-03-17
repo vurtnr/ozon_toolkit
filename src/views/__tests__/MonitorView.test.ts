@@ -16,22 +16,26 @@ describe("Monitor helpers", () => {
       stage: "planning_search_image",
       status: "processing",
       image_url: null,
+      original_image_url: "data:image/png;base64,source-preview",
+      matched_image_url: null,
       item_url: null,
       price: null,
       elapsed_text: null,
       is_final: false,
-    });
+    } as any);
     appendRowResult(state, {
       row_index: 2,
       sku: "SKU-2",
       stage: "completed",
       status: "processed",
       image_url: null,
+      original_image_url: "data:image/png;base64,source-preview",
+      matched_image_url: "https://img.1688.com/2.jpg",
       item_url: "https://detail.1688.com/offer/2.html",
       price: "¥5.20",
       elapsed_text: "12.3s",
       is_final: true,
-    });
+    } as any);
 
     expect(state.rows).toHaveLength(1);
     expect(state.rows[0]?.sku).toBe("SKU-2");
@@ -39,6 +43,12 @@ describe("Monitor helpers", () => {
     expect(state.rows[0]?.price).toBe("¥5.20");
     expect(state.rows[0]?.elapsedText).toBe("12.3s");
     expect(state.rows[0]?.isFinal).toBe(true);
+    expect(Reflect.get(state.rows[0] as object, "originalImageUrl")).toBe(
+      "data:image/png;base64,source-preview",
+    );
+    expect(Reflect.get(state.rows[0] as object, "matchedImageUrl")).toBe(
+      "https://img.1688.com/2.jpg",
+    );
   });
 
   test("keeps rows ordered by row index when staged updates arrive", () => {
@@ -49,24 +59,63 @@ describe("Monitor helpers", () => {
       stage: "queued",
       status: "queued",
       image_url: null,
+      original_image_url: null,
+      matched_image_url: null,
       item_url: null,
       price: null,
       elapsed_text: null,
       is_final: false,
-    });
+    } as any);
     appendRowResult(state, {
       row_index: 1,
       sku: "SKU-1",
       stage: "queued",
       status: "queued",
       image_url: null,
+      original_image_url: null,
+      matched_image_url: null,
       item_url: null,
       price: null,
       elapsed_text: null,
       is_final: false,
-    });
+    } as any);
 
     expect(state.rows.map((row) => row.rowIndex)).toEqual([1, 3]);
+  });
+
+  test("retains known thumbnails when later stage updates omit image fields", () => {
+    const state = createEmptyMonitor();
+    appendRowResult(state, {
+      row_index: 1,
+      sku: "SKU-1",
+      stage: "planning_search_image",
+      status: "processing",
+      image_url: null,
+      original_image_url: "data:image/png;base64,source-preview",
+      matched_image_url: null,
+      item_url: null,
+      price: null,
+      elapsed_text: null,
+      is_final: false,
+    } as any);
+    appendRowResult(state, {
+      row_index: 1,
+      sku: "SKU-1",
+      stage: "screening_candidates",
+      status: "AI复核中",
+      image_url: null,
+      original_image_url: null,
+      matched_image_url: null,
+      item_url: null,
+      price: null,
+      elapsed_text: "4.2s",
+      is_final: false,
+    } as any);
+
+    expect(Reflect.get(state.rows[0] as object, "originalImageUrl")).toBe(
+      "data:image/png;base64,source-preview",
+    );
+    expect(state.rows[0]?.elapsedText).toBe("4.2s");
   });
 
   test("updates progress fields", () => {
@@ -84,11 +133,13 @@ describe("Monitor helpers", () => {
       stage: "completed",
       status: "processed",
       image_url: null,
+      original_image_url: "data:image/png;base64,source-preview",
+      matched_image_url: "https://img.1688.com/1.jpg",
       item_url: null,
       price: null,
       elapsed_text: null,
       is_final: true,
-    });
+    } as any);
     setBlockingAlert(state, {
       code: "ANTI_BOT_CHALLENGE",
       message: "challenge",

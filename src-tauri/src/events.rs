@@ -59,6 +59,8 @@ pub struct RowResultEvent {
     pub stage: String,
     pub status: String,
     pub image_url: Option<String>,
+    pub original_image_url: Option<String>,
+    pub matched_image_url: Option<String>,
     pub item_url: Option<String>,
     pub price: Option<String>,
     pub elapsed_text: Option<String>,

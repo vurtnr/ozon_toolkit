@@ -19,6 +19,7 @@ use desktop_app_lib::events::{
 use desktop_app_lib::recovery::GLOBAL_RECOVERY_GATE;
 use rust_xlsxwriter::Workbook;
 use serde_json::Value;
+use zip::ZipArchive;
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
@@ -172,6 +173,58 @@ fn default_mock_search_image_plan_json() -> &'static str {
     }"#
 }
 
+fn spawn_image_server() -> (String, thread::JoinHandle<()>) {
+    const SAMPLE_PNG_BYTES: &[u8] = &[
+        137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1,
+        8, 6, 0, 0, 0, 31, 21, 196, 137, 0, 0, 0, 13, 73, 68, 65, 84, 120, 156, 99, 248, 207,
+        192, 240, 31, 0, 5, 0, 1, 255, 137, 153, 61, 29, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66,
+        96, 130,
+    ];
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind image listener");
+    listener
+        .set_nonblocking(true)
+        .expect("set image listener nonblocking");
+    let address = listener
+        .local_addr()
+        .expect("resolve image listener address");
+
+    let handle = thread::spawn(move || {
+        let started_at = Instant::now();
+        let mut last_activity = Instant::now();
+        let mut served_any = false;
+
+        loop {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let mut buffer = [0u8; 2048];
+                    let _ = stream.read(&mut buffer);
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        SAMPLE_PNG_BYTES.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes());
+                    let _ = stream.write_all(SAMPLE_PNG_BYTES);
+                    served_any = true;
+                    last_activity = Instant::now();
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if served_any && last_activity.elapsed() >= Duration::from_millis(250) {
+                        return;
+                    }
+                    if started_at.elapsed() >= Duration::from_secs(5) {
+                        return;
+                    }
+                    thread::sleep(Duration::from_millis(20));
+                }
+                Err(_) => return,
+            }
+        }
+    });
+
+    (format!("http://{address}/sample.png"), handle)
+}
+
 #[test]
 fn run_task_accepts_absolute_excel_path_and_emits_all_events() {
     let _guard = lock_env();
@@ -223,6 +276,17 @@ fn run_task_accepts_absolute_excel_path_and_emits_all_events() {
     assert_eq!(
         final_row_events[0]["item_url"],
         "https://detail.1688.com/offer/1.html"
+    );
+    assert!(
+        final_row_events[0]["original_image_url"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("data:image/"),
+        "final row event should carry the original thumbnail"
+    );
+    assert_eq!(
+        final_row_events[0]["matched_image_url"],
+        "https://img.1688.com/1.jpg"
     );
 
     let progress_events: Vec<&Value> = sink
@@ -369,19 +433,22 @@ fn run_task_uses_fallback_search_image_when_primary_has_no_match() {
 }
 
 #[test]
-fn run_task_writes_result_workbook_with_brain_core_columns() {
+fn run_task_writes_result_workbook_with_brain_core_columns_and_images() {
     let _guard = lock_env();
     GLOBAL_RECOVERY_GATE.resume();
 
     let excel_path = make_temp_excel_path();
     create_sample_workbook(&excel_path);
     let result_path = excel_path.with_file_name("result.xlsx");
+    let (image_url, image_server_handle) = spawn_image_server();
 
     set_mock_pipeline_env(
-        r#"[
-          [{"title":"sample","price":"¥12.34","itemUrl":"https://detail.1688.com/offer/1.html","imageUrl":"https://img.1688.com/1.jpg"}],
-          [{"title":"sample","price":"¥12.34","itemUrl":"https://detail.1688.com/offer/1.html","imageUrl":"https://img.1688.com/1.jpg"}]
-        ]"#,
+        &format!(
+            r#"[
+              [{{"title":"sample","price":"¥12.34","itemUrl":"https://detail.1688.com/offer/1.html","imageUrl":"{image_url}"}}],
+              [{{"title":"sample","price":"¥12.34","itemUrl":"https://detail.1688.com/offer/1.html","imageUrl":"{image_url}"}}]
+            ]"#
+        ),
         r#"[
           [1],
           [1],
@@ -432,6 +499,14 @@ fn run_task_writes_result_workbook_with_brain_core_columns() {
         Some("图像比对耗时".to_string())
     );
     assert_eq!(
+        range.get_value((0, 6)).map(|v| v.to_string()),
+        Some("原图".to_string())
+    );
+    assert_eq!(
+        range.get_value((0, 7)).map(|v| v.to_string()),
+        Some("匹配图".to_string())
+    );
+    assert_eq!(
         range.get_value((1, 0)).map(|v| v.to_string()),
         Some("sample-1".to_string())
     );
@@ -460,7 +535,41 @@ fn run_task_writes_result_workbook_with_brain_core_columns() {
         "compare elapsed text should keep the root format like 0.01s"
     );
 
+    let file = std::fs::File::open(&result_path).expect("result workbook should exist on disk");
+    let mut archive = ZipArchive::new(file).expect("result workbook should be a zip archive");
+    let drawing_names: Vec<String> = (0..archive.len())
+        .filter_map(|index| {
+            archive
+                .by_index(index)
+                .ok()
+                .map(|entry| entry.name().to_string())
+        })
+        .filter(|name| name.starts_with("xl/drawings/drawing") && name.ends_with(".xml"))
+        .collect();
+
+    assert!(
+        !drawing_names.is_empty(),
+        "exported workbook should include drawing XML for thumbnails"
+    );
+
+    let mut picture_count = 0usize;
+    for name in drawing_names {
+        let mut xml = String::new();
+        archive
+            .by_name(&name)
+            .expect("drawing xml should exist")
+            .read_to_string(&mut xml)
+            .expect("drawing xml should be readable");
+        picture_count += xml.matches("<xdr:pic>").count();
+    }
+
+    assert!(
+        picture_count >= 4,
+        "expected at least 4 embedded pictures for 2 rows x 2 columns, got {picture_count}"
+    );
+
     clear_mock_pipeline_env();
+    image_server_handle.join().expect("join image server");
     remove_if_exists(&excel_path);
     remove_if_exists(&result_path);
 }

@@ -14,6 +14,8 @@ export interface RowResultEventPayload {
   stage: string;
   status: string;
   image_url: string | null;
+  original_image_url: string | null;
+  matched_image_url: string | null;
   item_url: string | null;
   price: string | null;
   elapsed_text: string | null;
@@ -41,6 +43,8 @@ export interface MonitorRow {
   stage: string;
   status: string;
   imageUrl: string | null;
+  originalImageUrl: string | null;
+  matchedImageUrl: string | null;
   itemUrl: string | null;
   price: string | null;
   elapsedText: string | null;

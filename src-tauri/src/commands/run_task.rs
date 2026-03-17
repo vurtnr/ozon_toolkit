@@ -1,5 +1,5 @@
 use std::cell::{Cell, RefCell};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
@@ -10,7 +10,7 @@ use calamine::{open_workbook, Reader, Xlsx};
 use image::{DynamicImage, ImageFormat, Rgba, RgbaImage};
 use regex::Regex;
 use reqwest::blocking::Client;
-use rust_xlsxwriter::{Color, Format, Workbook};
+use rust_xlsxwriter::{Color, Format, Image as XlsxImage, Workbook};
 use serde::{Deserialize, Serialize};
 use tauri::Manager;
 
@@ -96,7 +96,9 @@ struct TaskOutputRow {
     compare_elapsed_text: Option<String>,
     price: Option<String>,
     item_url: Option<String>,
-    image_url: Option<String>,
+    original_image_url: Option<String>,
+    original_image_bytes: Option<Vec<u8>>,
+    matched_image_url: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -129,6 +131,14 @@ struct PendingDiagnosticsJob {
     used_fallback_image: bool,
     no_match_reason: Option<NoMatchReason>,
     row_stage_timings: RowStageTimings,
+}
+
+#[derive(Debug, Clone)]
+struct SourceImageArtifact {
+    path: PathBuf,
+    source_data_url: String,
+    preview_data_url: String,
+    workbook_image_bytes: Vec<u8>,
 }
 
 #[derive(Debug, Serialize)]
@@ -381,6 +391,7 @@ impl CandidateFetcher for SidecarCandidateFetcher<'_> {
             None,
             None,
             None,
+            None,
             false,
         )?;
         emit_event(
@@ -431,6 +442,7 @@ impl CandidateFetcher for SidecarCandidateFetcher<'_> {
                 &self.sku,
                 next_stage,
                 next_status,
+                None,
                 None,
                 None,
                 None,
@@ -1027,11 +1039,45 @@ fn build_mock_source_png() -> Result<Vec<u8>, String> {
     Ok(cursor.into_inner())
 }
 
+fn detect_image_mime_from_bytes(bytes: &[u8]) -> &'static str {
+    if bytes.starts_with(&[0x89, b'P', b'N', b'G']) {
+        return "image/png";
+    }
+    if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        return "image/jpeg";
+    }
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        return "image/gif";
+    }
+    if bytes.starts_with(b"BM") {
+        return "image/bmp";
+    }
+    if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        return "image/webp";
+    }
+
+    "application/octet-stream"
+}
+
+fn build_data_url(bytes: &[u8], mime_type: &str) -> String {
+    format!("data:{mime_type};base64,{}", BASE64_STANDARD.encode(bytes))
+}
+
+fn normalize_image_bytes_for_workbook(bytes: &[u8]) -> Result<Vec<u8>, String> {
+    let dynamic =
+        image::load_from_memory(bytes).map_err(|e| format!("decode image bytes failed: {e}"))?;
+    let mut cursor = std::io::Cursor::new(Vec::new());
+    dynamic
+        .write_to(&mut cursor, ImageFormat::Png)
+        .map_err(|e| format!("encode workbook image failed: {e}"))?;
+    Ok(cursor.into_inner())
+}
+
 fn write_source_image_or_mock_png(
     row: &TaskRow,
     temp_dir: &Path,
     use_mock_candidates: bool,
-) -> Result<(PathBuf, String), String> {
+) -> Result<SourceImageArtifact, String> {
     let image_path = if row.image_bytes.is_some() {
         temp_dir.join(format!(
             "{}-{}.jpg",
@@ -1046,19 +1092,35 @@ fn write_source_image_or_mock_png(
         ))
     };
 
-    let (bytes, mime_type) = if let Some(image_bytes) = &row.image_bytes {
-        (image_bytes.clone(), "image/jpeg")
+    let source_bytes = if let Some(image_bytes) = &row.image_bytes {
+        image_bytes.clone()
     } else if use_mock_candidates {
-        (build_mock_source_png()?, "image/png")
+        build_mock_source_png()?
     } else {
         return Err("source image missing".to_string());
     };
 
-    std::fs::write(&image_path, &bytes).map_err(|e| format!("write source image failed: {e}"))?;
-    Ok((
-        image_path,
-        format!("data:{mime_type};base64,{}", BASE64_STANDARD.encode(bytes)),
-    ))
+    std::fs::write(&image_path, &source_bytes)
+        .map_err(|e| format!("write source image failed: {e}"))?;
+
+    let source_mime_type = detect_image_mime_from_bytes(&source_bytes);
+    let source_data_url = build_data_url(&source_bytes, source_mime_type);
+
+    let workbook_image_bytes = normalize_image_bytes_for_workbook(&source_bytes)
+        .unwrap_or_else(|_| source_bytes.clone());
+    let preview_mime_type = if workbook_image_bytes == source_bytes {
+        source_mime_type
+    } else {
+        "image/png"
+    };
+    let preview_data_url = build_data_url(&workbook_image_bytes, preview_mime_type);
+
+    Ok(SourceImageArtifact {
+        path: image_path,
+        source_data_url,
+        preview_data_url,
+        workbook_image_bytes,
+    })
 }
 
 fn encode_image_file_as_data_url(image_path: &Path) -> Result<String, String> {
@@ -1276,11 +1338,37 @@ fn write_result_workbook(
     result_path: &Path,
     headers: &[String],
     rows: &[TaskOutputRow],
+    client: &Client,
 ) -> Result<(), String> {
     let mut workbook = Workbook::new();
     let worksheet = workbook.add_worksheet();
     let header_format = Format::new().set_bold().set_background_color(Color::Silver);
     let base_col_len = headers.len() as u16;
+    let price_col = base_col_len;
+    let item_url_col = base_col_len + 1;
+    let status_col = base_col_len + 2;
+    let elapsed_col = base_col_len + 3;
+    let original_image_col = base_col_len + 4;
+    let matched_image_col = base_col_len + 5;
+
+    worksheet
+        .set_column_width(price_col, 12.0)
+        .map_err(|e| format!("set result column width failed: {e}"))?;
+    worksheet
+        .set_column_width(item_url_col, 44.0)
+        .map_err(|e| format!("set result column width failed: {e}"))?;
+    worksheet
+        .set_column_width(status_col, 28.0)
+        .map_err(|e| format!("set result column width failed: {e}"))?;
+    worksheet
+        .set_column_width(elapsed_col, 12.0)
+        .map_err(|e| format!("set result column width failed: {e}"))?;
+    worksheet
+        .set_column_width_pixels(original_image_col, 108)
+        .map_err(|e| format!("set result column width failed: {e}"))?;
+    worksheet
+        .set_column_width_pixels(matched_image_col, 108)
+        .map_err(|e| format!("set result column width failed: {e}"))?;
 
     for (col_idx, header) in headers.iter().enumerate() {
         worksheet
@@ -1288,18 +1376,25 @@ fn write_result_workbook(
             .map_err(|e| format!("write result header failed: {e}"))?;
     }
     worksheet
-        .write_string_with_format(0, base_col_len, "1688成本价", &header_format)
+        .write_string_with_format(0, price_col, "1688成本价", &header_format)
         .map_err(|e| format!("write result header failed: {e}"))?;
     worksheet
-        .write_string_with_format(0, base_col_len + 1, "1688链接", &header_format)
+        .write_string_with_format(0, item_url_col, "1688链接", &header_format)
         .map_err(|e| format!("write result header failed: {e}"))?;
     worksheet
-        .write_string_with_format(0, base_col_len + 2, "AI分析结论", &header_format)
+        .write_string_with_format(0, status_col, "AI分析结论", &header_format)
         .map_err(|e| format!("write result header failed: {e}"))?;
     worksheet
-        .write_string_with_format(0, base_col_len + 3, "图像比对耗时", &header_format)
+        .write_string_with_format(0, elapsed_col, "图像比对耗时", &header_format)
+        .map_err(|e| format!("write result header failed: {e}"))?;
+    worksheet
+        .write_string_with_format(0, original_image_col, "原图", &header_format)
+        .map_err(|e| format!("write result header failed: {e}"))?;
+    worksheet
+        .write_string_with_format(0, matched_image_col, "匹配图", &header_format)
         .map_err(|e| format!("write result header failed: {e}"))?;
 
+    let mut image_cache: HashMap<String, Option<Vec<u8>>> = HashMap::new();
     for (idx, row) in rows.iter().enumerate() {
         let write_row = (idx + 1) as u32;
 
@@ -1311,27 +1406,93 @@ fn write_result_workbook(
 
         if let Some(price) = &row.price {
             worksheet
-                .write_string(write_row, base_col_len, price)
+                .write_string(write_row, price_col, price)
                 .map_err(|e| format!("write result row failed: {e}"))?;
         }
         if let Some(item_url) = &row.item_url {
             worksheet
-                .write_string(write_row, base_col_len + 1, item_url)
+                .write_string(write_row, item_url_col, item_url)
                 .map_err(|e| format!("write result row failed: {e}"))?;
         }
         worksheet
-            .write_string(write_row, base_col_len + 2, &row.status)
+            .write_string(write_row, status_col, &row.status)
             .map_err(|e| format!("write result row failed: {e}"))?;
         if let Some(compare_elapsed_text) = &row.compare_elapsed_text {
             worksheet
-                .write_string(write_row, base_col_len + 3, compare_elapsed_text)
+                .write_string(write_row, elapsed_col, compare_elapsed_text)
                 .map_err(|e| format!("write result row failed: {e}"))?;
+        }
+
+        if row.original_image_bytes.is_some() || row.matched_image_url.is_some() {
+            worksheet
+                .set_row_height_pixels(write_row, 92)
+                .map_err(|e| format!("set result row height failed: {e}"))?;
+        }
+
+        if let Some(original_image_bytes) = &row.original_image_bytes {
+            let _ = insert_result_image(
+                worksheet,
+                write_row,
+                original_image_col,
+                original_image_bytes,
+            );
+        }
+
+        if let Some(matched_image_url) = &row.matched_image_url {
+            if let Some(image_bytes) =
+                fetch_result_image_bytes(client, matched_image_url, &mut image_cache)
+            {
+                let _ = insert_result_image(
+                    worksheet,
+                    write_row,
+                    matched_image_col,
+                    &image_bytes,
+                );
+            }
         }
     }
 
     workbook
         .save(result_path)
         .map_err(|e| format!("save result workbook failed: {e}"))
+}
+
+fn fetch_result_image_bytes(
+    client: &Client,
+    image_url: &str,
+    cache: &mut HashMap<String, Option<Vec<u8>>>,
+) -> Option<Vec<u8>> {
+    if let Some(cached) = cache.get(image_url) {
+        return cached.clone();
+    }
+
+    let fetched = client
+        .get(image_url)
+        .send()
+        .ok()?
+        .error_for_status()
+        .ok()?
+        .bytes()
+        .ok()?
+        .to_vec();
+
+    let normalized = normalize_image_bytes_for_workbook(&fetched).unwrap_or(fetched);
+    cache.insert(image_url.to_string(), Some(normalized.clone()));
+    Some(normalized)
+}
+
+fn insert_result_image(
+    worksheet: &mut rust_xlsxwriter::Worksheet,
+    row: u32,
+    col: u16,
+    image_bytes: &[u8],
+) -> Result<(), String> {
+    let image = XlsxImage::new_from_buffer(image_bytes)
+        .map_err(|e| format!("create result image failed: {e}"))?;
+    worksheet
+        .insert_image_fit_to_cell(row, col, &image, true)
+        .map_err(|e| format!("insert result image failed: {e}"))?;
+    Ok(())
 }
 
 fn empty_output_row(row: &TaskRow, status: &str) -> TaskOutputRow {
@@ -1343,7 +1504,9 @@ fn empty_output_row(row: &TaskRow, status: &str) -> TaskOutputRow {
         compare_elapsed_text: None,
         price: None,
         item_url: None,
-        image_url: None,
+        original_image_url: None,
+        original_image_bytes: None,
+        matched_image_url: None,
     }
 }
 
@@ -1362,7 +1525,9 @@ fn output_row_from_match(
             compare_elapsed_text: Some(compare_elapsed_text),
             price: Some(cheapest.price),
             item_url: Some(cheapest.item_url),
-            image_url: Some(cheapest.image_url),
+            original_image_url: None,
+            original_image_bytes: None,
+            matched_image_url: Some(cheapest.image_url),
         },
         MatchSummary::MatchedButPriceUnavailable { .. } | MatchSummary::NoMatch => TaskOutputRow {
             row_index: row.excel_row_index,
@@ -1372,7 +1537,9 @@ fn output_row_from_match(
             compare_elapsed_text: Some(compare_elapsed_text),
             price: None,
             item_url: None,
-            image_url: None,
+            original_image_url: None,
+            original_image_bytes: None,
+            matched_image_url: None,
         },
     }
 }
@@ -1384,7 +1551,8 @@ fn emit_row_event(
     sku: &str,
     stage: &str,
     status: String,
-    image_url: Option<String>,
+    original_image_url: Option<String>,
+    matched_image_url: Option<String>,
     item_url: Option<String>,
     price: Option<String>,
     elapsed_text: Option<String>,
@@ -1398,7 +1566,9 @@ fn emit_row_event(
             sku: sku.to_string(),
             stage: stage.to_string(),
             status,
-            image_url,
+            image_url: matched_image_url.clone(),
+            original_image_url,
+            matched_image_url,
             item_url,
             price,
             elapsed_text,
@@ -1423,6 +1593,7 @@ fn emit_row_stage_event(
         None,
         None,
         None,
+        None,
         false,
     )
 }
@@ -1437,7 +1608,8 @@ fn emit_final_row_result_event(
         &row.sku,
         "completed",
         row.status.clone(),
-        row.image_url.clone(),
+        row.original_image_url.clone(),
+        row.matched_image_url.clone(),
         row.item_url.clone(),
         row.price.clone(),
         row.compare_elapsed_text.clone(),
@@ -1532,6 +1704,8 @@ pub fn run_task_with_original_source_and_sink(
         for row in &task_workbook.rows {
             processed_rows += 1;
             let mut output_row = empty_output_row(row, "Excel中无图");
+            let mut original_image_url: Option<String> = None;
+            let mut original_image_bytes: Option<Vec<u8>> = None;
             let mut pending_diagnostics: Option<PendingDiagnosticsJob> = None;
             let mut row_stage_timings = RowStageTimings::default();
             emit_row_stage_event(sink, row, "queued", "排队中")?;
@@ -1548,7 +1722,24 @@ pub fn run_task_with_original_source_and_sink(
                     },
                 )?;
                 match write_source_image_or_mock_png(row, &temp_dir, use_mock_candidates) {
-                    Ok((source_image_path, ozon_base64)) => {
+                    Ok(source_image) => {
+                        original_image_url = Some(source_image.preview_data_url.clone());
+                        original_image_bytes = Some(source_image.workbook_image_bytes.clone());
+                        emit_row_event(
+                            sink,
+                            row.excel_row_index,
+                            &row.sku,
+                            "planning_search_image",
+                            "正在生成搜索图".to_string(),
+                            original_image_url.clone(),
+                            None,
+                            None,
+                            None,
+                            None,
+                            false,
+                        )?;
+                        let source_image_path = source_image.path.clone();
+                        let ozon_base64 = source_image.source_data_url.clone();
                         let search_plan_started_at = Instant::now();
                         match resolve_search_image_plan(&vlm_client, &ozon_base64, &row.ozon_name) {
                             Ok(search_plan) => {
@@ -1821,6 +2012,8 @@ pub fn run_task_with_original_source_and_sink(
                 }
             }
 
+            output_row.original_image_url = original_image_url;
+            output_row.original_image_bytes = original_image_bytes;
             emit_final_row_result_event(sink, &output_row)?;
             if has_stage_timing_data(&row_stage_timings) {
                 emit_event(
@@ -1863,7 +2056,7 @@ pub fn run_task_with_original_source_and_sink(
             }
         }
 
-        write_result_workbook(&result_path, &task_workbook.headers, &output_rows)?;
+        write_result_workbook(&result_path, &task_workbook.headers, &output_rows, &client)?;
 
         for handle in diagnostics_handles {
             match handle.join() {

@@ -24,15 +24,20 @@ export function appendRowResult(
   state: MonitorState,
   payload: RowResultEventPayload,
 ): void {
+  const existingRow = state.rows.find((row) => row.rowIndex === payload.row_index);
   const nextRow: MonitorRow = {
     rowIndex: payload.row_index,
     sku: payload.sku,
     stage: payload.stage,
     status: payload.status,
-    imageUrl: payload.image_url,
-    itemUrl: payload.item_url,
-    price: payload.price,
-    elapsedText: payload.elapsed_text,
+    imageUrl: payload.matched_image_url ?? payload.image_url ?? existingRow?.imageUrl ?? null,
+    originalImageUrl:
+      payload.original_image_url ?? existingRow?.originalImageUrl ?? null,
+    matchedImageUrl:
+      payload.matched_image_url ?? payload.image_url ?? existingRow?.matchedImageUrl ?? null,
+    itemUrl: payload.item_url ?? existingRow?.itemUrl ?? null,
+    price: payload.price ?? existingRow?.price ?? null,
+    elapsedText: payload.elapsed_text ?? existingRow?.elapsedText ?? null,
     isFinal: payload.is_final,
   };
   const existingIndex = state.rows.findIndex(
