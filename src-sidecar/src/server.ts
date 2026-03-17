@@ -171,40 +171,50 @@ export function classifyLoginRequirement(
   return state === "login_required" ? ERROR_CODES.LOGIN_REQUIRED : null;
 }
 
-export function classifySessionState(snapshot: SessionSnapshot): SessionState {
+function snapshotHasStrongLoggedInSignal(snapshot: SessionSnapshot): boolean {
+  const visibleText = normalizeVisibleText(snapshot.visibleText);
+
+  return (
+    snapshot.hasLoggedInEntry ||
+    LOGGED_IN_TEXT_HINTS.some((hint) => visibleText.includes(hint))
+  );
+}
+
+function snapshotHasLoginSignal(snapshot: SessionSnapshot): boolean {
   const url = (snapshot.url || "").toLowerCase();
   const visibleText = normalizeVisibleText(snapshot.visibleText);
   const links = snapshot.links.join(" ").toLowerCase();
-  const hasStrongLoggedInSignal =
-    snapshot.hasLoggedInEntry ||
-    LOGGED_IN_TEXT_HINTS.some((hint) => visibleText.includes(hint));
+
+  return (
+    snapshot.hasLoginEntry ||
+    LOGIN_URL_HINTS.some((hint) => url.includes(hint)) ||
+    LOGIN_TEXT_HINTS.some((hint) => visibleText.includes(hint)) ||
+    LOGIN_URL_HINTS.some((hint) => links.includes(hint))
+  );
+}
+
+export function classifySessionState(snapshot: SessionSnapshot): SessionState {
+  const hasStrongLoggedInSignal = snapshotHasStrongLoggedInSignal(snapshot);
 
   if (
     snapshot.hasAntiBotChallenge ||
-    ANTI_BOT_URL_HINTS.some((hint) => url.includes(hint)) ||
-    ANTI_BOT_TEXT_HINTS.some((hint) => visibleText.includes(hint))
+    ANTI_BOT_URL_HINTS.some((hint) => (snapshot.url || "").toLowerCase().includes(hint)) ||
+    ANTI_BOT_TEXT_HINTS.some((hint) =>
+      normalizeVisibleText(snapshot.visibleText).includes(hint),
+    )
   ) {
     return "anti_bot_challenge";
+  }
+
+  if (snapshotHasLoginSignal(snapshot)) {
+    return "login_required";
   }
 
   if (hasStrongLoggedInSignal) {
     return "ready";
   }
 
-  if (
-    snapshot.hasLoginEntry ||
-    LOGIN_URL_HINTS.some((hint) => url.includes(hint)) ||
-    LOGIN_TEXT_HINTS.some((hint) => visibleText.includes(hint)) ||
-    LOGIN_URL_HINTS.some((hint) => links.includes(hint))
-  ) {
-    return "login_required";
-  }
-
-  if (is1688HomeUrl(url)) {
-    return "login_required";
-  }
-
-  if (LOGIN_URL_HINTS.some((hint) => links.includes(hint))) {
+  if (is1688HomeUrl((snapshot.url || "").toLowerCase())) {
     return "login_required";
   }
 
@@ -219,6 +229,15 @@ export function classifySessionStates(snapshots: SessionSnapshot[]): SessionStat
   const states = snapshots.map((snapshot) => classifySessionState(snapshot));
   if (states.includes("anti_bot_challenge")) {
     return "anti_bot_challenge";
+  }
+  const primarySnapshot = snapshots[0];
+  const primaryState = states[0];
+  if (
+    primarySnapshot &&
+    primaryState === "login_required" &&
+    snapshotHasLoginSignal(primarySnapshot)
+  ) {
+    return "login_required";
   }
   if (states.includes("ready")) {
     return "ready";

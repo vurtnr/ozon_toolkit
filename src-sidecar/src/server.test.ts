@@ -98,6 +98,22 @@ describe("classifySessionState", () => {
     expect(classifySessionState(snapshot)).toBe("ready");
   });
 
+  test("keeps login_required when a page still exposes login entry alongside stale workbench markers", () => {
+    const snapshot: SessionSnapshot = {
+      url: "https://www.1688.com/",
+      visibleText: "请登录 买家工作台",
+      links: [
+        "https://work.1688.com/home/page/index.htm",
+        "https://login.1688.com/member/signin.htm",
+      ],
+      hasAntiBotChallenge: false,
+      hasLoginEntry: true,
+      hasLoggedInEntry: true,
+    };
+
+    expect(classifySessionState(snapshot)).toBe("login_required");
+  });
+
   test("does not treat generic header words like cart or messages as authenticated state", () => {
     const snapshot: SessionSnapshot = {
       url: "https://www.1688.com/",
@@ -203,5 +219,26 @@ describe("classifySessionStates", () => {
     };
 
     expect(classifySessionStates([home, workbench])).toBe("ready");
+  });
+
+  test("does not let a stale authenticated tab override a primary home page that is still logged out", () => {
+    const home: SessionSnapshot = {
+      url: "https://www.1688.com/",
+      visibleText: "欢迎来到1688 请登录",
+      links: ["https://login.1688.com/member/signin.htm"],
+      hasAntiBotChallenge: false,
+      hasLoginEntry: true,
+      hasLoggedInEntry: false,
+    };
+    const staleWorkbenchTab: SessionSnapshot = {
+      url: "https://work.1688.com/home/page/index.htm",
+      visibleText: "买家工作台",
+      links: [],
+      hasAntiBotChallenge: false,
+      hasLoginEntry: false,
+      hasLoggedInEntry: true,
+    };
+
+    expect(classifySessionStates([home, staleWorkbenchTab])).toBe("login_required");
   });
 });
