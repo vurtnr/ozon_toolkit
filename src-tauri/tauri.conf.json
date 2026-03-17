@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "desktop_app",
+  "productName": "ozon_1688_tool",
   "version": "0.1.0",
-  "identifier": "com.jiaoyumin.desktop-app",
+  "identifier": "com.bigthunk.ozontool",
   "build": {
     "beforeDevCommand": "bun run dev",
     "devUrl": "http://localhost:1420",
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "desktop_app",
+        "title": "ozon_1688_tool",
         "width": 1480,
         "height": 980,
         "minWidth": 1280,
