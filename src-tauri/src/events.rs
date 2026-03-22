@@ -6,6 +6,7 @@ pub const EVENT_LOG: &str = "log";
 pub const EVENT_ROW_RESULT: &str = "row_result";
 pub const EVENT_TASK_DONE: &str = "task_done";
 pub const EVENT_BLOCKING_ALERT: &str = "blocking_alert";
+pub const EVENT_TASK_PHASE: &str = "task_phase";
 pub const EVENT_UPLOAD_PROGRESS: &str = "upload_progress";
 
 pub trait EventSink {
@@ -74,4 +75,12 @@ pub struct TaskDoneEvent {
     pub processed_rows: u32,
     pub total_rows: u32,
     pub result_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TaskPhaseEvent {
+    pub phase: String,
+    pub label: String,
+    pub detail: String,
+    pub blocking: bool,
 }

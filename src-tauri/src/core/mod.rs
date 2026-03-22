@@ -1,5 +1,6 @@
 pub mod excel;
 pub mod matcher;
+pub mod ozon_product;
 pub mod orchestrator;
 pub mod search_image;
 pub mod types;

@@ -1,7 +1,8 @@
 import { describe, expect, test } from "bun:test";
-import type { LogEventPayload, MonitorRow } from "../../types/events";
+import type { LogEventPayload, MonitorRow, TaskPhaseEventPayload } from "../../types/events";
 import {
   getStagePresentation,
+  resolveMonitorStage,
   summarizeMonitorBoard,
 } from "../monitorViewModel";
 
@@ -23,6 +24,42 @@ function buildRow(overrides: Partial<MonitorRow> = {}): MonitorRow {
 }
 
 describe("monitorViewModel", () => {
+  test("prefers task-level preflight phase before row execution starts", () => {
+    const phase: TaskPhaseEventPayload = {
+      phase: "resolving_ozon_products",
+      label: "解析 Ozon 商品源",
+      detail: "正在解析商品标题与主图",
+      blocking: false,
+    };
+
+    const presentation = resolveMonitorStage(null, phase);
+
+    expect(presentation.label).toBe("解析 Ozon 商品源");
+    expect(presentation.tone).toBe("info");
+    expect(presentation.detail).toBe("正在解析商品标题与主图");
+  });
+
+  test("prefers blocking login task phase over row stage", () => {
+    const phase: TaskPhaseEventPayload = {
+      phase: "waiting_for_1688_login",
+      label: "等待 1688 登录",
+      detail: "请先完成 1688 登录，完成后任务会继续",
+      blocking: true,
+    };
+
+    const presentation = resolveMonitorStage(
+      buildRow({
+        stage: "queued",
+        status: "排队中",
+      }),
+      phase,
+    );
+
+    expect(presentation.label).toBe("等待 1688 登录");
+    expect(presentation.tone).toBe("warn");
+    expect(presentation.detail).toContain("完成 1688 登录");
+  });
+
   test("maps failed final rows to a danger stage presentation", () => {
     const presentation = getStagePresentation(
       buildRow({

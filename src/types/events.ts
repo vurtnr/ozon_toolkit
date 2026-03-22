@@ -37,6 +37,13 @@ export interface BlockingAlertEventPayload {
   action_label: string | null;
 }
 
+export interface TaskPhaseEventPayload {
+  phase: string;
+  label: string;
+  detail: string;
+  blocking: boolean;
+}
+
 export interface MonitorRow {
   rowIndex: number;
   sku: string;
@@ -57,4 +64,5 @@ export interface MonitorState {
   logs: LogEventPayload[];
   done: TaskDoneEventPayload | null;
   alert: BlockingAlertEventPayload | null;
+  taskPhase: TaskPhaseEventPayload | null;
 }

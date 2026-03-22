@@ -19,6 +19,9 @@ use crate::config::{
     settings_file_path, AppSettings,
 };
 use crate::core::excel::extract_wps_images;
+use crate::core::ozon_product::{
+    resolve_ozon_product, OzonProductResolution, OzonResolutionFailure,
+};
 use crate::core::orchestrator::{
     orchestrate_match, CandidateFetcher, NoMatchReason, OrchestrationDiagnostics, SearchPass,
     VlmCallStage,
@@ -32,8 +35,9 @@ use crate::core::vlm::{
     VlmClient, VlmMatchResult,
 };
 use crate::events::{
-    emit_event, EventSink, LogEvent, ProgressEvent, RowResultEvent, TaskDoneEvent, TauriWindowSink,
-    EVENT_BLOCKING_ALERT, EVENT_LOG, EVENT_PROGRESS, EVENT_ROW_RESULT, EVENT_TASK_DONE,
+    emit_event, EventSink, LogEvent, ProgressEvent, RowResultEvent, TaskDoneEvent,
+    TaskPhaseEvent, TauriWindowSink, EVENT_BLOCKING_ALERT, EVENT_LOG, EVENT_PROGRESS,
+    EVENT_ROW_RESULT, EVENT_TASK_DONE, EVENT_TASK_PHASE,
 };
 use crate::lifecycle::cleanup::run_with_task_guard;
 use crate::recovery::{
@@ -81,6 +85,7 @@ struct TaskWorkbook {
 #[derive(Debug, Clone)]
 struct TaskRow {
     excel_row_index: u32,
+    product_url: Option<String>,
     ozon_name: String,
     sku: String,
     original_cells: Vec<String>,
@@ -93,12 +98,20 @@ struct TaskOutputRow {
     sku: String,
     original_cells: Vec<String>,
     status: String,
+    ai_analysis_conclusion: Option<String>,
     compare_elapsed_text: Option<String>,
     price: Option<String>,
     item_url: Option<String>,
     original_image_url: Option<String>,
     original_image_bytes: Option<Vec<u8>>,
     matched_image_url: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct PreparedTaskRows {
+    executable_rows: Vec<TaskRow>,
+    finalized_rows: Vec<TaskOutputRow>,
+    processed_rows: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -492,6 +505,11 @@ fn validate_absolute_excel_path(excel_path: &str) -> Result<PathBuf, String> {
     Ok(path.to_path_buf())
 }
 
+fn looks_like_http_url(value: &str) -> bool {
+    let trimmed = value.trim();
+    trimmed.starts_with("http://") || trimmed.starts_with("https://")
+}
+
 fn load_task_rows(excel_path: &Path) -> Result<TaskWorkbook, String> {
     let mut workbook: Xlsx<_> =
         open_workbook(excel_path).map_err(|e| format!("open workbook failed: {e}"))?;
@@ -523,11 +541,21 @@ fn load_task_rows(excel_path: &Path) -> Result<TaskWorkbook, String> {
     let mut rows = Vec::new();
     for (idx, row) in range.rows().enumerate().skip(1) {
         let original_cells = row.iter().map(|cell| cell.to_string()).collect::<Vec<_>>();
-        let ozon_name = row
+        let first_cell = row
             .first()
             .map(|v| v.to_string())
             .map(|v| v.trim().to_string())
             .unwrap_or_default();
+        let product_url = if looks_like_http_url(&first_cell) {
+            Some(first_cell.clone())
+        } else {
+            None
+        };
+        let ozon_name = if product_url.is_some() {
+            String::new()
+        } else {
+            first_cell
+        };
         let sku = row
             .get(1)
             .map(|v| v.to_string())
@@ -562,6 +590,7 @@ fn load_task_rows(excel_path: &Path) -> Result<TaskWorkbook, String> {
 
         rows.push(TaskRow {
             excel_row_index: (idx + 1) as u32,
+            product_url,
             ozon_name,
             sku,
             original_cells,
@@ -1078,20 +1107,6 @@ fn write_source_image_or_mock_png(
     temp_dir: &Path,
     use_mock_candidates: bool,
 ) -> Result<SourceImageArtifact, String> {
-    let image_path = if row.image_bytes.is_some() {
-        temp_dir.join(format!(
-            "{}-{}.jpg",
-            row.excel_row_index,
-            sanitize_filename(&row.sku)
-        ))
-    } else {
-        temp_dir.join(format!(
-            "{}-{}-source.png",
-            row.excel_row_index,
-            sanitize_filename(&row.sku)
-        ))
-    };
-
     let source_bytes = if let Some(image_bytes) = &row.image_bytes {
         image_bytes.clone()
     } else if use_mock_candidates {
@@ -1100,10 +1115,25 @@ fn write_source_image_or_mock_png(
         return Err("source image missing".to_string());
     };
 
+    let source_mime_type = detect_image_mime_from_bytes(&source_bytes);
+    let extension = match source_mime_type {
+        "image/jpeg" => "jpg",
+        "image/png" => "png",
+        "image/webp" => "webp",
+        "image/gif" => "gif",
+        "image/bmp" => "bmp",
+        _ => "png",
+    };
+    let image_path = temp_dir.join(format!(
+        "{}-{}-source.{}",
+        row.excel_row_index,
+        sanitize_filename(&row.sku),
+        extension
+    ));
+
     std::fs::write(&image_path, &source_bytes)
         .map_err(|e| format!("write source image failed: {e}"))?;
 
-    let source_mime_type = detect_image_mime_from_bytes(&source_bytes);
     let source_data_url = build_data_url(&source_bytes, source_mime_type);
 
     let workbook_image_bytes = normalize_image_bytes_for_workbook(&source_bytes)
@@ -1142,12 +1172,6 @@ fn encode_image_file_as_data_url(image_path: &Path) -> Result<String, String> {
         "data:{mime_type};base64,{}",
         BASE64_STANDARD.encode(bytes)
     ))
-}
-
-fn ensure_sidecar_reachable(client: &Client) -> Result<(), String> {
-    ping_sidecar(client).map_err(|e| {
-        format!("sidecar service unavailable: {e}. 请先启动 sidecar（二进制 engine）后重试。")
-    })
 }
 
 fn ping_sidecar(client: &Client) -> Result<(), String> {
@@ -1244,14 +1268,15 @@ fn wait_for_sidecar_ready_session(sink: &mut dyn EventSink, client: &Client) -> 
 
 fn validate_task_runtime_prerequisites(
     task_rows: &[TaskRow],
-    client: &Client,
     use_mock_candidates: bool,
 ) -> Result<(), String> {
     if use_mock_candidates {
         return Ok(());
     }
 
-    let has_any_extractable_image = task_rows.iter().any(|row| row.image_bytes.is_some());
+    let has_any_extractable_image = task_rows
+        .iter()
+        .any(|row| row.image_bytes.is_some() || row.product_url.is_some());
     if !has_any_extractable_image && !use_mock_candidates {
         return Err(
             "未提取到可搜索图片：请确认 Excel 中嵌入了商品图，并且图片引用不是失效状态。"
@@ -1259,7 +1284,120 @@ fn validate_task_runtime_prerequisites(
         );
     }
 
-    ensure_sidecar_reachable(client)
+    Ok(())
+}
+
+fn map_ozon_resolution_failure_to_status(error: &OzonResolutionFailure) -> String {
+    match error {
+        OzonResolutionFailure::InvalidUrl => "Ozon链接无效".to_string(),
+        OzonResolutionFailure::Unavailable | OzonResolutionFailure::FetchFailed(_) => {
+            "Ozon商品已下架或不可访问".to_string()
+        }
+        OzonResolutionFailure::MissingTitle => "未解析到Ozon商品标题".to_string(),
+        OzonResolutionFailure::MissingImage => "未解析到Ozon商品主图".to_string(),
+    }
+}
+
+fn resolve_task_row_source(
+    sink: &mut dyn EventSink,
+    client: &Client,
+    row: &TaskRow,
+    cache: &mut HashMap<String, Result<OzonProductResolution, OzonResolutionFailure>>,
+) -> Result<TaskRow, TaskOutputRow> {
+    let Some(product_url) = row.product_url.as_deref() else {
+        return Ok(row.clone());
+    };
+
+    emit_row_stage_event(sink, row, "resolving_ozon_product", "正在解析 Ozon 商品页").map_err(
+        |_| empty_output_row(row, "正在解析 Ozon 商品页"),
+    )?;
+    let _ = emit_event(
+        sink,
+        EVENT_LOG,
+        &LogEvent {
+            level: "info".to_string(),
+            message: format!("正在解析 Ozon 商品页: {}", row.sku),
+        },
+    );
+
+    let resolution = if let Some(cached) = cache.get(product_url) {
+        cached.clone()
+    } else {
+        let resolved = resolve_ozon_product(client, product_url);
+        cache.insert(product_url.to_string(), resolved.clone());
+        resolved
+    };
+
+    match resolution {
+        Ok(resolution) => {
+            let mut hydrated = row.clone();
+            hydrated.ozon_name = resolution.title;
+            hydrated.image_bytes = Some(resolution.image_bytes);
+            Ok(hydrated)
+        }
+        Err(error) => Err(empty_output_row(
+            row,
+            map_ozon_resolution_failure_to_status(&error).as_str(),
+        )),
+    }
+}
+
+fn finalize_preflight_row(
+    sink: &mut dyn EventSink,
+    prepared: &mut PreparedTaskRows,
+    output_row: TaskOutputRow,
+    total_rows: u32,
+) -> Result<(), String> {
+    emit_final_row_result_event(sink, &output_row)?;
+    prepared.finalized_rows.push(output_row);
+    prepared.processed_rows += 1;
+    emit_event(
+        sink,
+        EVENT_PROGRESS,
+        &ProgressEvent {
+            processed: prepared.processed_rows,
+            total: total_rows,
+        },
+    )
+}
+
+fn prepare_task_rows_for_execution(
+    sink: &mut dyn EventSink,
+    client: &Client,
+    task_rows: &[TaskRow],
+    total_rows: u32,
+    use_mock_candidates: bool,
+) -> Result<PreparedTaskRows, String> {
+    let mut prepared = PreparedTaskRows::default();
+    let mut ozon_source_cache: HashMap<String, Result<OzonProductResolution, OzonResolutionFailure>> =
+        HashMap::new();
+
+    for row in task_rows {
+        emit_row_stage_event(sink, row, "queued", "排队中")?;
+
+        let resolved_row = match resolve_task_row_source(sink, client, row, &mut ozon_source_cache)
+        {
+            Ok(resolved) => resolved,
+            Err(source_failure_output) => {
+                finalize_preflight_row(sink, &mut prepared, source_failure_output, total_rows)?;
+                continue;
+            }
+        };
+
+        if resolved_row.image_bytes.is_some() || use_mock_candidates {
+            prepared.executable_rows.push(resolved_row);
+            continue;
+        }
+
+        finalize_preflight_row(
+            sink,
+            &mut prepared,
+            empty_output_row(&resolved_row, "Excel中无图"),
+            total_rows,
+        )?;
+    }
+
+    Ok(prepared)
 }
 
 fn fetch_candidates_from_sidecar(
@@ -1347,9 +1485,10 @@ fn write_result_workbook(
     let price_col = base_col_len;
     let item_url_col = base_col_len + 1;
     let status_col = base_col_len + 2;
-    let elapsed_col = base_col_len + 3;
-    let original_image_col = base_col_len + 4;
-    let matched_image_col = base_col_len + 5;
+    let ai_col = base_col_len + 3;
+    let elapsed_col = base_col_len + 4;
+    let original_image_col = base_col_len + 5;
+    let matched_image_col = base_col_len + 6;
 
     worksheet
         .set_column_width(price_col, 12.0)
@@ -1359,6 +1498,9 @@ fn write_result_workbook(
         .map_err(|e| format!("set result column width failed: {e}"))?;
     worksheet
         .set_column_width(status_col, 28.0)
+        .map_err(|e| format!("set result column width failed: {e}"))?;
+    worksheet
+        .set_column_width(ai_col, 28.0)
         .map_err(|e| format!("set result column width failed: {e}"))?;
     worksheet
         .set_column_width(elapsed_col, 12.0)
@@ -1382,7 +1524,10 @@ fn write_result_workbook(
         .write_string_with_format(0, item_url_col, "1688链接", &header_format)
         .map_err(|e| format!("write result header failed: {e}"))?;
     worksheet
-        .write_string_with_format(0, status_col, "AI分析结论", &header_format)
+        .write_string_with_format(0, status_col, "处理状态", &header_format)
+        .map_err(|e| format!("write result header failed: {e}"))?;
+    worksheet
+        .write_string_with_format(0, ai_col, "AI分析结论", &header_format)
         .map_err(|e| format!("write result header failed: {e}"))?;
     worksheet
         .write_string_with_format(0, elapsed_col, "图像比对耗时", &header_format)
@@ -1417,6 +1562,11 @@ fn write_result_workbook(
         worksheet
             .write_string(write_row, status_col, &row.status)
             .map_err(|e| format!("write result row failed: {e}"))?;
+        if let Some(ai_analysis_conclusion) = &row.ai_analysis_conclusion {
+            worksheet
+                .write_string(write_row, ai_col, ai_analysis_conclusion)
+                .map_err(|e| format!("write result row failed: {e}"))?;
+        }
         if let Some(compare_elapsed_text) = &row.compare_elapsed_text {
             worksheet
                 .write_string(write_row, elapsed_col, compare_elapsed_text)
@@ -1501,6 +1651,7 @@ fn empty_output_row(row: &TaskRow, status: &str) -> TaskOutputRow {
         sku: row.sku.clone(),
         original_cells: row.original_cells.clone(),
         status: status.to_string(),
+        ai_analysis_conclusion: None,
         compare_elapsed_text: None,
         price: None,
         item_url: None,
@@ -1521,6 +1672,7 @@ fn output_row_from_match(
             row_index: row.excel_row_index,
             sku: row.sku.clone(),
             original_cells: row.original_cells.clone(),
+            ai_analysis_conclusion: Some(status.clone()),
             status,
             compare_elapsed_text: Some(compare_elapsed_text),
             price: Some(cheapest.price),
@@ -1533,6 +1685,7 @@ fn output_row_from_match(
             row_index: row.excel_row_index,
             sku: row.sku.clone(),
             original_cells: row.original_cells.clone(),
+            ai_analysis_conclusion: Some(status.clone()),
             status,
             compare_elapsed_text: Some(compare_elapsed_text),
             price: None,
@@ -1617,6 +1770,25 @@ fn emit_final_row_result_event(
     )
 }
 
+fn emit_task_phase_event(
+    sink: &mut dyn EventSink,
+    phase: &str,
+    label: &str,
+    detail: &str,
+    blocking: bool,
+) -> Result<(), String> {
+    emit_event(
+        sink,
+        EVENT_TASK_PHASE,
+        &TaskPhaseEvent {
+            phase: phase.to_string(),
+            label: label.to_string(),
+            detail: detail.to_string(),
+            blocking,
+        },
+    )
+}
+
 fn no_match_status(reason: Option<&NoMatchReason>) -> &'static str {
     match reason {
         Some(NoMatchReason::NoCandidates) => "无可比对候选(双搜索图未召回有效1688结果)",
@@ -1626,11 +1798,15 @@ fn no_match_status(reason: Option<&NoMatchReason>) -> &'static str {
     }
 }
 
-pub fn run_task_with_original_source_and_sink(
+fn run_task_with_original_source_and_sink_inner<F>(
     excel_path: &str,
     original_source_excel_path: Option<&str>,
     sink: &mut dyn EventSink,
-) -> Result<RunTaskSummary, String> {
+    mut ensure_browser_ready: F,
+) -> Result<RunTaskSummary, String>
+where
+    F: FnMut(&Client) -> Result<(), String>,
+{
     let excel = validate_absolute_excel_path(excel_path)?;
     let output_anchor_path = resolve_output_anchor_path(&excel, original_source_excel_path);
 
@@ -1656,10 +1832,7 @@ pub fn run_task_with_original_source_and_sink(
     let total_rows = task_workbook.rows.len() as u32;
     let client = Client::new();
     let use_mock_candidates = has_mock_candidates();
-    validate_task_runtime_prerequisites(&task_workbook.rows, &client, use_mock_candidates)?;
-    if !use_mock_candidates {
-        wait_for_sidecar_ready_session(sink, &client)?;
-    }
+    validate_task_runtime_prerequisites(&task_workbook.rows, use_mock_candidates)?;
     let vlm_client = build_runtime_vlm_client()?;
     let mut mock_candidate_sequence = load_mock_candidate_sequence()?;
 
@@ -1697,22 +1870,70 @@ pub fn run_task_with_original_source_and_sink(
             },
         )?;
 
-        let mut processed_rows = 0u32;
-        let mut output_rows = Vec::new();
+        emit_task_phase_event(
+            sink,
+            "validating_runtime",
+            "校验运行环境",
+            "正在校验输入文件、任务参数与运行时依赖",
+            false,
+        )?;
+        emit_task_phase_event(
+            sink,
+            "resolving_ozon_products",
+            "解析 Ozon 商品源",
+            "正在抓取商品详情、标题与首张主图",
+            false,
+        )?;
+        let prepared_rows = prepare_task_rows_for_execution(
+            sink,
+            &client,
+            &task_workbook.rows,
+            total_rows,
+            use_mock_candidates,
+        )?;
+        let mut processed_rows = prepared_rows.processed_rows;
+        let executable_rows = prepared_rows.executable_rows;
+        let mut output_rows = prepared_rows.finalized_rows;
         let mut diagnostics_handles = Vec::new();
 
-        for row in &task_workbook.rows {
+        if !use_mock_candidates && !executable_rows.is_empty() {
+            emit_task_phase_event(
+                sink,
+                "waiting_for_1688_login",
+                "等待 1688 登录",
+                "已打开 1688，会在登录状态就绪后自动继续执行",
+                true,
+            )?;
+            ensure_browser_ready(&client)?;
+            wait_for_sidecar_ready_session(sink, &client)?;
+        }
+
+        if !executable_rows.is_empty() {
+            emit_task_phase_event(
+                sink,
+                "running_1688_and_ai",
+                "执行 1688 搜款与 AI 复核",
+                "正在基于搜索图执行 1688 搜索与大模型比对",
+                false,
+            )?;
+        }
+
+        for resolved_row in &executable_rows {
             processed_rows += 1;
-            let mut output_row = empty_output_row(row, "Excel中无图");
+            let mut output_row = empty_output_row(resolved_row, "Excel中无图");
             let mut original_image_url: Option<String> = None;
             let mut original_image_bytes: Option<Vec<u8>> = None;
             let mut pending_diagnostics: Option<PendingDiagnosticsJob> = None;
             let mut row_stage_timings = RowStageTimings::default();
-            emit_row_stage_event(sink, row, "queued", "排队中")?;
 
-            if row.image_bytes.is_some() || use_mock_candidates {
+            if resolved_row.image_bytes.is_some() || use_mock_candidates {
                 let compare_started_at = Instant::now();
-                emit_row_stage_event(sink, row, "planning_search_image", "正在生成搜索图")?;
+                emit_row_stage_event(
+                    sink,
+                    &resolved_row,
+                    "planning_search_image",
+                    "正在生成搜索图",
+                )?;
                 emit_event(
                     sink,
                     EVENT_LOG,
@@ -1721,14 +1942,14 @@ pub fn run_task_with_original_source_and_sink(
                         message: "正在生成搜索图".to_string(),
                     },
                 )?;
-                match write_source_image_or_mock_png(row, &temp_dir, use_mock_candidates) {
+                match write_source_image_or_mock_png(&resolved_row, &temp_dir, use_mock_candidates) {
                     Ok(source_image) => {
                         original_image_url = Some(source_image.preview_data_url.clone());
                         original_image_bytes = Some(source_image.workbook_image_bytes.clone());
                         emit_row_event(
                             sink,
-                            row.excel_row_index,
-                            &row.sku,
+                            resolved_row.excel_row_index,
+                            &resolved_row.sku,
                             "planning_search_image",
                             "正在生成搜索图".to_string(),
                             original_image_url.clone(),
@@ -1741,7 +1962,11 @@ pub fn run_task_with_original_source_and_sink(
                         let source_image_path = source_image.path.clone();
                         let ozon_base64 = source_image.source_data_url.clone();
                         let search_plan_started_at = Instant::now();
-                        match resolve_search_image_plan(&vlm_client, &ozon_base64, &row.ozon_name) {
+                        match resolve_search_image_plan(
+                            &vlm_client,
+                            &ozon_base64,
+                            &resolved_row.ozon_name,
+                        ) {
                             Ok(search_plan) => {
                                 row_stage_timings.search_plan_ms =
                                     Some(elapsed_millis(search_plan_started_at.elapsed()));
@@ -1750,7 +1975,7 @@ pub fn run_task_with_original_source_and_sink(
                                     &source_image_path,
                                     &search_plan,
                                     &temp_dir,
-                                    &row.sku,
+                                    &resolved_row.sku,
                                 ) {
                                     Ok(search_images) => {
                                         row_stage_timings.search_image_render_ms =
@@ -1769,17 +1994,16 @@ pub fn run_task_with_original_source_and_sink(
                                                 Ok(primary_search_base64),
                                                 Ok(fallback_search_base64),
                                             ) => {
-                                                let match_hint =
-                                                    build_match_hint(
-                                                        &row.ozon_name,
-                                                        &search_plan.target_product,
-                                                    );
+                                                let match_hint = build_match_hint(
+                                                    &resolved_row.ozon_name,
+                                                    &search_plan.target_product,
+                                                );
                                                 let fetcher = SidecarCandidateFetcher::new(
                                                     sink,
                                                     &client,
                                                     mock_candidate_sequence.take(),
-                                                    row.excel_row_index,
-                                                    row.sku.clone(),
+                                                    resolved_row.excel_row_index,
+                                                    resolved_row.sku.clone(),
                                                 );
                                                 let result = orchestrate_match(
                                                     &fetcher,
@@ -1860,7 +2084,7 @@ pub fn run_task_with_original_source_and_sink(
                                                                     "AI比对成功(主搜索图召回)"
                                                                 };
                                                                 output_row_from_match(
-                                                                    row,
+                                                                    &resolved_row,
                                                                     MatchSummary::Cheapest(
                                                                         cheapest,
                                                                     ),
@@ -1870,7 +2094,7 @@ pub fn run_task_with_original_source_and_sink(
                                                             }
                                                             MatchSummary::NoMatch => {
                                                                 output_row_from_match(
-                                                                    row,
+                                                                    &resolved_row,
                                                                     MatchSummary::NoMatch,
                                                                     no_match_status(
                                                                         no_match_reason.as_ref(),
@@ -1882,7 +2106,7 @@ pub fn run_task_with_original_source_and_sink(
                                                             MatchSummary::MatchedButPriceUnavailable {
                                                                 total_matches,
                                                             } => output_row_from_match(
-                                                                row,
+                                                                &resolved_row,
                                                                 MatchSummary::MatchedButPriceUnavailable {
                                                                     total_matches,
                                                                 },
@@ -1898,7 +2122,7 @@ pub fn run_task_with_original_source_and_sink(
                                                         ) {
                                                             pending_diagnostics =
                                                                 Some(PendingDiagnosticsJob {
-                                                                    row: row.clone(),
+                                                                    row: resolved_row.clone(),
                                                                     status: output_row
                                                                         .status
                                                                         .clone(),
@@ -1949,7 +2173,7 @@ pub fn run_task_with_original_source_and_sink(
                                                             format!("sidecar_error({code})")
                                                         };
                                                         output_row = output_row_from_match(
-                                                            row,
+                                                            &resolved_row,
                                                             MatchSummary::NoMatch,
                                                             status,
                                                             format_elapsed_text(elapsed_millis(
@@ -1961,7 +2185,7 @@ pub fn run_task_with_original_source_and_sink(
                                             }
                                             (Err(error), _) | (_, Err(error)) => {
                                                 output_row = output_row_from_match(
-                                                    row,
+                                                    &resolved_row,
                                                     MatchSummary::NoMatch,
                                                     format!("搜索图编码失败: {error}"),
                                                     format_elapsed_text(elapsed_millis(
@@ -1977,7 +2201,7 @@ pub fn run_task_with_original_source_and_sink(
                                                 render_search_images_started_at.elapsed(),
                                             ));
                                         output_row = output_row_from_match(
-                                            row,
+                                            &resolved_row,
                                             MatchSummary::NoMatch,
                                             format!("搜索图生成失败: {error}"),
                                             format_elapsed_text(elapsed_millis(
@@ -1991,7 +2215,7 @@ pub fn run_task_with_original_source_and_sink(
                                 row_stage_timings.search_plan_ms =
                                     Some(elapsed_millis(search_plan_started_at.elapsed()));
                                 output_row = output_row_from_match(
-                                    row,
+                                    &resolved_row,
                                     MatchSummary::NoMatch,
                                     format!("搜索图生成失败: {error}"),
                                     format_elapsed_text(elapsed_millis(
@@ -2003,7 +2227,7 @@ pub fn run_task_with_original_source_and_sink(
                     }
                     Err(error) => {
                         output_row = output_row_from_match(
-                            row,
+                            &resolved_row,
                             MatchSummary::NoMatch,
                             format!("搜索图生成失败: {error}"),
                             format_elapsed_text(elapsed_millis(compare_started_at.elapsed())),
@@ -2021,7 +2245,7 @@ pub fn run_task_with_original_source_and_sink(
                     EVENT_LOG,
                     &LogEvent {
                         level: "info".to_string(),
-                        message: format_stage_timing_summary(&row.sku, &row_stage_timings),
+                        message: format_stage_timing_summary(&resolved_row.sku, &row_stage_timings),
                     },
                 )?;
             }
@@ -2056,6 +2280,14 @@ pub fn run_task_with_original_source_and_sink(
             }
         }
 
+        emit_task_phase_event(
+            sink,
+            "exporting_results",
+            "导出结果文件",
+            "正在整理结果并生成 result.xlsx",
+            false,
+        )?;
+        output_rows.sort_by_key(|row| row.row_index);
         write_result_workbook(&result_path, &task_workbook.headers, &output_rows, &client)?;
 
         for handle in diagnostics_handles {
@@ -2123,6 +2355,19 @@ pub fn run_task_with_original_source_and_sink(
 
         Ok(summary)
     })
+}
+
+pub fn run_task_with_original_source_and_sink(
+    excel_path: &str,
+    original_source_excel_path: Option<&str>,
+    sink: &mut dyn EventSink,
+) -> Result<RunTaskSummary, String> {
+    run_task_with_original_source_and_sink_inner(
+        excel_path,
+        original_source_excel_path,
+        sink,
+        |_client| Ok(()),
+    )
 }
 
 pub fn run_task_with_sink(
@@ -2443,11 +2688,13 @@ pub async fn run_task(
     run_blocking_task(move || {
         std::env::set_var("DASHSCOPE_API_KEY", &api_key);
 
-        let client = Client::new();
-        ensure_sidecar_running(&app_handle, settings.as_ref(), &api_key, &client)?;
-
         let mut sink = TauriWindowSink::new(&window_for_worker);
-        run_task_with_original_source_and_sink(&excel_path, source_excel_path.as_deref(), &mut sink)
+        run_task_with_original_source_and_sink_inner(
+            &excel_path,
+            source_excel_path.as_deref(),
+            &mut sink,
+            |client| ensure_sidecar_running(&app_handle, settings.as_ref(), &api_key, client),
+        )
     })
     .await
 }

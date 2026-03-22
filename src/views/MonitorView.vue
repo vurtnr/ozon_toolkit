@@ -5,6 +5,7 @@ import BlockingAlert from "../components/BlockingAlert.vue";
 import {
   getLogTone,
   getStagePresentation,
+  resolveMonitorStage,
   summarizeMonitorBoard,
 } from "./monitorViewModel";
 
@@ -15,22 +16,38 @@ const boardSummary = computed(() =>
     monitor.state.rows,
     monitor.state.logs,
     monitor.state.progress,
+    monitor.state.taskPhase,
   ),
 );
-const activeStage = computed(() => {
-  if (!boardSummary.value.activeRow) {
-    return {
-      label: "等待任务启动",
-      tone: "info" as const,
-      emphasis: "live" as const,
-    };
-  }
-
-  return getStagePresentation(boardSummary.value.activeRow);
-});
+const activeStage = computed(() =>
+  resolveMonitorStage(boardSummary.value.activeRow, boardSummary.value.taskPhase),
+);
 const doneSummary = computed(() => {
   if (!monitor.state.done) return null;
   return `${monitor.state.done.processed_rows}/${monitor.state.done.total_rows}`;
+});
+const focusTitle = computed(() => {
+  if (activeStage.value.source === "task_phase") {
+    return activeStage.value.label;
+  }
+  return boardSummary.value.activeRow?.sku || "暂无活跃行";
+});
+const focusDetail = computed(() => {
+  if (activeStage.value.source === "task_phase") {
+    return activeStage.value.detail;
+  }
+  if (boardSummary.value.activeRow) {
+    return boardSummary.value.activeRow.status;
+  }
+  return "等待上传文件并启动任务。";
+});
+const focusMeta = computed(() => {
+  if (activeStage.value.source === "task_phase") {
+    return monitor.state.taskPhase?.blocking
+      ? "完成登录或解除阻塞后，任务会自动继续。"
+      : "任务阶段会持续推进并实时刷新。";
+  }
+  return `耗时 ${boardSummary.value.activeRow?.elapsedText || "执行中"}`;
 });
 
 function resolveMatchedImage(url: string | null, fallback: string | null): string | null {
@@ -67,7 +84,7 @@ function dismissAlert() {
         <strong>{{ boardSummary.activeRow?.sku || "等待新任务" }}</strong>
         <small>
           {{
-            boardSummary.activeRow?.status ||
+            activeStage.detail ||
             "上传 Excel 后，系统会从排队、搜索到 AI 复核分阶段更新。"
           }}
         </small>
@@ -186,14 +203,14 @@ function dismissAlert() {
             <span class="status-pill" :data-tone="activeStage.tone">{{ activeStage.label }}</span>
           </div>
           <div v-if="boardSummary.activeRow" class="focus-body">
-            <strong>{{ boardSummary.activeRow.sku }}</strong>
-            <p>{{ boardSummary.activeRow.status }}</p>
-            <small>耗时 {{ boardSummary.activeRow.elapsedText || "执行中" }}</small>
+            <strong>{{ focusTitle }}</strong>
+            <p>{{ focusDetail }}</p>
+            <small>{{ focusMeta }}</small>
           </div>
           <div v-else class="focus-body">
-            <strong>暂无活跃行</strong>
-            <p>等待上传文件并启动任务。</p>
-            <small>完成后会自动在结果区回显导出状态。</small>
+            <strong>{{ focusTitle }}</strong>
+            <p>{{ focusDetail }}</p>
+            <small>{{ focusMeta }}</small>
           </div>
         </article>
 

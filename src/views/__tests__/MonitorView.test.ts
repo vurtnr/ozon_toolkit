@@ -3,6 +3,7 @@ import {
   appendRowResult,
   createEmptyMonitor,
   setBlockingAlert,
+  setTaskPhase,
   markTaskDone,
   updateProgress,
 } from "../../composables/useTaskEvents";
@@ -151,7 +152,30 @@ describe("Monitor helpers", () => {
 
     expect(state.rows).toHaveLength(0);
     expect(state.alert).toBeNull();
+    expect(Reflect.get(state as object, "taskPhase")).toBeNull();
     expect(state.progress.total).toBe(5);
+  });
+
+  test("stores task phase and clears it on a new task reset", () => {
+    const state = createEmptyMonitor();
+
+    setTaskPhase(state, {
+      phase: "resolving_ozon_products",
+      label: "解析 Ozon 商品源",
+      detail: "正在抓取商品详情与首图",
+      blocking: false,
+    });
+
+    expect(Reflect.get(state as object, "taskPhase")).toEqual({
+      phase: "resolving_ozon_products",
+      label: "解析 Ozon 商品源",
+      detail: "正在抓取商品详情与首图",
+      blocking: false,
+    });
+
+    updateProgress(state, { processed: 0, total: 2 });
+
+    expect(Reflect.get(state as object, "taskPhase")).toBeNull();
   });
 
   test("marks task done summary", () => {

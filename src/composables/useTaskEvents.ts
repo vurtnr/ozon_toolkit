@@ -7,6 +7,7 @@ import type {
   MonitorState,
   ProgressEventPayload,
   RowResultEventPayload,
+  TaskPhaseEventPayload,
   TaskDoneEventPayload,
 } from "../types/events";
 
@@ -17,6 +18,7 @@ export function createEmptyMonitor(): MonitorState {
     logs: [],
     done: null,
     alert: null,
+    taskPhase: null,
   };
 }
 
@@ -60,6 +62,7 @@ export function updateProgress(
     state.logs = [];
     state.done = null;
     state.alert = null;
+    state.taskPhase = null;
   }
   state.progress.processed = payload.processed;
   state.progress.total = payload.total;
@@ -81,6 +84,13 @@ export function setBlockingAlert(
   payload: BlockingAlertEventPayload,
 ): void {
   state.alert = payload;
+}
+
+export function setTaskPhase(
+  state: MonitorState,
+  payload: TaskPhaseEventPayload,
+): void {
+  state.taskPhase = payload;
 }
 
 export function useTaskEvents() {
@@ -119,6 +129,12 @@ export function useTaskEvents() {
         setBlockingAlert(state, event.payload);
       }),
     );
+
+    unlisten.push(
+      await listen<TaskPhaseEventPayload>("task_phase", (event) => {
+        setTaskPhase(state, event.payload);
+      }),
+    );
   }
 
   function stopListening() {
@@ -133,6 +149,7 @@ export function useTaskEvents() {
     state.logs.splice(0, state.logs.length);
     state.done = null;
     state.alert = null;
+    state.taskPhase = null;
     state.progress.processed = 0;
     state.progress.total = 0;
   }
