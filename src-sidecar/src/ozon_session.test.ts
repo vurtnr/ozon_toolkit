@@ -1,5 +1,56 @@
 import { describe, expect, test } from "bun:test";
-import { classifyOzonSnapshot, type OzonSnapshot } from "./ozon_session";
+import {
+  buildCanonicalOzonProductUrl,
+  classifyOzonLandingSnapshot,
+  classifyOzonSnapshot,
+  type OzonSnapshot,
+} from "./ozon_session";
+
+describe("buildCanonicalOzonProductUrl", () => {
+  test("normalizes product deep links into a canonical detail url", () => {
+    expect(
+      buildCanonicalOzonProductUrl(
+        "https://www.ozon.ru/product/3552213000/?at=abc&utm_source=test#section",
+      ),
+    ).toBe("https://www.ozon.ru/product/3552213000/");
+  });
+
+  test("rejects non-product ozon urls", () => {
+    expect(
+      buildCanonicalOzonProductUrl("https://www.ozon.ru/category/sport-12345/"),
+    ).toBeNull();
+  });
+});
+
+describe("classifyOzonLandingSnapshot", () => {
+  test("treats access-restricted ozon home pages as anti_bot_challenge", () => {
+    const snapshot: OzonSnapshot = {
+      url: "https://www.ozon.ru/",
+      documentTitle: "Доступ ограничен",
+      title: null,
+      imageUrl: null,
+      bodyText: "Инцидент: fab_chlg_20260323001058 Служба поддержки",
+      hasAntiBotChallenge: false,
+      isUnavailable: false,
+    };
+
+    expect(classifyOzonLandingSnapshot(snapshot)).toBe("anti_bot_challenge");
+  });
+
+  test("treats normal ozon home pages as ready", () => {
+    const snapshot: OzonSnapshot = {
+      url: "https://www.ozon.ru/",
+      documentTitle: "Ozon",
+      title: null,
+      imageUrl: null,
+      bodyText: "Маркетплейс Ozon",
+      hasAntiBotChallenge: false,
+      isUnavailable: false,
+    };
+
+    expect(classifyOzonLandingSnapshot(snapshot)).toBe("ready");
+  });
+});
 
 describe("classifyOzonSnapshot", () => {
   test("treats access-restricted pages as anti_bot_challenge", () => {

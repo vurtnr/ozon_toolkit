@@ -22,6 +22,8 @@ export type OzonPageState =
   | "unavailable"
   | "incomplete";
 
+export type OzonLandingState = "ready" | "anti_bot_challenge" | "loading";
+
 export interface ResolveOzonProductDependencies {
   browser: Browser;
   getSessionPage: () => Page | null;
@@ -36,6 +38,7 @@ export interface ResolveOzonProductDependencies {
 const DEFAULT_OZON_HOME_URL = "https://www.ozon.ru/";
 const DEFAULT_RESOLVE_TIMEOUT_MS = 180_000;
 const DEFAULT_POLL_INTERVAL_MS = 1_000;
+const DEFAULT_LANDING_TIMEOUT_MS = 60_000;
 
 const OZON_ANTI_BOT_URL_HINTS = ["__rr=", "abt_att=1", "captcha"];
 const OZON_ANTI_BOT_TEXT_HINTS = [
@@ -63,6 +66,44 @@ const OZON_UNAVAILABLE_TEXT_HINTS = [
   "товар закончился",
   "нет в наличии",
 ];
+
+function isAllowedOzonHost(hostname: string): boolean {
+  const normalized = (hostname || "").trim().toLowerCase();
+  return normalized === "ozon.ru" || normalized.endsWith(".ozon.ru");
+}
+
+export function buildCanonicalOzonProductUrl(value: string): string | null {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return null;
+  }
+
+  try {
+    const parsed = new URL(trimmed);
+    if (!isAllowedOzonHost(parsed.hostname)) {
+      return null;
+    }
+
+    const segments = parsed.pathname.split("/").filter(Boolean);
+    if (segments[0] !== "product" || !segments[1]) {
+      return null;
+    }
+
+    const rawSegment = segments[1].trim();
+    const normalizedSegment = rawSegment ? decodeURIComponent(rawSegment) : "";
+    if (!normalizedSegment) {
+      return null;
+    }
+
+    const canonical = new URL(DEFAULT_OZON_HOME_URL);
+    canonical.pathname = `/product/${normalizedSegment}/`;
+    canonical.search = "";
+    canonical.hash = "";
+    return canonical.toString();
+  } catch {
+    return null;
+  }
+}
 
 export async function collectOzonSnapshot(page: Page): Promise<OzonSnapshot> {
   return page.evaluate(
@@ -225,6 +266,30 @@ export function classifyOzonSnapshot(snapshot: OzonSnapshot): OzonPageState {
   return "incomplete";
 }
 
+export function classifyOzonLandingSnapshot(
+  snapshot: OzonSnapshot,
+): OzonLandingState {
+  if (snapshotHasOzonAntiBotSignal(snapshot)) {
+    return "anti_bot_challenge";
+  }
+
+  try {
+    const parsed = new URL(snapshot.url || "");
+    if (
+      isAllowedOzonHost(parsed.hostname) &&
+      (parsed.pathname === "/" || parsed.pathname === "")
+    ) {
+      const hasVisibleContent =
+        snapshot.documentTitle.trim().length > 0 || snapshot.bodyText.trim().length > 0;
+      if (hasVisibleContent) {
+        return "ready";
+      }
+    }
+  } catch {}
+
+  return "loading";
+}
+
 async function captureOzonImageBase64(
   page: Page,
   expectedImageUrl: string | null,
@@ -328,7 +393,27 @@ async function warmOzonSession(
     waitUntil: "domcontentloaded",
     timeout: 60_000,
   });
-  await dependencies.delay(750);
+
+  const deadline = Date.now() + DEFAULT_LANDING_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    const snapshot = await collectOzonSnapshot(page);
+    const landingState = classifyOzonLandingSnapshot(snapshot);
+
+    if (landingState === "anti_bot_challenge") {
+      throw new Error("[ANTI_BOT_CHALLENGE] Ozon 首页触发验证且在进入商品页前未解除");
+    }
+
+    if (landingState === "ready") {
+      await dependencies.delay(750);
+      return;
+    }
+
+    await dependencies.delay(
+      dependencies.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS,
+    );
+  }
+
+  throw new Error("[OZON_RESOLVE_FAILED] Ozon 首页未完成加载，无法进入商品详情页");
 }
 
 export async function resolveOzonProductViaSession(
@@ -337,8 +422,12 @@ export async function resolveOzonProductViaSession(
 ): Promise<OzonResolvePayload> {
   const page = await ensureOzonSessionPage(dependencies);
   await warmOzonSession(dependencies, page);
+  const canonicalProductUrl = buildCanonicalOzonProductUrl(productUrl);
+  if (!canonicalProductUrl) {
+    throw new Error("[OZON_RESOLVE_FAILED] Ozon 商品链接无效");
+  }
 
-  await page.goto(productUrl, {
+  await page.goto(canonicalProductUrl, {
     waitUntil: "domcontentloaded",
     timeout: 60_000,
   });
