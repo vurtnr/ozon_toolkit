@@ -34,7 +34,9 @@ pub fn blocking_alert_for_code(code: &str) -> Option<BlockingAlertPayload> {
         }),
         CODE_ANTI_BOT_CHALLENGE => Some(BlockingAlertPayload {
             code: CODE_ANTI_BOT_CHALLENGE.to_string(),
-            message: "触发 1688 底层拦截，请在弹出的浏览器窗口中完成验证".to_string(),
+            message:
+                "触发页面风控或访问限制，请在弹出的浏览器窗口中完成验证、刷新页面或处理网络问题后再继续执行。"
+                    .to_string(),
             blocking: true,
             action_label: Some("已验证，继续执行".to_string()),
         }),

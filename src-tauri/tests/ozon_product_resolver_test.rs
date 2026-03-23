@@ -25,6 +25,7 @@ struct HttpResponse {
     status_line: &'static str,
     content_type: &'static str,
     body: Vec<u8>,
+    extra_headers: Vec<(&'static str, &'static str)>,
 }
 
 fn png_bytes(fill: u8) -> Vec<u8> {
@@ -67,13 +68,19 @@ fn spawn_fixture_server(
                         status_line: "404 Not Found",
                         content_type: "text/plain; charset=utf-8",
                         body: b"not found".to_vec(),
+                        extra_headers: Vec::new(),
                     });
 
                     let headers = format!(
-                        "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\n{}Connection: close\r\n\r\n",
                         response.status_line,
                         response.content_type,
-                        response.body.len()
+                        response.body.len(),
+                        response
+                            .extra_headers
+                            .iter()
+                            .map(|(name, value)| format!("{name}: {value}\r\n"))
+                            .collect::<String>()
                     );
                     let _ = stream.write_all(headers.as_bytes());
                     let _ = stream.write_all(&response.body);
@@ -151,6 +158,7 @@ fn resolve_ozon_product_extracts_title_and_first_main_image_from_structured_html
             status_line: "200 OK",
             content_type: "image/png",
             body: first_image.clone(),
+            extra_headers: Vec::new(),
         },
     );
     routes.insert(
@@ -159,6 +167,7 @@ fn resolve_ozon_product_extracts_title_and_first_main_image_from_structured_html
             status_line: "200 OK",
             content_type: "image/png",
             body: second_image,
+            extra_headers: Vec::new(),
         },
     );
     routes.insert(
@@ -167,6 +176,7 @@ fn resolve_ozon_product_extracts_title_and_first_main_image_from_structured_html
             status_line: "200 OK",
             content_type: "image/png",
             body: png_bytes(64),
+            extra_headers: Vec::new(),
         },
     );
     routes.insert(
@@ -179,6 +189,7 @@ fn resolve_ozon_product_extracts_title_and_first_main_image_from_structured_html
                 &["/images/main-1.png", "/images/main-2.png"],
             )
             .into_bytes(),
+            extra_headers: Vec::new(),
         },
     );
     let (base_url, handle) = spawn_fixture_server(routes);
@@ -207,6 +218,7 @@ fn resolve_ozon_product_prefers_first_image_only() {
             status_line: "200 OK",
             content_type: "image/png",
             body: first_image.clone(),
+            extra_headers: Vec::new(),
         },
     );
     routes.insert(
@@ -215,6 +227,7 @@ fn resolve_ozon_product_prefers_first_image_only() {
             status_line: "200 OK",
             content_type: "image/png",
             body: second_image,
+            extra_headers: Vec::new(),
         },
     );
     routes.insert(
@@ -224,6 +237,7 @@ fn resolve_ozon_product_prefers_first_image_only() {
             content_type: "text/html; charset=utf-8",
             body: structured_product_html("Товар для теста", &["/images/first.png", "/images/second.png"])
                 .into_bytes(),
+            extra_headers: Vec::new(),
         },
     );
     let (base_url, handle) = spawn_fixture_server(routes);
@@ -251,6 +265,7 @@ fn resolve_ozon_product_returns_unavailable_for_off_shelf_html() {
             body: r#"<html><body><h1>Такого товара нет</h1></body></html>"#
                 .as_bytes()
                 .to_vec(),
+            extra_headers: Vec::new(),
         },
     );
     let (base_url, handle) = spawn_fixture_server(routes);
@@ -272,6 +287,7 @@ fn resolve_ozon_product_returns_missing_title_when_title_is_absent() {
             status_line: "200 OK",
             content_type: "image/png",
             body: png_bytes(188),
+            extra_headers: Vec::new(),
         },
     );
     routes.insert(
@@ -283,6 +299,7 @@ fn resolve_ozon_product_returns_missing_title_when_title_is_absent() {
                 r#"<html><head><script type="application/ld+json">{{"@context":"https://schema.org","@type":"Product","image":["/images/main.png"]}}</script></head></html>"#
             )
             .into_bytes(),
+            extra_headers: Vec::new(),
         },
     );
     let (base_url, handle) = spawn_fixture_server(routes);
@@ -306,6 +323,7 @@ fn resolve_ozon_product_returns_missing_image_when_image_is_absent() {
             body: r#"<html><head><script type="application/ld+json">{"@context":"https://schema.org","@type":"Product","name":"无主图测试"}</script></head></html>"#
                 .as_bytes()
                 .to_vec(),
+            extra_headers: Vec::new(),
         },
     );
     let (base_url, handle) = spawn_fixture_server(routes);
@@ -314,6 +332,110 @@ fn resolve_ozon_product_returns_missing_image_when_image_is_absent() {
         .expect_err("missing image should be classified");
 
     assert_eq!(error, OzonResolutionFailure::MissingImage);
+    handle.join().expect("join fixture server");
+}
+
+#[test]
+fn resolve_ozon_product_returns_antibot_for_challenge_page() {
+    let client = Client::new();
+    let mut routes = HashMap::new();
+    routes.insert(
+        "/product/3570411009".to_string(),
+        HttpResponse {
+            status_line: "403 Forbidden",
+            content_type: "text/html; charset=utf-8",
+            body: r#"<html><head><title>Antibot Captcha</title></head><body><input id="captcha-input" type="hidden" value="challenge"></body></html>"#
+                .as_bytes()
+                .to_vec(),
+            extra_headers: vec![("ozon-antibot", "1")],
+        },
+    );
+    let (base_url, handle) = spawn_fixture_server(routes);
+
+    let error = resolve_ozon_product(&client, &format!("{base_url}/product/3570411009"))
+        .expect_err("antibot page should be classified separately");
+
+    assert_eq!(error, OzonResolutionFailure::AntiBotChallenge);
+    handle.join().expect("join fixture server");
+}
+
+#[test]
+fn resolve_ozon_product_returns_antibot_for_503_challenge_page() {
+    let client = Client::builder()
+        .redirect(reqwest::redirect::Policy::limited(10))
+        .build()
+        .expect("build reqwest client");
+
+    let mut routes = HashMap::new();
+    routes.insert(
+        "/product/3570411009".to_string(),
+        HttpResponse {
+            status_line: "503 Service Unavailable",
+            content_type: "text/html; charset=utf-8",
+            body: r#"<html><head><title>Antibot Challenge Page</title></head><body><input id="captcha-input" type="hidden" value="challenge"></body></html>"#
+                .as_bytes()
+                .to_vec(),
+            extra_headers: Vec::new(),
+        },
+    );
+    let (base_url, handle) = spawn_fixture_server(routes);
+
+    let error = resolve_ozon_product(&client, &format!("{base_url}/product/3570411009"))
+        .expect_err("503 challenge page should be classified as antibot");
+
+    assert_eq!(error, OzonResolutionFailure::AntiBotChallenge);
+
+    handle.join().expect("join fixture server");
+}
+
+#[test]
+fn resolve_ozon_product_returns_antibot_for_access_restricted_page() {
+    let client = Client::builder()
+        .redirect(reqwest::redirect::Policy::limited(10))
+        .build()
+        .expect("build reqwest client");
+
+    let mut routes = HashMap::new();
+    routes.insert(
+        "/product/3570411009".to_string(),
+        HttpResponse {
+            status_line: "200 OK",
+            content_type: "text/html; charset=utf-8",
+            body: r#"<!doctype html>
+<html>
+  <head>
+    <title>Доступ ограничен</title>
+  </head>
+  <body>
+    <h1>Доступ ограничен</h1>
+    <p>Инцидент: fab_chlg_20260323001058</p>
+    <p>Чтобы решить проблему, попробуйте сделать это:</p>
+    <img src="/warning.png" alt="warning">
+    <button>Обновить</button>
+    <a href="/support">Служба поддержки</a>
+  </body>
+</html>"#
+                .as_bytes()
+                .to_vec(),
+            extra_headers: Vec::new(),
+        },
+    );
+    routes.insert(
+        "/warning.png".to_string(),
+        HttpResponse {
+            status_line: "200 OK",
+            content_type: "image/png",
+            body: png_bytes(12),
+            extra_headers: Vec::new(),
+        },
+    );
+    let (base_url, handle) = spawn_fixture_server(routes);
+
+    let error = resolve_ozon_product(&client, &format!("{base_url}/product/3570411009"))
+        .expect_err("access restricted page should be classified as antibot");
+
+    assert_eq!(error, OzonResolutionFailure::AntiBotChallenge);
+
     handle.join().expect("join fixture server");
 }
 

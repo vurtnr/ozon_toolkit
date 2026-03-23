@@ -7,6 +7,7 @@ use serde_json::Value;
 pub enum OzonResolutionFailure {
     InvalidUrl,
     Unavailable,
+    AntiBotChallenge,
     MissingTitle,
     MissingImage,
     FetchFailed(String),
@@ -31,27 +32,31 @@ pub fn resolve_ozon_product(
     let response = client
         .get(parsed_url.clone())
         .send()
-        .map_err(|e| OzonResolutionFailure::FetchFailed(format!("fetch product page failed: {e}")))?;
+        .map_err(|e| {
+            if e.is_redirect() || looks_like_ozon_antibot_redirect_error(&e.to_string()) {
+                OzonResolutionFailure::AntiBotChallenge
+            } else {
+                OzonResolutionFailure::FetchFailed(format!("fetch product page failed: {e}"))
+            }
+        })?;
 
     let status = response.status();
-    if matches!(
-        status.as_u16(),
-        403 | 404 | 410 | 451 | 500 | 502 | 503 | 504
-    ) {
+    let headers = response.headers().clone();
+
+    let html = response
+        .text()
+        .map_err(|e| OzonResolutionFailure::FetchFailed(format!("read product page failed: {e}")))?;
+
+    if is_antibot_response_status(status.as_u16(), &headers) || is_antibot_html(&html) {
+        return Err(OzonResolutionFailure::AntiBotChallenge);
+    }
+    if is_unavailable_response_status(status.as_u16()) || is_unavailable_html(&html) {
         return Err(OzonResolutionFailure::Unavailable);
     }
     if !status.is_success() {
         return Err(OzonResolutionFailure::FetchFailed(format!(
             "unexpected product page status: {status}"
         )));
-    }
-
-    let html = response
-        .text()
-        .map_err(|e| OzonResolutionFailure::FetchFailed(format!("read product page failed: {e}")))?;
-
-    if is_unavailable_html(&html) {
-        return Err(OzonResolutionFailure::Unavailable);
     }
 
     let title = extract_title(&html).ok_or(OzonResolutionFailure::MissingTitle)?;
@@ -103,6 +108,47 @@ fn is_unavailable_html(html: &str) -> bool {
         "товар закончился",
         "нет в наличии",
         "не удалось найти товар",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker))
+}
+
+fn is_unavailable_response_status(status_code: u16) -> bool {
+    matches!(status_code, 404 | 410 | 451)
+}
+
+fn is_antibot_response_status(
+    status_code: u16,
+    headers: &reqwest::header::HeaderMap,
+) -> bool {
+    if status_code == 403 {
+        return headers.contains_key("ozon-antibot");
+    }
+
+    false
+}
+
+fn looks_like_ozon_antibot_redirect_error(message: &str) -> bool {
+    let normalized = message.to_lowercase();
+    normalized.contains("too many redirects")
+        || (normalized.contains("redirect") && normalized.contains("__rr"))
+}
+
+fn is_antibot_html(html: &str) -> bool {
+    let normalized = html.to_lowercase();
+    [
+        "antibot captcha",
+        "antibot challenge",
+        "please, enable javascript to continue",
+        "нам нужно убедиться, что вы не робот",
+        "доступ ограничен",
+        "инцидент:",
+        "чтобы решить проблему, попробуйте сделать это",
+        "служба поддержки",
+        "обновить версию браузера или мобильного приложения",
+        "captcha-input",
+        "__rr=",
+        "abt_att=1",
     ]
     .iter()
     .any(|marker| normalized.contains(marker))
