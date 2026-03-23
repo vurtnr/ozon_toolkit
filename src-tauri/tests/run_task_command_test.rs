@@ -1111,11 +1111,35 @@ fn run_task_stops_when_browser_assisted_ozon_resolve_remains_blocked() {
         .expect_err("task should stop when ozon browser fallback remains blocked");
 
     assert_eq!(err, "ANTI_BOT_CHALLENGE");
+    let task_phase_events: Vec<&Value> = sink
+        .payloads
+        .iter()
+        .filter(|(name, _)| name == "task_phase")
+        .map(|(_, payload)| payload)
+        .collect();
+    assert!(
+        task_phase_events
+            .iter()
+            .any(|payload| payload["phase"] == "warming_ozon_session"),
+        "task phase stream should expose ozon session warm-up before browser hydration"
+    );
+    assert!(
+        task_phase_events
+            .iter()
+            .any(|payload| payload["phase"] == "waiting_for_ozon_verification"),
+        "task phase stream should expose ozon verification wait when hydration remains blocked"
+    );
     assert!(
         sink.payloads.iter().any(|(name, payload)| {
             name == EVENT_BLOCKING_ALERT && payload["code"] == "ANTI_BOT_CHALLENGE"
         }),
         "blocking alert should be emitted when ozon remains blocked",
+    );
+    assert!(
+        !sink.payloads.iter().any(|(name, payload)| {
+            name == EVENT_ROW_RESULT && payload["stage"] == "planning_search_image"
+        }),
+        "1688 planning stage must not start while ozon hydration remains blocked",
     );
 
     clear_mock_pipeline_env();

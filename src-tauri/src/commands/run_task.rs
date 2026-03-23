@@ -1507,6 +1507,7 @@ where
     let mut prepared = PreparedTaskRows::default();
     let mut ozon_source_cache: HashMap<String, Result<OzonProductResolution, OzonResolutionFailure>> =
         HashMap::new();
+    let mut ozon_session_warmed = false;
 
     for row in task_rows {
         emit_row_stage_event(sink, row, "queued", "排队中")?;
@@ -1535,6 +1536,16 @@ where
             let resolution = if let Some(cached) = ozon_source_cache.get(product_url) {
                 cached.clone()
             } else {
+                if !ozon_session_warmed {
+                    emit_task_phase_event(
+                        sink,
+                        "warming_ozon_session",
+                        "准备 Ozon 浏览器会话",
+                        "正在拉起浏览器并预热 Ozon 会话，用于抓取商品标题与首张主图",
+                        false,
+                    )?;
+                    ozon_session_warmed = true;
+                }
                 ensure_browser_ready(client)?;
                 let resolved = resolve_ozon_product_via_sidecar(client, product_url);
                 ozon_source_cache.insert(product_url.to_string(), resolved.clone());

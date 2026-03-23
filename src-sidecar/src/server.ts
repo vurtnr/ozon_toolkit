@@ -9,10 +9,18 @@ import {
 } from "./1688_engine";
 import { ChromeNotFoundError, findChromePath } from "./chrome-path";
 import { ERROR_CODES, type SidecarErrorCode } from "./error-codes";
+import {
+  resolveOzonProductViaSession,
+  type OzonResolvePayload,
+} from "./ozon_session";
 
 interface SearchRequestBody {
   imagePath?: string;
   forceFullCrop?: boolean;
+}
+
+interface OzonResolveRequestBody {
+  productUrl?: string;
 }
 
 interface SidecarErrorPayload {
@@ -47,6 +55,7 @@ type ClosableServer = Pick<Server, "close">;
 
 type RuntimeResources = {
   page: ClosablePage | null;
+  ozonPage: ClosablePage | null;
   browser: ClosableBrowser | null;
   server: ClosableServer | null;
 };
@@ -114,6 +123,7 @@ function buildChromeArgs(
 
 let globalBrowser: Browser | null = null;
 let globalHomePage: Page | null = null;
+let globalOzonPage: Page | null = null;
 let chromeExecutablePath: string | null = null;
 let httpServer: Server | null = null;
 let shutdownInFlight: Promise<void> | null = null;
@@ -157,6 +167,10 @@ function resolveProfileDir(): string {
 
 function normalizeVisibleText(value: string): string {
   return (value || "").replace(/\s+/g, "");
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function is1688HomeUrl(url: string): boolean {
@@ -349,6 +363,40 @@ async function ensure1688SessionReady(page: Page): Promise<void> {
   }
 }
 
+async function resolveOzonProductViaBrowser(productUrl: string): Promise<OzonResolvePayload> {
+  const activeHomePage = await ensureBrowserAndPageAlive();
+  const restoreHomePageFocus = async () => {
+    try {
+      if (activeHomePage && !activeHomePage.isClosed()) {
+        await activeHomePage.bringToFront();
+      }
+    } catch {}
+  };
+
+  try {
+    const payload = await resolveOzonProductViaSession(
+      {
+        browser: globalBrowser as Browser,
+        getSessionPage: () => globalOzonPage,
+        setSessionPage: (page) => {
+          globalOzonPage = page;
+        },
+        applyBrowserEvasions,
+        delay,
+      },
+      productUrl,
+    );
+    await restoreHomePageFocus();
+    return payload;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (!message.includes("[ANTI_BOT_CHALLENGE]")) {
+      await restoreHomePageFocus();
+    }
+    throw error;
+  }
+}
+
 async function applyBrowserEvasions(page: Page): Promise<void> {
   const navigatorPlatform = browserNavigatorPlatformForPlatform();
   await page.evaluateOnNewDocument((injectedPlatform: string) => {
@@ -409,6 +457,7 @@ async function ensureBrowserAndPageAliveInner(): Promise<Page> {
       args: buildChromeArgs(),
     });
     globalHomePage = null;
+    globalOzonPage = null;
   }
 
   let needNewPage = false;
@@ -450,6 +499,10 @@ export async function shutdownRuntimeResources(
     await resources.page.close().catch(() => undefined);
   }
 
+  if (resources.ozonPage && !resources.ozonPage.isClosed()) {
+    await resources.ozonPage.close().catch(() => undefined);
+  }
+
   if (resources.browser && resources.browser.isConnected()) {
     await resources.browser.close().catch(() => undefined);
   }
@@ -469,10 +522,12 @@ async function shutdownSidecarProcess(exitCode?: number): Promise<void> {
   shutdownInFlight = (async () => {
     const resources: RuntimeResources = {
       page: globalHomePage,
+      ozonPage: globalOzonPage,
       browser: globalBrowser,
       server: httpServer,
     };
     globalHomePage = null;
+    globalOzonPage = null;
     globalBrowser = null;
     httpServer = null;
 
@@ -640,6 +695,29 @@ app.post("/search", async (req: Request<unknown, unknown, SearchRequestBody>, re
     return res.status(statusCode).json(payload);
   }
 });
+
+app.post(
+  "/resolve-ozon-product",
+  async (req: Request<unknown, unknown, OzonResolveRequestBody>, res: Response) => {
+    const productUrl = (req.body?.productUrl || "").trim();
+    if (!productUrl) {
+      return res.status(400).json({
+        success: false,
+        code: ERROR_CODES.UNKNOWN,
+        error: "missing productUrl",
+      });
+    }
+
+    try {
+      const data = await resolveOzonProductViaBrowser(productUrl);
+      return res.json({ success: true, data });
+    } catch (error) {
+      const payload = buildErrorPayload(error);
+      const statusCode = payload.code === ERROR_CODES.UNKNOWN ? 500 : 200;
+      return res.status(statusCode).json(payload);
+    }
+  },
+);
 
 app.get("/health", createHealthHandler());
 

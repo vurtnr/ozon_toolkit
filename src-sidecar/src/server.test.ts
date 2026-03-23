@@ -17,6 +17,12 @@ describe("shutdownRuntimeResources", () => {
           calls.push("page");
         },
       },
+      ozonPage: {
+        isClosed: () => false,
+        close: async () => {
+          calls.push("ozonPage");
+        },
+      },
       browser: {
         isConnected: () => true,
         close: async () => {
@@ -32,7 +38,7 @@ describe("shutdownRuntimeResources", () => {
       },
     });
 
-    expect(calls).toEqual(["page", "browser", "server"]);
+    expect(calls).toEqual(["page", "ozonPage", "browser", "server"]);
   });
 
   test("skips already-closed resources", async () => {
@@ -43,6 +49,12 @@ describe("shutdownRuntimeResources", () => {
         isClosed: () => true,
         close: async () => {
           calls.push("page");
+        },
+      },
+      ozonPage: {
+        isClosed: () => true,
+        close: async () => {
+          calls.push("ozonPage");
         },
       },
       browser: {
