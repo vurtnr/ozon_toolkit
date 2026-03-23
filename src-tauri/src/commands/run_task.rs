@@ -20,7 +20,7 @@ use crate::config::{
 };
 use crate::core::excel::extract_wps_images;
 use crate::core::ozon_product::{
-    resolve_ozon_product, OzonProductResolution, OzonResolutionFailure,
+    classify_ozon_url_mode, OzonProductResolution, OzonResolutionFailure,
 };
 use crate::core::orchestrator::{
     orchestrate_match, CandidateFetcher, NoMatchReason, OrchestrationDiagnostics, SearchPass,
@@ -48,6 +48,7 @@ use crate::recovery::{
 const DEFAULT_SIDECAR_SEARCH_URL: &str = "http://127.0.0.1:8266/search";
 const DEFAULT_SIDECAR_HEALTH_URL: &str = "http://127.0.0.1:8266/health";
 const DEFAULT_SIDECAR_SESSION_URL: &str = "http://127.0.0.1:8266/session-state";
+const DEFAULT_SIDECAR_OZON_RESOLVE_URL: &str = "http://127.0.0.1:8266/resolve-ozon-product";
 const DEFAULT_SIDECAR_SHUTDOWN_URL: &str = "http://127.0.0.1:8266/shutdown";
 const MOCK_CANDIDATES_ENV: &str = "RUN_TASK_MOCK_CANDIDATES_JSON";
 const MOCK_CANDIDATE_RESPONSES_ENV: &str = "RUN_TASK_MOCK_CANDIDATE_RESPONSES_JSON";
@@ -60,6 +61,7 @@ const DIAGNOSTICS_DELAY_MS_ENV: &str = "RUN_TASK_DIAGNOSTICS_DELAY_MS";
 const SIDECAR_SHUTDOWN_URL_ENV: &str = "SIDECAR_SHUTDOWN_URL";
 const SIDECAR_URL_ENV: &str = "SIDECAR_SEARCH_URL";
 const SIDECAR_SESSION_URL_ENV: &str = "SIDECAR_SESSION_URL";
+const SIDECAR_OZON_RESOLVE_URL_ENV: &str = "SIDECAR_OZON_RESOLVE_URL";
 const SIDECAR_EXECUTABLE_PATH_ENV: &str = "SIDECAR_EXECUTABLE_PATH";
 const SIDECAR_PROFILE_DIR_ENV: &str = "SIDECAR_PROFILE_DIR";
 const SIDECAR_WAIT_TIMEOUT_SECS: u64 = 15;
@@ -183,10 +185,33 @@ struct SidecarSearchRequest {
     force_full_crop: bool,
 }
 
+#[derive(Debug, Serialize)]
+struct SidecarOzonResolveRequest {
+    #[serde(rename = "productUrl")]
+    product_url: String,
+}
+
 #[derive(Debug, Deserialize)]
 struct SidecarSearchResponse {
     success: bool,
     data: Option<Vec<Candidate>>,
+    code: Option<String>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SidecarOzonResolvePayload {
+    title: String,
+    #[serde(rename = "imageUrl")]
+    image_url: String,
+    #[serde(rename = "imageBase64")]
+    image_base64: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SidecarOzonResolveResponse {
+    success: bool,
+    data: Option<SidecarOzonResolvePayload>,
     code: Option<String>,
     error: Option<String>,
 }
@@ -951,6 +976,14 @@ fn sidecar_session_url() -> String {
         .unwrap_or_else(|| DEFAULT_SIDECAR_SESSION_URL.to_string())
 }
 
+fn sidecar_ozon_resolve_url() -> String {
+    std::env::var(SIDECAR_OZON_RESOLVE_URL_ENV)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| DEFAULT_SIDECAR_OZON_RESOLVE_URL.to_string())
+}
+
 fn sidecar_shutdown_url() -> String {
     std::env::var(SIDECAR_SHUTDOWN_URL_ENV)
         .ok()
@@ -1290,9 +1323,13 @@ fn validate_task_runtime_prerequisites(
 fn map_ozon_resolution_failure_to_status(error: &OzonResolutionFailure) -> String {
     match error {
         OzonResolutionFailure::InvalidUrl => "Ozon链接无效".to_string(),
-        OzonResolutionFailure::Unavailable | OzonResolutionFailure::FetchFailed(_) => {
+        OzonResolutionFailure::AntiBotChallenge => {
+            "Ozon触发风控，未完成浏览器验证".to_string()
+        }
+        OzonResolutionFailure::Unavailable => {
             "Ozon商品已下架或不可访问".to_string()
         }
+        OzonResolutionFailure::FetchFailed(_) => "Ozon商品页抓取失败".to_string(),
         OzonResolutionFailure::MissingTitle => "未解析到Ozon商品标题".to_string(),
         OzonResolutionFailure::MissingImage => "未解析到Ozon商品主图".to_string(),
     }
@@ -1300,17 +1337,14 @@ fn map_ozon_resolution_failure_to_status(error: &OzonResolutionFailure) -> Strin
 
 fn resolve_task_row_source(
     sink: &mut dyn EventSink,
-    client: &Client,
     row: &TaskRow,
-    cache: &mut HashMap<String, Result<OzonProductResolution, OzonResolutionFailure>>,
-) -> Result<TaskRow, TaskOutputRow> {
+) -> Result<TaskRow, OzonResolutionFailure> {
     let Some(product_url) = row.product_url.as_deref() else {
         return Ok(row.clone());
     };
 
-    emit_row_stage_event(sink, row, "resolving_ozon_product", "正在解析 Ozon 商品页").map_err(
-        |_| empty_output_row(row, "正在解析 Ozon 商品页"),
-    )?;
+    emit_row_stage_event(sink, row, "resolving_ozon_product", "正在解析 Ozon 商品页")
+        .map_err(|_| OzonResolutionFailure::FetchFailed("emit resolving event failed".to_string()))?;
     let _ = emit_event(
         sink,
         EVENT_LOG,
@@ -1320,26 +1354,124 @@ fn resolve_task_row_source(
         },
     );
 
-    let resolution = if let Some(cached) = cache.get(product_url) {
-        cached.clone()
+    if classify_ozon_url_mode(product_url) {
+        Ok(row.clone())
     } else {
-        let resolved = resolve_ozon_product(client, product_url);
-        cache.insert(product_url.to_string(), resolved.clone());
-        resolved
+        Err(OzonResolutionFailure::InvalidUrl)
+    }
+}
+
+fn download_image_bytes_for_browser_resolve(
+    client: &Client,
+    image_url: &str,
+) -> Result<Vec<u8>, OzonResolutionFailure> {
+    let response = client
+        .get(image_url)
+        .send()
+        .map_err(|e| OzonResolutionFailure::FetchFailed(format!("fetch image failed: {e}")))?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(OzonResolutionFailure::FetchFailed(format!(
+            "unexpected image status: {status}"
+        )));
+    }
+    response
+        .bytes()
+        .map(|bytes| bytes.to_vec())
+        .map_err(|e| OzonResolutionFailure::FetchFailed(format!("read image bytes failed: {e}")))
+}
+
+fn decode_sidecar_ozon_image_bytes(image_base64: &str) -> Result<Vec<u8>, OzonResolutionFailure> {
+    BASE64_STANDARD.decode(image_base64).map_err(|e| {
+        OzonResolutionFailure::FetchFailed(format!("decode sidecar image bytes failed: {e}"))
+    })
+}
+
+fn classify_sidecar_ozon_resolve_failure(
+    code: Option<&str>,
+    error: Option<&str>,
+    status: reqwest::StatusCode,
+) -> OzonResolutionFailure {
+    let code = code.unwrap_or("").trim();
+    let error = error.unwrap_or("").trim();
+    let message = if !error.is_empty() {
+        error
+    } else if !code.is_empty() {
+        code
+    } else {
+        ""
     };
 
-    match resolution {
-        Ok(resolution) => {
-            let mut hydrated = row.clone();
-            hydrated.ozon_name = resolution.title;
-            hydrated.image_bytes = Some(resolution.image_bytes);
-            Ok(hydrated)
-        }
-        Err(error) => Err(empty_output_row(
-            row,
-            map_ozon_resolution_failure_to_status(&error).as_str(),
-        )),
+    if code == CODE_ANTI_BOT_CHALLENGE || message.contains("[ANTI_BOT_CHALLENGE]") {
+        return OzonResolutionFailure::AntiBotChallenge;
     }
+    if message.contains("[OZON_PRODUCT_UNAVAILABLE]") {
+        return OzonResolutionFailure::Unavailable;
+    }
+    if !message.is_empty() {
+        return OzonResolutionFailure::FetchFailed(message.to_string());
+    }
+
+    OzonResolutionFailure::FetchFailed(format!("sidecar http error {status}"))
+}
+
+fn resolve_ozon_product_via_sidecar(
+    client: &Client,
+    product_url: &str,
+) -> Result<OzonProductResolution, OzonResolutionFailure> {
+    let response = client
+        .post(sidecar_ozon_resolve_url())
+        .json(&SidecarOzonResolveRequest {
+            product_url: product_url.to_string(),
+        })
+        .send()
+        .map_err(|e| OzonResolutionFailure::FetchFailed(format!("request sidecar failed: {e}")))?;
+
+    let status = response.status();
+    let text = response
+        .text()
+        .map_err(|e| OzonResolutionFailure::FetchFailed(format!("read sidecar response failed: {e}")))?;
+
+    let parsed = serde_json::from_str::<SidecarOzonResolveResponse>(&text)
+        .map_err(|e| OzonResolutionFailure::FetchFailed(format!(
+            "parse sidecar resolve response failed: {e}; body={text}"
+        )))?;
+
+    if !status.is_success() {
+        return Err(classify_sidecar_ozon_resolve_failure(
+            parsed.code.as_deref(),
+            parsed.error.as_deref(),
+            status,
+        ));
+    }
+
+    if !parsed.success {
+        return Err(classify_sidecar_ozon_resolve_failure(
+            parsed.code.as_deref(),
+            parsed.error.as_deref(),
+            status,
+        ));
+    }
+
+    let payload = parsed
+        .data
+        .ok_or_else(|| OzonResolutionFailure::FetchFailed("sidecar response missing data".to_string()))?;
+    let image_bytes = if let Some(encoded) = payload
+        .image_base64
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        decode_sidecar_ozon_image_bytes(encoded)?
+    } else {
+        download_image_bytes_for_browser_resolve(client, &payload.image_url)?
+    };
+
+    Ok(OzonProductResolution {
+        title: payload.title,
+        image_url: payload.image_url,
+        image_bytes,
+    })
 }
 
 fn finalize_preflight_row(
@@ -1361,13 +1493,17 @@ fn finalize_preflight_row(
     )
 }
 
-fn prepare_task_rows_for_execution(
+fn prepare_task_rows_for_execution<F>(
     sink: &mut dyn EventSink,
     client: &Client,
     task_rows: &[TaskRow],
     total_rows: u32,
     use_mock_candidates: bool,
-) -> Result<PreparedTaskRows, String> {
+    ensure_browser_ready: &mut F,
+) -> Result<PreparedTaskRows, String>
+where
+    F: FnMut(&Client) -> Result<(), String>,
+{
     let mut prepared = PreparedTaskRows::default();
     let mut ozon_source_cache: HashMap<String, Result<OzonProductResolution, OzonResolutionFailure>> =
         HashMap::new();
@@ -1375,13 +1511,70 @@ fn prepare_task_rows_for_execution(
     for row in task_rows {
         emit_row_stage_event(sink, row, "queued", "排队中")?;
 
-        let resolved_row = match resolve_task_row_source(sink, client, row, &mut ozon_source_cache)
-        {
+        let validated_row = match resolve_task_row_source(sink, row) {
             Ok(resolved) => resolved,
-            Err(source_failure_output) => {
-                finalize_preflight_row(sink, &mut prepared, source_failure_output, total_rows)?;
+            Err(error) => {
+                finalize_preflight_row(
+                    sink,
+                    &mut prepared,
+                    empty_output_row(row, map_ozon_resolution_failure_to_status(&error).as_str()),
+                    total_rows,
+                )?;
                 continue;
             }
+        };
+
+        let resolved_row = if !use_mock_candidates
+            && validated_row.image_bytes.is_none()
+            && validated_row.product_url.is_some()
+        {
+            let product_url = validated_row
+                .product_url
+                .as_deref()
+                .expect("product_url presence checked above");
+            let resolution = if let Some(cached) = ozon_source_cache.get(product_url) {
+                cached.clone()
+            } else {
+                ensure_browser_ready(client)?;
+                let resolved = resolve_ozon_product_via_sidecar(client, product_url);
+                ozon_source_cache.insert(product_url.to_string(), resolved.clone());
+                resolved
+            };
+
+            match resolution {
+                Ok(resolution) => {
+                    let mut hydrated = validated_row.clone();
+                    hydrated.ozon_name = resolution.title;
+                    hydrated.image_bytes = Some(resolution.image_bytes);
+                    hydrated
+                }
+                Err(error) => {
+                    if error == OzonResolutionFailure::AntiBotChallenge {
+                        emit_task_phase_event(
+                            sink,
+                            "waiting_for_ozon_verification",
+                            "等待 Ozon 验证",
+                            "Ozon 商品页触发验证，Chrome 已打开验证页，完成验证后会自动继续。",
+                            true,
+                        )?;
+                        GLOBAL_RECOVERY_GATE.pause();
+                        emit_blocking_alert_if_needed(sink, CODE_ANTI_BOT_CHALLENGE)?;
+                        return Err(CODE_ANTI_BOT_CHALLENGE.to_string());
+                    }
+                    finalize_preflight_row(
+                        sink,
+                        &mut prepared,
+                        empty_output_row(
+                            &validated_row,
+                            map_ozon_resolution_failure_to_status(&error).as_str(),
+                        ),
+                        total_rows,
+                    )?;
+                    continue;
+                }
+            }
+        } else {
+            validated_row
         };
 
         if resolved_row.image_bytes.is_some() || use_mock_candidates {
@@ -1890,6 +2083,7 @@ where
             &task_workbook.rows,
             total_rows,
             use_mock_candidates,
+            &mut ensure_browser_ready,
         )?;
         let mut processed_rows = prepared_rows.processed_rows;
         let executable_rows = prepared_rows.executable_rows;
