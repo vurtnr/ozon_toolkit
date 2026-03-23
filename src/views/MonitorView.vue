@@ -4,6 +4,7 @@ import { useTaskEvents } from "../composables/useTaskEvents";
 import BlockingAlert from "../components/BlockingAlert.vue";
 import {
   getLogTone,
+  resolveOutcomeSummaryCard,
   getStagePresentation,
   resolveMonitorStage,
   summarizeMonitorBoard,
@@ -21,6 +22,12 @@ const boardSummary = computed(() =>
 );
 const activeStage = computed(() =>
   resolveMonitorStage(boardSummary.value.activeRow, boardSummary.value.taskPhase),
+);
+const outcomeSummary = computed(() =>
+  resolveOutcomeSummaryCard(
+    boardSummary.value.failedCount,
+    boardSummary.value.taskPhase,
+  ),
 );
 const doneSummary = computed(() => {
   if (!monitor.state.done) return null;
@@ -43,9 +50,16 @@ const focusDetail = computed(() => {
 });
 const focusMeta = computed(() => {
   if (activeStage.value.source === "task_phase") {
-    return monitor.state.taskPhase?.blocking
-      ? "完成登录或解除阻塞后，任务会自动继续。"
-      : "任务阶段会持续推进并实时刷新。";
+    if (!monitor.state.taskPhase?.blocking) {
+      return "任务阶段会持续推进并实时刷新。";
+    }
+    if (monitor.state.taskPhase.phase === "waiting_for_ozon_verification") {
+      return "请在已打开的 Ozon 页面完成验证或处理访问限制后再继续。";
+    }
+    if (monitor.state.taskPhase.phase === "waiting_for_1688_login") {
+      return "请在 1688 页面完成登录，检测到登录成功后会自动继续。";
+    }
+    return "完成登录或解除阻塞后，任务会自动继续。";
   }
   return `耗时 ${boardSummary.value.activeRow?.elapsedText || "执行中"}`;
 });
@@ -99,10 +113,10 @@ function dismissAlert() {
         <strong>{{ boardSummary.pendingCount }}</strong>
         <small>正在执行浏览器搜索、AI 初筛或严格终审的行数。</small>
       </article>
-      <article class="summary-card">
-        <span class="summary-label">未锁定结果</span>
-        <strong>{{ boardSummary.failedCount }}</strong>
-        <small>已完成处理但未找到可交付商品的行数。</small>
+      <article class="summary-card" :data-tone="outcomeSummary.tone">
+        <span class="summary-label">{{ outcomeSummary.label }}</span>
+        <strong>{{ outcomeSummary.value }}</strong>
+        <small>{{ outcomeSummary.detail }}</small>
       </article>
     </div>
 
@@ -272,6 +286,15 @@ function dismissAlert() {
   display: grid;
   gap: 0.42rem;
   padding: 1rem;
+}
+
+.summary-card[data-tone="warn"] {
+  border-color: rgba(255, 197, 79, 0.36);
+}
+
+.summary-card[data-tone="danger"] {
+  border-color: rgba(255, 98, 98, 0.42);
+  box-shadow: inset 0 0 0 1px rgba(255, 98, 98, 0.12);
 }
 
 .summary-label {

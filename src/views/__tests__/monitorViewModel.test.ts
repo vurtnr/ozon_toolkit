@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import type { LogEventPayload, MonitorRow, TaskPhaseEventPayload } from "../../types/events";
 import {
   getStagePresentation,
+  resolveOutcomeSummaryCard,
   resolveMonitorStage,
   summarizeMonitorBoard,
 } from "../monitorViewModel";
@@ -60,6 +61,21 @@ describe("monitorViewModel", () => {
     expect(presentation.detail).toContain("完成 1688 登录");
   });
 
+  test("treats ozon verification wait as a blocking danger stage", () => {
+    const phase: TaskPhaseEventPayload = {
+      phase: "waiting_for_ozon_verification",
+      label: "等待 Ozon 验证",
+      detail: "Ozon 商品页触发验证，完成后任务会自动继续。",
+      blocking: true,
+    };
+
+    const presentation = resolveMonitorStage(null, phase);
+
+    expect(presentation.label).toBe("等待 Ozon 验证");
+    expect(presentation.tone).toBe("danger");
+    expect(presentation.detail).toContain("自动继续");
+  });
+
   test("maps failed final rows to a danger stage presentation", () => {
     const presentation = getStagePresentation(
       buildRow({
@@ -72,6 +88,37 @@ describe("monitorViewModel", () => {
     expect(presentation.label).toBe("执行失败");
     expect(presentation.tone).toBe("danger");
     expect(presentation.emphasis).toBe("terminal");
+  });
+
+  test("maps ozon source failures to a dedicated terminal stage", () => {
+    const presentation = getStagePresentation(
+      buildRow({
+        stage: "completed",
+        status: "Ozon商品已下架或不可访问",
+        isFinal: true,
+      }),
+    );
+
+    expect(presentation.label).toBe("源图不可用");
+    expect(presentation.tone).toBe("warn");
+    expect(presentation.emphasis).toBe("terminal");
+  });
+
+  test("uses a blocking summary card instead of unlocked-result summary while task is paused", () => {
+    const summaryCard = resolveOutcomeSummaryCard(
+      0,
+      {
+        phase: "waiting_for_ozon_verification",
+        label: "等待 Ozon 验证",
+        detail: "请先解除 Ozon 访问限制后再继续。",
+        blocking: true,
+      },
+    );
+
+    expect(summaryCard.label).toBe("任务阻断中");
+    expect(summaryCard.value).toBe("等待 Ozon 验证");
+    expect(summaryCard.tone).toBe("danger");
+    expect(summaryCard.detail).toContain("解除 Ozon 访问限制");
   });
 
   test("summarizes active row and recent logs for the monitor board", () => {

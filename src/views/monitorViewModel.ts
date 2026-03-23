@@ -29,6 +29,13 @@ export interface MonitorBoardSummary {
   taskPhase: TaskPhaseEventPayload | null;
 }
 
+export interface OutcomeSummaryCard {
+  label: string;
+  value: string;
+  detail: string;
+  tone: StageTone;
+}
+
 const STAGE_PRESENTATIONS: Record<string, StagePresentation> = {
   queued: { label: "排队中", tone: "info", emphasis: "live" },
   planning_search_image: { label: "生成搜索图", tone: "info", emphasis: "live" },
@@ -65,10 +72,41 @@ const STAGE_PRESENTATIONS: Record<string, StagePresentation> = {
 const TASK_PHASE_TONES: Record<string, StageTone> = {
   validating_runtime: "info",
   resolving_ozon_products: "info",
+  warming_ozon_session: "info",
   waiting_for_1688_login: "warn",
+  waiting_for_ozon_verification: "danger",
   running_1688_and_ai: "info",
   exporting_results: "ready",
 };
+
+function resolveTerminalFailurePresentation(status: string): StagePresentation | null {
+  if (
+    status.includes("Ozon触发风控") ||
+    status.includes("未完成浏览器验证") ||
+    status.includes("等待验证")
+  ) {
+    return {
+      label: "等待验证",
+      tone: "danger",
+      emphasis: "terminal",
+    };
+  }
+
+  if (
+    status.includes("Ozon商品已下架") ||
+    status.includes("不可访问") ||
+    status.includes("Ozon链接无效") ||
+    status.includes("未解析到Ozon商品")
+  ) {
+    return {
+      label: "源图不可用",
+      tone: "warn",
+      emphasis: "terminal",
+    };
+  }
+
+  return null;
+}
 
 export function hasLockedResult(row: Pick<MonitorRow, "itemUrl">): boolean {
   return Boolean(row.itemUrl);
@@ -90,6 +128,10 @@ export function getStagePresentation(
   }
 
   if (row.isFinal) {
+    const specialized = resolveTerminalFailurePresentation(row.status);
+    if (specialized) {
+      return specialized;
+    }
     return {
       label: "未锁定结果",
       tone: row.status.includes("失败") ? "danger" : "warn",
@@ -149,6 +191,27 @@ export function resolveMonitorStage(
     emphasis: "live",
     detail: "上传 Excel 后，系统会按阶段推进任务。",
     source: "idle",
+  };
+}
+
+export function resolveOutcomeSummaryCard(
+  failedCount: number,
+  taskPhase: TaskPhaseEventPayload | null,
+): OutcomeSummaryCard {
+  if (taskPhase?.blocking) {
+    return {
+      label: "任务阻断中",
+      value: taskPhase.label,
+      detail: taskPhase.detail,
+      tone: TASK_PHASE_TONES[taskPhase.phase] || "warn",
+    };
+  }
+
+  return {
+    label: "未锁定结果",
+    value: String(failedCount),
+    detail: "已完成处理但未找到可交付商品的行数。",
+    tone: failedCount > 0 ? "warn" : "info",
   };
 }
 
