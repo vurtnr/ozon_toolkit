@@ -24,7 +24,7 @@ pub struct OzonSourceCache {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct OzonCacheMetadata {
-    canonical_url: String,
+    source_key: String,
     title: String,
     image_url: String,
 }
@@ -46,8 +46,8 @@ impl OzonSourceCache {
         Self::new(cache_root_for_output_anchor(output_anchor_path))
     }
 
-    pub fn lookup(&self, product_url: &str) -> Result<OzonSourceCacheLookup, String> {
-        let entry_dir = self.entry_dir(product_url)?;
+    pub fn lookup(&self, source_key: &str) -> Result<OzonSourceCacheLookup, String> {
+        let entry_dir = self.entry_dir(source_key)?;
         if !entry_dir.exists() {
             return Ok(OzonSourceCacheLookup::Miss);
         }
@@ -76,10 +76,10 @@ impl OzonSourceCache {
                 )));
             }
         };
-        let canonical_url = canonicalize_product_url(product_url)?;
-        if metadata.canonical_url != canonical_url {
+        let normalized_source_key = normalize_cache_source_key(source_key)?;
+        if metadata.source_key != normalized_source_key {
             return Ok(OzonSourceCacheLookup::Corrupted(
-                "ozon cache metadata url mismatch".to_string(),
+                "ozon cache metadata key mismatch".to_string(),
             ));
         }
 
@@ -106,15 +106,15 @@ impl OzonSourceCache {
 
     pub fn store(
         &self,
-        product_url: &str,
+        source_key: &str,
         resolution: &OzonProductResolution,
     ) -> Result<(), String> {
-        let entry_dir = self.entry_dir(product_url)?;
+        let entry_dir = self.entry_dir(source_key)?;
         std::fs::create_dir_all(&entry_dir)
             .map_err(|e| format!("create ozon cache entry dir failed: {e}"))?;
 
         let metadata = OzonCacheMetadata {
-            canonical_url: canonicalize_product_url(product_url)?,
+            source_key: normalize_cache_source_key(source_key)?,
             title: resolution.title.clone(),
             image_url: resolution.image_url.clone(),
         };
@@ -129,37 +129,39 @@ impl OzonSourceCache {
         Ok(())
     }
 
-    fn entry_dir(&self, product_url: &str) -> Result<PathBuf, String> {
-        let canonical_url = canonicalize_product_url(product_url)?;
-        Ok(self.root_dir.join(cache_key_for_url(&canonical_url)))
+    fn entry_dir(&self, source_key: &str) -> Result<PathBuf, String> {
+        let normalized_source_key = normalize_cache_source_key(source_key)?;
+        Ok(self.root_dir.join(cache_key_for_source(&normalized_source_key)))
     }
 }
 
-fn canonicalize_product_url(value: &str) -> Result<String, String> {
+fn normalize_cache_source_key(value: &str) -> Result<String, String> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
-        return Err("normalize ozon cache url failed: empty product url".to_string());
+        return Err("normalize ozon cache key failed: empty source key".to_string());
     }
 
-    let mut url =
-        Url::parse(trimmed).map_err(|e| format!("normalize ozon cache url failed: {e}"))?;
-    if let Some(host) = url.host_str().map(|value| value.to_ascii_lowercase()) {
-        url.set_host(Some(&host))
-            .map_err(|_| "normalize ozon cache url failed: invalid host".to_string())?;
+    if let Ok(mut url) = Url::parse(trimmed) {
+        if let Some(host) = url.host_str().map(|value| value.to_ascii_lowercase()) {
+            url.set_host(Some(&host))
+                .map_err(|_| "normalize ozon cache url failed: invalid host".to_string())?;
+        }
+        url.set_fragment(None);
+        let path = url.path().trim_end_matches('/').to_string();
+        if path.is_empty() {
+            url.set_path("/");
+        } else {
+            url.set_path(&path);
+        }
+        return Ok(url.to_string());
     }
-    url.set_fragment(None);
-    let path = url.path().trim_end_matches('/').to_string();
-    if path.is_empty() {
-        url.set_path("/");
-    } else {
-        url.set_path(&path);
-    }
-    Ok(url.to_string())
+
+    Ok(trimmed.to_string())
 }
 
-fn cache_key_for_url(canonical_url: &str) -> String {
+fn cache_key_for_source(normalized_source_key: &str) -> String {
     let mut hash = 0xcbf2_9ce4_8422_2325u64;
-    for byte in canonical_url.as_bytes() {
+    for byte in normalized_source_key.as_bytes() {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
