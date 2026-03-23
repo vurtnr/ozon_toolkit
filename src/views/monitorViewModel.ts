@@ -38,6 +38,7 @@ export interface OutcomeSummaryCard {
 
 const STAGE_PRESENTATIONS: Record<string, StagePresentation> = {
   queued: { label: "排队中", tone: "info", emphasis: "live" },
+  resolving_ozon_sku: { label: "Ozon 搜索 SKU", tone: "info", emphasis: "live" },
   planning_search_image: { label: "生成搜索图", tone: "info", emphasis: "live" },
   searching_1688_primary: {
     label: "1688 首轮搜索",
@@ -96,7 +97,9 @@ function resolveTerminalFailurePresentation(status: string): StagePresentation |
     status.includes("Ozon商品已下架") ||
     status.includes("不可访问") ||
     status.includes("Ozon链接无效") ||
-    status.includes("未解析到Ozon商品")
+    status.includes("未解析到Ozon商品") ||
+    status.includes("Ozon 未找到 SKU") ||
+    status.includes("Ozon主图抓取失败")
   ) {
     return {
       label: "源图不可用",

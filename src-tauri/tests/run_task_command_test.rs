@@ -731,25 +731,18 @@ fn run_task_exports_directly_when_all_ozon_rows_fail_preflight() {
 }
 
 #[test]
-fn run_task_resolves_ozon_rows_before_requiring_sidecar() {
+fn run_task_emits_ozon_sku_resolution_stage_before_matching() {
     let _guard = lock_env();
     GLOBAL_RECOVERY_GATE.resume();
     clear_mock_pipeline_env();
     clear_sidecar_fixture_env();
 
     let excel_path = make_temp_excel_path();
-    create_url_mode_workbook(
-        &excel_path,
-        &[(
-            "http://127.0.0.1:9/product/3570411012",
-            "SKU-PREFLIGHT-READY",
-            "400 g",
-        )],
-    );
+    create_sku_mode_workbook(&excel_path, &[("sample-1", "SKU-PREFLIGHT-READY")]);
     let (candidate_image_url, image_server_handle) = spawn_image_server();
     let (session_url, session_handle) =
         spawn_sidecar_session_server(vec![r#"{"success":true,"status":"ready"}"#]);
-    let (resolve_url, resolve_handle) = spawn_sidecar_ozon_resolve_server(
+    let (resolve_url, resolve_handle) = spawn_sidecar_ozon_sku_resolve_server(
         format!(
             r#"{{"success":true,"data":{{"title":"Recovered title","imageUrl":"{candidate_image_url}"}}}}"#
         ),
@@ -763,14 +756,14 @@ fn run_task_resolves_ozon_rows_before_requiring_sidecar() {
 
     let mut sink = CollectingSink::default();
     let summary = run_task_with_sink(excel_path.to_string_lossy().as_ref(), &mut sink)
-        .expect("URL-mode rows should continue into search stage after sidecar hydration");
+        .expect("sku-mode rows should continue into search stage after sidecar hydration");
 
     assert_eq!(summary.status, "completed");
     assert!(
         row_event_payloads(&sink)
             .iter()
-            .any(|payload| payload["stage"] == "resolving_ozon_product"),
-        "ozon source resolution stage should be emitted before matching"
+            .any(|payload| payload["stage"] == "resolving_ozon_sku"),
+        "ozon sku resolution stage should be emitted before matching"
     );
     let final_rows = final_row_event_payloads(&sink);
     assert_eq!(final_rows.len(), 1);
@@ -1484,22 +1477,17 @@ fn run_task_stops_when_browser_assisted_ozon_resolve_remains_blocked() {
 }
 
 #[test]
-fn run_task_url_mode_successfully_resolves_ozon_source_before_1688() {
+fn run_task_sku_mode_successfully_resolves_ozon_source_before_1688() {
     let _guard = lock_env();
     GLOBAL_RECOVERY_GATE.resume();
+    clear_mock_pipeline_env();
+    clear_sidecar_fixture_env();
 
     let excel_path = make_temp_excel_path();
-    create_url_mode_workbook(
-        &excel_path,
-        &[(
-            "http://127.0.0.1:9/product/3570411009",
-            "SKU-URL-001",
-            "400 g",
-        )],
-    );
+    create_sku_mode_workbook(&excel_path, &[("sample-1", "SKU-URL-001")]);
 
     let (candidate_image_url, image_server_handle) = spawn_image_server();
-    let (resolve_url, resolve_handle) = spawn_sidecar_ozon_resolve_server(
+    let (resolve_url, resolve_handle) = spawn_sidecar_ozon_sku_resolve_server(
         format!(
             r#"{{"success":true,"data":{{"title":"Морская верёвочная лестница","imageUrl":"{candidate_image_url}"}}}}"#
         ),
@@ -1528,8 +1516,8 @@ fn run_task_url_mode_successfully_resolves_ozon_source_before_1688() {
     assert!(
         row_events
             .iter()
-            .any(|payload| payload["stage"] == "resolving_ozon_product"),
-        "url-mode rows should emit a dedicated ozon resolve stage"
+            .any(|payload| payload["stage"] == "resolving_ozon_sku"),
+        "sku-mode rows should emit a dedicated ozon resolve stage"
     );
     let final_rows = final_row_event_payloads(&sink);
     assert_eq!(final_rows.len(), 1);
@@ -1537,8 +1525,9 @@ fn run_task_url_mode_successfully_resolves_ozon_source_before_1688() {
     assert_eq!(final_rows[0]["status"], "AI比对成功(主搜索图召回)");
 
     clear_mock_pipeline_env();
+    clear_sidecar_fixture_env();
     image_server_handle.join().expect("join image server");
-    resolve_handle.join().expect("join ozon resolve server");
+    resolve_handle.join().expect("join ozon sku resolve server");
     remove_if_exists(&excel_path);
     remove_if_exists(&excel_path.with_file_name("result.xlsx"));
 }
@@ -1733,21 +1722,58 @@ fn run_task_rejects_relative_paths() {
 }
 
 #[test]
-fn run_task_rejects_workbook_without_extractable_images() {
+fn run_task_accepts_sku_only_workbook_without_embedded_images() {
     let _guard = lock_env();
     GLOBAL_RECOVERY_GATE.resume();
     clear_mock_pipeline_env();
+    clear_sidecar_fixture_env();
 
     let excel_path = make_temp_excel_path();
-    create_sample_workbook(&excel_path);
+    create_single_row_workbook(&excel_path);
+    let (candidate_image_url, image_server_handle) = spawn_image_server();
+    let (session_url, session_handle) =
+        spawn_sidecar_session_server(vec![r#"{"success":true,"status":"ready"}"#]);
+    let (resolve_url, resolve_handle) = spawn_sidecar_ozon_sku_resolve_server(
+        format!(
+            r#"{{"success":true,"data":{{"title":"Recovered title","imageUrl":"{candidate_image_url}"}}}}"#
+        ),
+        1,
+    );
+    let (search_url, search_handle) = spawn_sidecar_search_server(
+        format!(
+            r#"{{"success":true,"data":[{{"title":"candidate","price":"¥12.34","itemUrl":"https://detail.1688.com/offer/1.html","imageUrl":"{candidate_image_url}"}}]}}"#
+        ),
+        2,
+    );
+    std::env::set_var("SIDECAR_SESSION_URL", &session_url);
+    std::env::set_var("SIDECAR_OZON_RESOLVE_URL", &resolve_url);
+    std::env::set_var("SIDECAR_SEARCH_URL", &search_url);
+    std::env::set_var(
+        "RUN_TASK_MOCK_VLM_REPLIES_JSON",
+        r#"[
+          [1],
+          [1]
+        ]"#,
+    );
+    set_mock_search_image_plan_env(default_mock_search_image_plan_json());
 
     let mut sink = CollectingSink::default();
-    let err = run_task_with_sink(excel_path.to_string_lossy().as_ref(), &mut sink)
-        .expect_err("workbook without images should be rejected");
+    let summary = run_task_with_sink(excel_path.to_string_lossy().as_ref(), &mut sink)
+        .expect("sku-only workbook should no longer require embedded source images");
 
-    assert!(err.contains("未提取到可搜索图片"));
+    assert_eq!(summary.status, "completed");
+    let final_rows = final_row_event_payloads(&sink);
+    assert_eq!(final_rows.len(), 1);
+    assert_eq!(final_rows[0]["status"], "AI比对成功(主搜索图召回)");
 
+    clear_mock_pipeline_env();
+    clear_sidecar_fixture_env();
+    image_server_handle.join().expect("join image server");
+    session_handle.join().expect("join session server");
+    resolve_handle.join().expect("join ozon sku resolve server");
+    search_handle.join().expect("join search server");
     remove_if_exists(&excel_path);
+    remove_if_exists(&excel_path.with_file_name("result.xlsx"));
 }
 
 #[test]

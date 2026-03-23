@@ -104,6 +104,33 @@ describe("monitorViewModel", () => {
     expect(presentation.emphasis).toBe("terminal");
   });
 
+  test("maps sku-not-found rows to the same source-unavailable terminal stage", () => {
+    const presentation = getStagePresentation(
+      buildRow({
+        stage: "completed",
+        status: "Ozon 未找到 SKU",
+        isFinal: true,
+      }),
+    );
+
+    expect(presentation.label).toBe("源图不可用");
+    expect(presentation.tone).toBe("warn");
+    expect(presentation.emphasis).toBe("terminal");
+  });
+
+  test("shows a dedicated live stage while ozon sku search is running", () => {
+    const presentation = getStagePresentation(
+      buildRow({
+        stage: "resolving_ozon_sku",
+        status: "正在 Ozon 搜索 SKU",
+      }),
+    );
+
+    expect(presentation.label).toBe("Ozon 搜索 SKU");
+    expect(presentation.tone).toBe("info");
+    expect(presentation.emphasis).toBe("live");
+  });
+
   test("uses a blocking summary card instead of unlocked-result summary while task is paused", () => {
     const summaryCard = resolveOutcomeSummaryCard(
       0,
