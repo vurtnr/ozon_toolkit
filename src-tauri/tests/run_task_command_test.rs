@@ -158,6 +158,22 @@ fn create_url_mode_workbook(path: &PathBuf, rows: &[(&str, &str, &str)]) {
     workbook.save(path).expect("save workbook");
 }
 
+fn create_sku_mode_workbook(path: &PathBuf, rows: &[(&str, &str)]) {
+    let mut workbook = Workbook::new();
+    let worksheet = workbook.add_worksheet();
+
+    worksheet.write_string(0, 0, "title").expect("write header");
+    worksheet.write_string(0, 1, "sku").expect("write header");
+
+    for (index, (title, sku)) in rows.iter().enumerate() {
+        let row = (index + 1) as u32;
+        worksheet.write_string(row, 0, *title).expect("write title");
+        worksheet.write_string(row, 1, *sku).expect("write sku");
+    }
+
+    workbook.save(path).expect("save workbook");
+}
+
 fn spawn_ozon_antibot_server() -> (String, thread::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind ozon antibot listener");
     listener
@@ -528,6 +544,52 @@ fn spawn_sidecar_ozon_resolve_server(
     (format!("http://{address}/resolve-ozon-product"), handle)
 }
 
+fn spawn_sidecar_ozon_sku_resolve_server(
+    response_body: String,
+    max_requests: usize,
+) -> (String, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind ozon sku resolve listener");
+    listener
+        .set_nonblocking(true)
+        .expect("set ozon sku resolve listener nonblocking");
+    let address = listener
+        .local_addr()
+        .expect("resolve ozon sku resolve listener address");
+
+    let handle = thread::spawn(move || {
+        let started_at = Instant::now();
+        let mut served = 0usize;
+
+        loop {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let mut buffer = [0u8; 4096];
+                    let _ = stream.read(&mut buffer);
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        response_body.len(),
+                        response_body
+                    );
+                    let _ = stream.write_all(response.as_bytes());
+                    served += 1;
+                    if served >= max_requests {
+                        return;
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if started_at.elapsed() >= Duration::from_secs(5) {
+                        return;
+                    }
+                    thread::sleep(Duration::from_millis(20));
+                }
+                Err(_) => return,
+            }
+        }
+    });
+
+    (format!("http://{address}/resolve-ozon-sku"), handle)
+}
+
 #[test]
 fn run_task_accepts_absolute_excel_path_and_emits_all_events() {
     let _guard = lock_env();
@@ -819,6 +881,247 @@ fn run_task_waits_for_login_before_search_stages() {
     search_handle.join().expect("join search server");
     remove_if_exists(&excel_path);
     remove_if_exists(&excel_path.with_file_name("result.xlsx"));
+}
+
+#[test]
+fn run_task_batches_ozon_resolution_for_all_skus_before_1688_login_gate() {
+    let _guard = lock_env();
+    GLOBAL_RECOVERY_GATE.resume();
+    clear_mock_pipeline_env();
+    clear_sidecar_fixture_env();
+
+    let excel_path = make_temp_excel_path();
+    create_sku_mode_workbook(
+        &excel_path,
+        &[("sample-1", "SKU-BATCH-001"), ("sample-2", "SKU-BATCH-002")],
+    );
+
+    let (candidate_image_url, image_server_handle) = spawn_image_server();
+    let (session_url, session_handle) = spawn_sidecar_session_server(vec![
+        r#"{"success":true,"status":"login_required"}"#,
+        r#"{"success":true,"status":"ready"}"#,
+    ]);
+    let (resolve_url, resolve_handle) = spawn_sidecar_ozon_sku_resolve_server(
+        format!(
+            r#"{{"success":true,"data":{{"title":"Recovered title","imageUrl":"{candidate_image_url}"}}}}"#
+        ),
+        2,
+    );
+    let (search_url, search_handle) = spawn_sidecar_search_server(
+        format!(
+            r#"{{"success":true,"data":[{{"title":"candidate","price":"¥12.34","itemUrl":"https://detail.1688.com/offer/1.html","imageUrl":"{candidate_image_url}"}}]}}"#
+        ),
+        2,
+    );
+
+    std::env::set_var("SIDECAR_SESSION_URL", &session_url);
+    std::env::set_var("SIDECAR_OZON_RESOLVE_URL", &resolve_url);
+    std::env::set_var("SIDECAR_SEARCH_URL", &search_url);
+    std::env::set_var(
+        "RUN_TASK_MOCK_VLM_REPLIES_JSON",
+        r#"[
+          [1],
+          [1],
+          [1],
+          [1]
+        ]"#,
+    );
+    set_mock_search_image_plan_env(default_mock_search_image_plan_json());
+
+    let mut sink = CollectingSink::default();
+    let summary = run_task_with_sink(excel_path.to_string_lossy().as_ref(), &mut sink)
+        .expect("sku-mode rows should all resolve on Ozon before the 1688 login gate");
+
+    assert_eq!(summary.status, "completed");
+    let second_ozon_stage_index = sink
+        .payloads
+        .iter()
+        .position(|(name, payload)| {
+            name == EVENT_ROW_RESULT
+                && payload["sku"] == "SKU-BATCH-002"
+                && payload["stage"] == "resolving_ozon_sku"
+        })
+        .expect("second sku should finish the Ozon stage before 1688 login wait");
+    let waiting_login_index = sink
+        .payloads
+        .iter()
+        .position(|(name, payload)| name == "task_phase" && payload["phase"] == "waiting_for_1688_login")
+        .expect("1688 login wait should be emitted after Ozon batch completion");
+    let first_search_stage_index = sink
+        .payloads
+        .iter()
+        .position(|(name, payload)| {
+            name == EVENT_ROW_RESULT && payload["stage"] == "planning_search_image"
+        })
+        .expect("1688 search stage should eventually start");
+
+    assert!(
+        second_ozon_stage_index < waiting_login_index,
+        "all sku rows should complete the Ozon phase before waiting for 1688 login",
+    );
+    assert!(
+        waiting_login_index < first_search_stage_index,
+        "1688 login wait must happen before any search-image planning starts",
+    );
+
+    clear_mock_pipeline_env();
+    clear_sidecar_fixture_env();
+    image_server_handle.join().expect("join image server");
+    session_handle.join().expect("join session server");
+    resolve_handle.join().expect("join ozon sku resolve server");
+    search_handle.join().expect("join search server");
+    remove_if_exists(&excel_path);
+    remove_if_exists(&excel_path.with_file_name("result.xlsx"));
+}
+
+#[test]
+fn run_task_finalizes_ozon_not_found_rows_without_entering_1688() {
+    let _guard = lock_env();
+    GLOBAL_RECOVERY_GATE.resume();
+    clear_mock_pipeline_env();
+    clear_sidecar_fixture_env();
+
+    let excel_path = make_temp_excel_path();
+    let result_path = excel_path.with_file_name("result.xlsx");
+    create_sku_mode_workbook(&excel_path, &[("sample-1", "SKU-NOT-FOUND-001")]);
+
+    let (resolve_url, resolve_handle) = spawn_sidecar_ozon_sku_resolve_server(
+        r#"{"success":false,"code":"OZON_SKU_NOT_FOUND","error":"[OZON_SKU_NOT_FOUND] SKU not found on Ozon"}"#.to_string(),
+        1,
+    );
+    std::env::set_var("SIDECAR_OZON_RESOLVE_URL", &resolve_url);
+    set_mock_vlm_env(r#"[]"#);
+
+    let mut sink = CollectingSink::default();
+    let summary = run_task_with_sink(excel_path.to_string_lossy().as_ref(), &mut sink)
+        .expect("ozon not-found sku rows should finalize directly without entering 1688");
+
+    assert_eq!(summary.status, "completed");
+    assert_eq!(
+        summary.result_path.as_deref(),
+        Some(result_path.to_string_lossy().as_ref())
+    );
+
+    let final_rows = final_row_event_payloads(&sink);
+    assert_eq!(final_rows.len(), 1);
+    assert_eq!(final_rows[0]["status"], "Ozon 未找到 SKU");
+    assert!(
+        row_event_payloads(&sink)
+            .iter()
+            .all(|payload| payload["stage"] != "planning_search_image"),
+        "rows unresolved on Ozon must not enter the 1688 image-search stages"
+    );
+
+    clear_mock_pipeline_env();
+    clear_sidecar_fixture_env();
+    resolve_handle.join().expect("join ozon sku resolve server");
+    remove_if_exists(&excel_path);
+    remove_if_exists(&result_path);
+}
+
+#[test]
+fn run_task_uses_sku_cache_without_calling_ozon_sidecar_again() {
+    let _guard = lock_env();
+    GLOBAL_RECOVERY_GATE.resume();
+    clear_mock_pipeline_env();
+    clear_sidecar_fixture_env();
+
+    let work_dir = make_temp_work_dir("run-task-ozon-sku-cache");
+    std::fs::create_dir_all(&work_dir).expect("create work dir");
+    let excel_path = work_dir.join("input.xlsx");
+    create_sku_mode_workbook(&excel_path, &[("sample-1", "SKU-CACHE-001")]);
+
+    let (candidate_image_url, image_server_handle) = spawn_image_server();
+    let (health_url_1, health_handle_1) = spawn_sidecar_health_server();
+    let (session_url_1, session_handle_1) =
+        spawn_sidecar_session_server(vec![r#"{"success":true,"status":"ready"}"#]);
+    let (search_url_1, search_handle_1) = spawn_sidecar_search_server(
+        format!(
+            r#"{{"success":true,"data":[{{"title":"sample","price":"¥12.34","itemUrl":"https://detail.1688.com/offer/1.html","imageUrl":"{candidate_image_url}"}}]}}"#
+        ),
+        1,
+    );
+    let (resolve_url, resolve_handle) = spawn_sidecar_ozon_sku_resolve_server(
+        format!(
+            r#"{{"success":true,"data":{{"title":"Recovered title","imageUrl":"{candidate_image_url}"}}}}"#
+        ),
+        1,
+    );
+
+    std::env::set_var("SIDECAR_HEALTH_URL", &health_url_1);
+    std::env::set_var("SIDECAR_SESSION_URL", &session_url_1);
+    std::env::set_var("SIDECAR_SEARCH_URL", &search_url_1);
+    std::env::set_var("SIDECAR_OZON_RESOLVE_URL", &resolve_url);
+    set_mock_vlm_env(
+        r#"[
+          [1],
+          [1]
+        ]"#,
+    );
+    set_mock_search_image_plan_env(default_mock_search_image_plan_json());
+
+    let mut first_sink = CollectingSink::default();
+    let first_summary = run_task_with_sink(excel_path.to_string_lossy().as_ref(), &mut first_sink)
+        .expect("first sku-mode run should hydrate Ozon source and write cache");
+    assert_eq!(first_summary.status, "completed");
+    assert!(
+        cache_root_for_output_anchor(&excel_path).exists(),
+        "ozon cache root should be created after first sku hydration"
+    );
+
+    clear_sidecar_fixture_env();
+    health_handle_1.join().expect("join health server");
+    session_handle_1.join().expect("join session server");
+    search_handle_1.join().expect("join search server");
+    resolve_handle.join().expect("join ozon sku resolve server");
+
+    let (health_url_2, health_handle_2) = spawn_sidecar_health_server();
+    let (session_url_2, session_handle_2) =
+        spawn_sidecar_session_server(vec![r#"{"success":true,"status":"ready"}"#]);
+    let (search_url_2, search_handle_2) = spawn_sidecar_search_server(
+        format!(
+            r#"{{"success":true,"data":[{{"title":"sample","price":"¥12.34","itemUrl":"https://detail.1688.com/offer/1.html","imageUrl":"{candidate_image_url}"}}]}}"#
+        ),
+        1,
+    );
+
+    std::env::set_var("SIDECAR_HEALTH_URL", &health_url_2);
+    std::env::set_var("SIDECAR_SESSION_URL", &session_url_2);
+    std::env::set_var("SIDECAR_SEARCH_URL", &search_url_2);
+    std::env::set_var("SIDECAR_OZON_RESOLVE_URL", "http://127.0.0.1:9/resolve-ozon-sku");
+    set_mock_vlm_env(
+        r#"[
+          [1],
+          [1]
+        ]"#,
+    );
+    set_mock_search_image_plan_env(default_mock_search_image_plan_json());
+
+    let mut second_sink = CollectingSink::default();
+    let second_summary =
+        run_task_with_sink(excel_path.to_string_lossy().as_ref(), &mut second_sink)
+            .expect("second sku-mode run should reuse disk cache without hitting ozon sidecar");
+    assert_eq!(second_summary.status, "completed");
+    assert!(
+        !second_sink
+            .payloads
+            .iter()
+            .filter(|(name, _)| name == "task_phase")
+            .map(|(_, payload)| payload)
+            .any(|payload| payload["phase"] == "warming_ozon_session"),
+        "cache hit should skip Ozon browser warm-up on subsequent sku runs"
+    );
+
+    clear_mock_pipeline_env();
+    clear_sidecar_fixture_env();
+    image_server_handle.join().expect("join image server");
+    health_handle_2.join().expect("join health server");
+    session_handle_2.join().expect("join session server");
+    search_handle_2.join().expect("join search server");
+    remove_dir_if_exists(&cache_root_for_output_anchor(&excel_path));
+    remove_if_exists(&excel_path);
+    remove_if_exists(&work_dir.join("result.xlsx"));
+    remove_dir_if_exists(&work_dir);
 }
 
 #[test]

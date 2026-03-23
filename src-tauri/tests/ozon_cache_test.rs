@@ -109,3 +109,29 @@ fn ozon_source_cache_reports_corrupted_entries() {
 
     std::fs::remove_dir_all(root).expect("cleanup cache dir");
 }
+
+#[test]
+fn ozon_source_cache_uses_sku_identity_for_lookup_and_store() {
+    let root = make_temp_dir("ozon-cache-sku-key");
+    let cache = OzonSourceCache::new(root.clone());
+    let sku = "SKU-3570411009";
+
+    assert!(matches!(
+        cache.lookup(sku).expect("initial sku lookup should succeed"),
+        OzonSourceCacheLookup::Miss
+    ));
+
+    let resolution = sample_resolution();
+    cache
+        .store(sku, &resolution)
+        .expect("storing by sku should succeed");
+
+    match cache.lookup(sku).expect("sku lookup should succeed") {
+        OzonSourceCacheLookup::Hit(cached) => {
+            assert_eq!(cached, resolution);
+        }
+        other => panic!("expected sku cache hit, got {other:?}"),
+    }
+
+    std::fs::remove_dir_all(root).expect("cleanup cache dir");
+}
