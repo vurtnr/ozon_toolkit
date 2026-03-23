@@ -11,12 +11,11 @@ use calamine::{open_workbook, Reader, Xlsx};
 use desktop_app_lib::commands::run_task::{
     build_match_hint, choose_sidecar_profile_base_dir, run_task_with_original_source_and_sink,
     run_task_with_sink, shutdown_managed_sidecar, sidecar_profile_dir_for_base,
-    sidecar_runtime_dir_for_base,
-    RunTaskSummary,
+    sidecar_runtime_dir_for_base, RunTaskSummary,
 };
+use desktop_app_lib::core::ozon_cache::cache_root_for_output_anchor;
 use desktop_app_lib::events::{
-    EventSink, EVENT_BLOCKING_ALERT, EVENT_LOG, EVENT_PROGRESS, EVENT_ROW_RESULT,
-    EVENT_TASK_DONE,
+    EventSink, EVENT_BLOCKING_ALERT, EVENT_LOG, EVENT_PROGRESS, EVENT_ROW_RESULT, EVENT_TASK_DONE,
 };
 use desktop_app_lib::recovery::GLOBAL_RECOVERY_GATE;
 use rust_xlsxwriter::Workbook;
@@ -85,6 +84,18 @@ fn make_temp_excel_path() -> PathBuf {
     std::env::temp_dir().join(unique)
 }
 
+fn make_temp_work_dir(name: &str) -> PathBuf {
+    let unique = format!(
+        "{name}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time should move forward")
+            .as_nanos()
+    );
+    std::env::temp_dir().join(unique)
+}
+
 fn create_sample_workbook(path: &PathBuf) {
     let mut workbook = Workbook::new();
     let worksheet = workbook.add_worksheet();
@@ -127,15 +138,21 @@ fn create_url_mode_workbook(path: &PathBuf, rows: &[(&str, &str, &str)]) {
     let mut workbook = Workbook::new();
     let worksheet = workbook.add_worksheet();
 
-    worksheet.write_string(0, 0, "ozon链接").expect("write header");
+    worksheet
+        .write_string(0, 0, "ozon链接")
+        .expect("write header");
     worksheet.write_string(0, 1, "sku").expect("write header");
-    worksheet.write_string(0, 2, "产品重量").expect("write header");
+    worksheet
+        .write_string(0, 2, "产品重量")
+        .expect("write header");
 
     for (index, (url, sku, weight)) in rows.iter().enumerate() {
         let row = (index + 1) as u32;
         worksheet.write_string(row, 0, *url).expect("write url");
         worksheet.write_string(row, 1, *sku).expect("write sku");
-        worksheet.write_string(row, 2, *weight).expect("write weight");
+        worksheet
+            .write_string(row, 2, *weight)
+            .expect("write weight");
     }
 
     workbook.save(path).expect("save workbook");
@@ -157,8 +174,7 @@ fn spawn_ozon_antibot_server() -> (String, thread::JoinHandle<()>) {
                 Ok((mut stream, _)) => {
                     let mut buffer = [0u8; 4096];
                     let _ = stream.read(&mut buffer);
-                    let body =
-                        r#"<html><head><title>Antibot Captcha</title></head><body><input id="captcha-input" type="hidden" value="challenge"></body></html>"#;
+                    let body = r#"<html><head><title>Antibot Captcha</title></head><body><input id="captcha-input" type="hidden" value="challenge"></body></html>"#;
                     let response = format!(
                         "HTTP/1.1 403 Forbidden\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nozon-antibot: 1\r\nConnection: close\r\n\r\n{}",
                         body.len(),
@@ -231,7 +247,10 @@ fn build_match_hint_prefers_planner_target_product_without_losing_original_title
         ),
         "船用绳梯（带金属挂钩和红色踏步带）；原始标题：Аксессуары и комплектующие для судов"
     );
-    assert_eq!(build_match_hint("sample title", "sample title"), "sample title");
+    assert_eq!(
+        build_match_hint("sample title", "sample title"),
+        "sample title"
+    );
     assert_eq!(build_match_hint("sample title", ""), "sample title");
 }
 
@@ -276,10 +295,9 @@ fn default_mock_search_image_plan_json() -> &'static str {
 
 fn spawn_image_server() -> (String, thread::JoinHandle<()>) {
     const SAMPLE_PNG_BYTES: &[u8] = &[
-        137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1,
-        8, 6, 0, 0, 0, 31, 21, 196, 137, 0, 0, 0, 13, 73, 68, 65, 84, 120, 156, 99, 248, 207,
-        192, 240, 31, 0, 5, 0, 1, 255, 137, 153, 61, 29, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66,
-        96, 130,
+        137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1, 8, 6,
+        0, 0, 0, 31, 21, 196, 137, 0, 0, 0, 13, 73, 68, 65, 84, 120, 156, 99, 248, 207, 192, 240,
+        31, 0, 5, 0, 1, 255, 137, 153, 61, 29, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
     ];
 
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind image listener");
@@ -376,9 +394,7 @@ fn spawn_sidecar_health_server() -> (String, thread::JoinHandle<()>) {
     (format!("http://{address}/health"), handle)
 }
 
-fn spawn_sidecar_session_server(
-    bodies: Vec<&'static str>,
-) -> (String, thread::JoinHandle<()>) {
+fn spawn_sidecar_session_server(bodies: Vec<&'static str>) -> (String, thread::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind session listener");
     listener
         .set_nonblocking(true)
@@ -612,7 +628,11 @@ fn run_task_exports_directly_when_all_ozon_rows_fail_preflight() {
     let result_path = excel_path.with_file_name("result.xlsx");
     create_url_mode_workbook(
         &excel_path,
-        &[("http://127.0.0.1:9/product/3570411011", "SKU-PREFLIGHT-404", "500 g")],
+        &[(
+            "http://127.0.0.1:9/product/3570411011",
+            "SKU-PREFLIGHT-404",
+            "500 g",
+        )],
     );
     let (resolve_url, resolve_handle) = spawn_sidecar_ozon_resolve_server(
         r#"{"success":false,"error":"[OZON_PRODUCT_UNAVAILABLE] Ozon 商品页显示为不可访问或已下架"}"#.to_string(),
@@ -626,7 +646,10 @@ fn run_task_exports_directly_when_all_ozon_rows_fail_preflight() {
         .expect("all source failures should export result without entering 1688 matching");
 
     assert_eq!(summary.status, "completed");
-    assert_eq!(summary.result_path.as_deref(), Some(result_path.to_string_lossy().as_ref()));
+    assert_eq!(
+        summary.result_path.as_deref(),
+        Some(result_path.to_string_lossy().as_ref())
+    );
 
     let final_rows = final_row_event_payloads(&sink);
     assert_eq!(final_rows.len(), 1);
@@ -655,7 +678,11 @@ fn run_task_resolves_ozon_rows_before_requiring_sidecar() {
     let excel_path = make_temp_excel_path();
     create_url_mode_workbook(
         &excel_path,
-        &[("http://127.0.0.1:9/product/3570411012", "SKU-PREFLIGHT-READY", "400 g")],
+        &[(
+            "http://127.0.0.1:9/product/3570411012",
+            "SKU-PREFLIGHT-READY",
+            "400 g",
+        )],
     );
     let (candidate_image_url, image_server_handle) = spawn_image_server();
     let (session_url, session_handle) =
@@ -706,7 +733,11 @@ fn run_task_waits_for_login_before_search_stages() {
     let excel_path = make_temp_excel_path();
     create_url_mode_workbook(
         &excel_path,
-        &[("http://127.0.0.1:9/product/3570411013", "SKU-LOGIN-WAIT", "300 g")],
+        &[(
+            "http://127.0.0.1:9/product/3570411013",
+            "SKU-LOGIN-WAIT",
+            "300 g",
+        )],
     );
 
     let (candidate_image_url, image_server_handle) = spawn_image_server();
@@ -939,8 +970,7 @@ fn run_task_does_not_depend_on_rust_ozon_prefetch_unavailable_result() {
     clear_sidecar_fixture_env();
 
     let excel_path = make_temp_excel_path();
-    let (ozon_base_url, ozon_handle) =
-        spawn_ozon_status_server("404 Not Found", "not found");
+    let (ozon_base_url, ozon_handle) = spawn_ozon_status_server("404 Not Found", "not found");
     create_url_mode_workbook(
         &excel_path,
         &[(
@@ -1024,10 +1054,9 @@ fn run_task_prefers_sidecar_returned_ozon_image_bytes_over_rust_redownload() {
     let (session_url, session_handle) =
         spawn_sidecar_session_server(vec![r#"{"success":true,"status":"ready"}"#]);
     let embedded_png = BASE64_STANDARD.encode(vec![
-        137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0,
-        0, 0, 1, 8, 6, 0, 0, 0, 31, 21, 196, 137, 0, 0, 0, 13, 73, 68, 65, 84, 120,
-        156, 99, 248, 207, 192, 240, 31, 0, 5, 0, 1, 255, 137, 153, 61, 29, 0, 0, 0,
-        0, 73, 69, 78, 68, 174, 66, 96, 130,
+        137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1, 8, 6,
+        0, 0, 0, 31, 21, 196, 137, 0, 0, 0, 13, 73, 68, 65, 84, 120, 156, 99, 248, 207, 192, 240,
+        31, 0, 5, 0, 1, 255, 137, 153, 61, 29, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
     ]);
     let (resolve_url, resolve_handle) = spawn_sidecar_ozon_resolve_server(
         format!(
@@ -1159,7 +1188,11 @@ fn run_task_url_mode_successfully_resolves_ozon_source_before_1688() {
     let excel_path = make_temp_excel_path();
     create_url_mode_workbook(
         &excel_path,
-        &[("http://127.0.0.1:9/product/3570411009", "SKU-URL-001", "400 g")],
+        &[(
+            "http://127.0.0.1:9/product/3570411009",
+            "SKU-URL-001",
+            "400 g",
+        )],
     );
 
     let (candidate_image_url, image_server_handle) = spawn_image_server();
@@ -1208,6 +1241,121 @@ fn run_task_url_mode_successfully_resolves_ozon_source_before_1688() {
 }
 
 #[test]
+fn run_task_reuses_disk_cached_ozon_source_without_sidecar_resolve() {
+    let _guard = lock_env();
+    GLOBAL_RECOVERY_GATE.resume();
+    clear_mock_pipeline_env();
+    clear_sidecar_fixture_env();
+
+    let work_dir = make_temp_work_dir("run-task-ozon-cache");
+    std::fs::create_dir_all(&work_dir).expect("create work dir");
+    let excel_path = work_dir.join("input.xlsx");
+    create_url_mode_workbook(
+        &excel_path,
+        &[(
+            "http://127.0.0.1:9/product/3570411009",
+            "SKU-OZON-CACHE-001",
+            "400 g",
+        )],
+    );
+
+    let (candidate_image_url, image_server_handle) = spawn_image_server();
+    let (health_url_1, health_handle_1) = spawn_sidecar_health_server();
+    let (session_url_1, session_handle_1) =
+        spawn_sidecar_session_server(vec![r#"{"success":true,"status":"ready"}"#]);
+    let (search_url_1, search_handle_1) = spawn_sidecar_search_server(
+        format!(
+            r#"{{"success":true,"data":[{{"title":"sample","price":"¥12.34","itemUrl":"https://detail.1688.com/offer/1.html","imageUrl":"{candidate_image_url}"}}]}}"#
+        ),
+        1,
+    );
+    let (resolve_url, resolve_handle) = spawn_sidecar_ozon_resolve_server(
+        format!(
+            r#"{{"success":true,"data":{{"title":"Морская верёвочная лестница","imageUrl":"{candidate_image_url}"}}}}"#
+        ),
+        1,
+    );
+
+    std::env::set_var("SIDECAR_HEALTH_URL", &health_url_1);
+    std::env::set_var("SIDECAR_SESSION_URL", &session_url_1);
+    std::env::set_var("SIDECAR_SEARCH_URL", &search_url_1);
+    std::env::set_var("SIDECAR_OZON_RESOLVE_URL", &resolve_url);
+    set_mock_vlm_env(
+        r#"[
+          [1],
+          [1]
+        ]"#,
+    );
+    set_mock_search_image_plan_env(default_mock_search_image_plan_json());
+
+    let mut first_sink = CollectingSink::default();
+    let first_summary = run_task_with_sink(excel_path.to_string_lossy().as_ref(), &mut first_sink)
+        .expect("first run should hydrate ozon source and write cache");
+    assert_eq!(first_summary.status, "completed");
+    assert!(
+        cache_root_for_output_anchor(&excel_path).exists(),
+        "ozon cache root should be created after first hydration"
+    );
+
+    clear_sidecar_fixture_env();
+    health_handle_1.join().expect("join health server");
+    session_handle_1.join().expect("join session server");
+    search_handle_1.join().expect("join search server");
+    resolve_handle.join().expect("join ozon resolve server");
+
+    let (health_url_2, health_handle_2) = spawn_sidecar_health_server();
+    let (session_url_2, session_handle_2) =
+        spawn_sidecar_session_server(vec![r#"{"success":true,"status":"ready"}"#]);
+    let (search_url_2, search_handle_2) = spawn_sidecar_search_server(
+        format!(
+            r#"{{"success":true,"data":[{{"title":"sample","price":"¥12.34","itemUrl":"https://detail.1688.com/offer/1.html","imageUrl":"{candidate_image_url}"}}]}}"#
+        ),
+        1,
+    );
+
+    std::env::set_var("SIDECAR_HEALTH_URL", &health_url_2);
+    std::env::set_var("SIDECAR_SESSION_URL", &session_url_2);
+    std::env::set_var("SIDECAR_SEARCH_URL", &search_url_2);
+    std::env::set_var(
+        "SIDECAR_OZON_RESOLVE_URL",
+        "http://127.0.0.1:9/resolve-ozon-product",
+    );
+    set_mock_vlm_env(
+        r#"[
+          [1],
+          [1]
+        ]"#,
+    );
+    set_mock_search_image_plan_env(default_mock_search_image_plan_json());
+
+    let mut second_sink = CollectingSink::default();
+    let second_summary =
+        run_task_with_sink(excel_path.to_string_lossy().as_ref(), &mut second_sink)
+            .expect("second run should reuse disk cache without hitting ozon resolve sidecar");
+    assert_eq!(second_summary.status, "completed");
+    assert!(
+        !second_sink
+            .payloads
+            .iter()
+            .filter(|(name, _)| name == "task_phase")
+            .map(|(_, payload)| payload)
+            .any(|payload| payload["phase"] == "warming_ozon_session"),
+        "cache hit should skip ozon browser warm-up on subsequent runs"
+    );
+
+    clear_mock_pipeline_env();
+    clear_sidecar_fixture_env();
+    image_server_handle.join().expect("join image server");
+    health_handle_2.join().expect("join health server");
+    session_handle_2.join().expect("join session server");
+    search_handle_2.join().expect("join search server");
+    remove_dir_if_exists(&cache_root_for_output_anchor(&excel_path));
+    remove_if_exists(&excel_path);
+    remove_if_exists(&work_dir.join("result.xlsx"));
+    remove_dir_if_exists(&work_dir);
+}
+
+#[test]
 fn run_task_leaves_ai_conclusion_empty_for_ozon_source_failures() {
     let _guard = lock_env();
     GLOBAL_RECOVERY_GATE.resume();
@@ -1216,7 +1364,11 @@ fn run_task_leaves_ai_conclusion_empty_for_ozon_source_failures() {
     let result_path = excel_path.with_file_name("result.xlsx");
     create_url_mode_workbook(
         &excel_path,
-        &[("http://127.0.0.1:9/product/3570411010", "SKU-URL-404", "500 g")],
+        &[(
+            "http://127.0.0.1:9/product/3570411010",
+            "SKU-URL-404",
+            "500 g",
+        )],
     );
 
     let (resolve_url, resolve_handle) = spawn_sidecar_ozon_resolve_server(

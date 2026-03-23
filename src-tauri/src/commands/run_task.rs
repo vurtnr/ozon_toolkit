@@ -19,12 +19,13 @@ use crate::config::{
     settings_file_path, AppSettings,
 };
 use crate::core::excel::extract_wps_images;
-use crate::core::ozon_product::{
-    classify_ozon_url_mode, OzonProductResolution, OzonResolutionFailure,
-};
 use crate::core::orchestrator::{
     orchestrate_match, CandidateFetcher, NoMatchReason, OrchestrationDiagnostics, SearchPass,
     VlmCallStage,
+};
+use crate::core::ozon_cache::{OzonSourceCache, OzonSourceCacheLookup};
+use crate::core::ozon_product::{
+    classify_ozon_url_mode, OzonProductResolution, OzonResolutionFailure,
 };
 use crate::core::search_image::{
     generate_search_images, parse_search_image_plan, GeneratedSearchImages, SearchImagePlan,
@@ -35,9 +36,9 @@ use crate::core::vlm::{
     VlmClient, VlmMatchResult,
 };
 use crate::events::{
-    emit_event, EventSink, LogEvent, ProgressEvent, RowResultEvent, TaskDoneEvent,
-    TaskPhaseEvent, TauriWindowSink, EVENT_BLOCKING_ALERT, EVENT_LOG, EVENT_PROGRESS,
-    EVENT_ROW_RESULT, EVENT_TASK_DONE, EVENT_TASK_PHASE,
+    emit_event, EventSink, LogEvent, ProgressEvent, RowResultEvent, TaskDoneEvent, TaskPhaseEvent,
+    TauriWindowSink, EVENT_BLOCKING_ALERT, EVENT_LOG, EVENT_PROGRESS, EVENT_ROW_RESULT,
+    EVENT_TASK_DONE, EVENT_TASK_PHASE,
 };
 use crate::lifecycle::cleanup::run_with_task_guard;
 use crate::recovery::{
@@ -1080,9 +1081,7 @@ pub fn build_match_hint(ozon_name: &str, target_product: &str) -> String {
         return normalized_target_product.to_string();
     }
 
-    format!(
-        "{normalized_target_product}；原始标题：{normalized_ozon_name}"
-    )
+    format!("{normalized_target_product}；原始标题：{normalized_ozon_name}")
 }
 
 fn build_mock_source_png() -> Result<Vec<u8>, String> {
@@ -1169,8 +1168,8 @@ fn write_source_image_or_mock_png(
 
     let source_data_url = build_data_url(&source_bytes, source_mime_type);
 
-    let workbook_image_bytes = normalize_image_bytes_for_workbook(&source_bytes)
-        .unwrap_or_else(|_| source_bytes.clone());
+    let workbook_image_bytes =
+        normalize_image_bytes_for_workbook(&source_bytes).unwrap_or_else(|_| source_bytes.clone());
     let preview_mime_type = if workbook_image_bytes == source_bytes {
         source_mime_type
     } else {
@@ -1323,12 +1322,8 @@ fn validate_task_runtime_prerequisites(
 fn map_ozon_resolution_failure_to_status(error: &OzonResolutionFailure) -> String {
     match error {
         OzonResolutionFailure::InvalidUrl => "Ozon链接无效".to_string(),
-        OzonResolutionFailure::AntiBotChallenge => {
-            "Ozon触发风控，未完成浏览器验证".to_string()
-        }
-        OzonResolutionFailure::Unavailable => {
-            "Ozon商品已下架或不可访问".to_string()
-        }
+        OzonResolutionFailure::AntiBotChallenge => "Ozon触发风控，未完成浏览器验证".to_string(),
+        OzonResolutionFailure::Unavailable => "Ozon商品已下架或不可访问".to_string(),
         OzonResolutionFailure::FetchFailed(_) => "Ozon商品页抓取失败".to_string(),
         OzonResolutionFailure::MissingTitle => "未解析到Ozon商品标题".to_string(),
         OzonResolutionFailure::MissingImage => "未解析到Ozon商品主图".to_string(),
@@ -1343,8 +1338,9 @@ fn resolve_task_row_source(
         return Ok(row.clone());
     };
 
-    emit_row_stage_event(sink, row, "resolving_ozon_product", "正在解析 Ozon 商品页")
-        .map_err(|_| OzonResolutionFailure::FetchFailed("emit resolving event failed".to_string()))?;
+    emit_row_stage_event(sink, row, "resolving_ozon_product", "正在解析 Ozon 商品页").map_err(
+        |_| OzonResolutionFailure::FetchFailed("emit resolving event failed".to_string()),
+    )?;
     let _ = emit_event(
         sink,
         EVENT_LOG,
@@ -1428,14 +1424,15 @@ fn resolve_ozon_product_via_sidecar(
         .map_err(|e| OzonResolutionFailure::FetchFailed(format!("request sidecar failed: {e}")))?;
 
     let status = response.status();
-    let text = response
-        .text()
-        .map_err(|e| OzonResolutionFailure::FetchFailed(format!("read sidecar response failed: {e}")))?;
+    let text = response.text().map_err(|e| {
+        OzonResolutionFailure::FetchFailed(format!("read sidecar response failed: {e}"))
+    })?;
 
-    let parsed = serde_json::from_str::<SidecarOzonResolveResponse>(&text)
-        .map_err(|e| OzonResolutionFailure::FetchFailed(format!(
+    let parsed = serde_json::from_str::<SidecarOzonResolveResponse>(&text).map_err(|e| {
+        OzonResolutionFailure::FetchFailed(format!(
             "parse sidecar resolve response failed: {e}; body={text}"
-        )))?;
+        ))
+    })?;
 
     if !status.is_success() {
         return Err(classify_sidecar_ozon_resolve_failure(
@@ -1453,9 +1450,9 @@ fn resolve_ozon_product_via_sidecar(
         ));
     }
 
-    let payload = parsed
-        .data
-        .ok_or_else(|| OzonResolutionFailure::FetchFailed("sidecar response missing data".to_string()))?;
+    let payload = parsed.data.ok_or_else(|| {
+        OzonResolutionFailure::FetchFailed("sidecar response missing data".to_string())
+    })?;
     let image_bytes = if let Some(encoded) = payload
         .image_base64
         .as_deref()
@@ -1493,11 +1490,53 @@ fn finalize_preflight_row(
     )
 }
 
+fn hydrate_ozon_source_via_browser<F>(
+    sink: &mut dyn EventSink,
+    client: &Client,
+    product_url: &str,
+    ozon_disk_cache: &OzonSourceCache,
+    ozon_session_warmed: &mut bool,
+    ensure_browser_ready: &mut F,
+) -> Result<OzonProductResolution, OzonResolutionFailure>
+where
+    F: FnMut(&Client) -> Result<(), String>,
+{
+    if !*ozon_session_warmed {
+        emit_task_phase_event(
+            sink,
+            "warming_ozon_session",
+            "准备 Ozon 浏览器会话",
+            "正在拉起浏览器并预热 Ozon 会话，用于抓取商品标题与首张主图",
+            false,
+        )
+        .map_err(OzonResolutionFailure::FetchFailed)?;
+        *ozon_session_warmed = true;
+    }
+
+    ensure_browser_ready(client).map_err(OzonResolutionFailure::FetchFailed)?;
+    let resolved = resolve_ozon_product_via_sidecar(client, product_url);
+    if let Ok(resolution) = &resolved {
+        if let Err(error) = ozon_disk_cache.store(product_url, resolution) {
+            let _ = emit_event(
+                sink,
+                EVENT_LOG,
+                &LogEvent {
+                    level: "warn".to_string(),
+                    message: format!("写入 Ozon 源图缓存失败，将继续当前任务: {error}"),
+                },
+            );
+        }
+    }
+
+    resolved
+}
+
 fn prepare_task_rows_for_execution<F>(
     sink: &mut dyn EventSink,
     client: &Client,
     task_rows: &[TaskRow],
     total_rows: u32,
+    ozon_disk_cache: &OzonSourceCache,
     use_mock_candidates: bool,
     ensure_browser_ready: &mut F,
 ) -> Result<PreparedTaskRows, String>
@@ -1505,8 +1544,10 @@ where
     F: FnMut(&Client) -> Result<(), String>,
 {
     let mut prepared = PreparedTaskRows::default();
-    let mut ozon_source_cache: HashMap<String, Result<OzonProductResolution, OzonResolutionFailure>> =
-        HashMap::new();
+    let mut ozon_source_cache: HashMap<
+        String,
+        Result<OzonProductResolution, OzonResolutionFailure>,
+    > = HashMap::new();
     let mut ozon_session_warmed = false;
 
     for row in task_rows {
@@ -1536,20 +1577,72 @@ where
             let resolution = if let Some(cached) = ozon_source_cache.get(product_url) {
                 cached.clone()
             } else {
-                if !ozon_session_warmed {
-                    emit_task_phase_event(
-                        sink,
-                        "warming_ozon_session",
-                        "准备 Ozon 浏览器会话",
-                        "正在拉起浏览器并预热 Ozon 会话，用于抓取商品标题与首张主图",
-                        false,
-                    )?;
-                    ozon_session_warmed = true;
+                let cache_lookup = ozon_disk_cache.lookup(product_url);
+                match cache_lookup {
+                    Ok(OzonSourceCacheLookup::Hit(hit)) => {
+                        let resolved = Ok(hit);
+                        ozon_source_cache.insert(product_url.to_string(), resolved.clone());
+                        resolved
+                    }
+                    Ok(OzonSourceCacheLookup::Corrupted(error)) => {
+                        let _ = emit_event(
+                            sink,
+                            EVENT_LOG,
+                            &LogEvent {
+                                level: "warn".to_string(),
+                                message: format!(
+                                    "Ozon 源图缓存损坏，回退浏览器抓取: {} ({error})",
+                                    product_url
+                                ),
+                            },
+                        );
+                        let resolved = hydrate_ozon_source_via_browser(
+                            sink,
+                            client,
+                            product_url,
+                            ozon_disk_cache,
+                            &mut ozon_session_warmed,
+                            ensure_browser_ready,
+                        );
+                        ozon_source_cache.insert(product_url.to_string(), resolved.clone());
+                        resolved
+                    }
+                    Ok(OzonSourceCacheLookup::Miss) => {
+                        let resolved = hydrate_ozon_source_via_browser(
+                            sink,
+                            client,
+                            product_url,
+                            ozon_disk_cache,
+                            &mut ozon_session_warmed,
+                            ensure_browser_ready,
+                        );
+                        ozon_source_cache.insert(product_url.to_string(), resolved.clone());
+                        resolved
+                    }
+                    Err(error) => {
+                        let _ = emit_event(
+                            sink,
+                            EVENT_LOG,
+                            &LogEvent {
+                                level: "warn".to_string(),
+                                message: format!(
+                                    "读取 Ozon 源图缓存失败，回退浏览器抓取: {} ({error})",
+                                    product_url,
+                                ),
+                            },
+                        );
+                        let resolved = hydrate_ozon_source_via_browser(
+                            sink,
+                            client,
+                            product_url,
+                            ozon_disk_cache,
+                            &mut ozon_session_warmed,
+                            ensure_browser_ready,
+                        );
+                        ozon_source_cache.insert(product_url.to_string(), resolved.clone());
+                        resolved
+                    }
                 }
-                ensure_browser_ready(client)?;
-                let resolved = resolve_ozon_product_via_sidecar(client, product_url);
-                ozon_source_cache.insert(product_url.to_string(), resolved.clone());
-                resolved
             };
 
             match resolution {
@@ -1796,12 +1889,7 @@ fn write_result_workbook(
             if let Some(image_bytes) =
                 fetch_result_image_bytes(client, matched_image_url, &mut image_cache)
             {
-                let _ = insert_result_image(
-                    worksheet,
-                    write_row,
-                    matched_image_col,
-                    &image_bytes,
-                );
+                let _ = insert_result_image(worksheet, write_row, matched_image_col, &image_bytes);
             }
         }
     }
@@ -2041,6 +2129,7 @@ where
     let mut mock_candidate_sequence = load_mock_candidate_sequence()?;
 
     run_with_task_guard(temp_dir.clone(), || {
+        let ozon_disk_cache = OzonSourceCache::for_output_anchor(&output_anchor_path);
         let diagnostics_session = match TaskDiagnosticsSession::new(&output_anchor_path) {
             Ok(session) => Some(session),
             Err(error) => {
@@ -2093,6 +2182,7 @@ where
             &client,
             &task_workbook.rows,
             total_rows,
+            &ozon_disk_cache,
             use_mock_candidates,
             &mut ensure_browser_ready,
         )?;
@@ -2147,7 +2237,8 @@ where
                         message: "正在生成搜索图".to_string(),
                     },
                 )?;
-                match write_source_image_or_mock_png(&resolved_row, &temp_dir, use_mock_candidates) {
+                match write_source_image_or_mock_png(&resolved_row, &temp_dir, use_mock_candidates)
+                {
                     Ok(source_image) => {
                         original_image_url = Some(source_image.preview_data_url.clone());
                         original_image_bytes = Some(source_image.workbook_image_bytes.clone());
@@ -2685,8 +2776,11 @@ fn resolve_sidecar_profile_dir(app: &tauri::AppHandle) -> Result<PathBuf, String
     let local_data_dir = app.path().app_local_data_dir().ok();
     let cache_dir = app.path().app_cache_dir().ok();
     let fallback_dir = std::env::temp_dir().join("desktop_app");
-    let preferred_base_dir =
-        choose_sidecar_profile_base_dir(local_data_dir.as_deref(), cache_dir.as_deref(), &fallback_dir);
+    let preferred_base_dir = choose_sidecar_profile_base_dir(
+        local_data_dir.as_deref(),
+        cache_dir.as_deref(),
+        &fallback_dir,
+    );
     let profile_dir = sidecar_profile_dir_for_base(&preferred_base_dir);
 
     if let Some(parent) = profile_dir.parent() {
