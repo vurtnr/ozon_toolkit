@@ -11,6 +11,7 @@ import { ChromeNotFoundError, findChromePath } from "./chrome-path";
 import { ERROR_CODES, type SidecarErrorCode } from "./error-codes";
 import {
   resolveOzonProductViaSession,
+  resolveOzonSkuViaSession,
   type OzonResolvePayload,
 } from "./ozon_session";
 
@@ -21,6 +22,10 @@ interface SearchRequestBody {
 
 interface OzonResolveRequestBody {
   productUrl?: string;
+}
+
+interface OzonSkuResolveRequestBody {
+  sku?: string;
 }
 
 interface SidecarErrorPayload {
@@ -397,6 +402,47 @@ async function resolveOzonProductViaBrowser(productUrl: string): Promise<OzonRes
   }
 }
 
+async function resolveOzonSkuViaBrowser(sku: string): Promise<OzonResolvePayload> {
+  const activeHomePage = await ensureBrowserAndPageAlive();
+  const restoreHomePageFocus = async () => {
+    try {
+      if (activeHomePage && !activeHomePage.isClosed()) {
+        await activeHomePage.bringToFront();
+      }
+    } catch {}
+  };
+
+  try {
+    const payload = await resolveOzonSkuViaSession(
+      {
+        browser: globalBrowser as Browser,
+        getSessionPage: () => globalOzonPage,
+        setSessionPage: (page) => {
+          globalOzonPage = page;
+        },
+        applyBrowserEvasions,
+        delay,
+      },
+      sku,
+    );
+    await restoreHomePageFocus();
+    return payload;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (!message.includes("[ANTI_BOT_CHALLENGE]")) {
+      await restoreHomePageFocus();
+    }
+    throw error;
+  }
+}
+
+async function closeOzonSessionPage(): Promise<void> {
+  if (globalOzonPage && !globalOzonPage.isClosed()) {
+    await globalOzonPage.close().catch(() => undefined);
+  }
+  globalOzonPage = null;
+}
+
 async function applyBrowserEvasions(page: Page): Promise<void> {
   const navigatorPlatform = browserNavigatorPlatformForPlatform();
   await page.evaluateOnNewDocument((injectedPlatform: string) => {
@@ -580,6 +626,14 @@ function buildErrorPayload(error: unknown): SidecarErrorPayload {
     };
   }
 
+  if (message.includes("[OZON_SKU_NOT_FOUND]")) {
+    return {
+      success: false,
+      code: ERROR_CODES.OZON_SKU_NOT_FOUND,
+      error: message,
+    };
+  }
+
   if (message.includes("[FULL_CROP_NOT_APPLIED]")) {
     return {
       success: false,
@@ -718,6 +772,40 @@ app.post(
     }
   },
 );
+
+app.post(
+  "/resolve-ozon-sku",
+  async (req: Request<unknown, unknown, OzonSkuResolveRequestBody>, res: Response) => {
+    const sku = (req.body?.sku || "").trim();
+    if (!sku) {
+      return res.status(400).json({
+        success: false,
+        code: ERROR_CODES.UNKNOWN,
+        error: "missing sku",
+      });
+    }
+
+    try {
+      const data = await resolveOzonSkuViaBrowser(sku);
+      return res.json({ success: true, data });
+    } catch (error) {
+      const payload = buildErrorPayload(error);
+      const statusCode = payload.code === ERROR_CODES.UNKNOWN ? 500 : 200;
+      return res.status(statusCode).json(payload);
+    }
+  },
+);
+
+app.post("/close-ozon-session", async (_req: Request, res: Response) => {
+  try {
+    await closeOzonSessionPage();
+    return res.json({ success: true });
+  } catch (error) {
+    const payload = buildErrorPayload(error);
+    const statusCode = payload.code === ERROR_CODES.UNKNOWN ? 500 : 200;
+    return res.status(statusCode).json(payload);
+  }
+});
 
 app.get("/health", createHealthHandler());
 

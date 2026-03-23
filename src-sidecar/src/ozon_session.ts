@@ -22,6 +22,12 @@ export type OzonPageState =
   | "unavailable"
   | "incomplete";
 
+export type OzonSkuSearchState =
+  | "resolved"
+  | "not_found"
+  | "anti_bot_challenge"
+  | "incomplete";
+
 export type OzonLandingState = "ready" | "anti_bot_challenge" | "loading";
 
 export interface ResolveOzonProductDependencies {
@@ -66,6 +72,16 @@ const OZON_UNAVAILABLE_TEXT_HINTS = [
   "товар закончился",
   "нет в наличии",
 ];
+const OZON_SKU_NOT_FOUND_TEXT_HINTS = ["такой страницы не существует"];
+const OZON_SEARCH_INPUT_SELECTORS = [
+  'input[type="search"]',
+  'input[name="text"]',
+  'input[placeholder*="искать" i]',
+  'input[placeholder*="поиск" i]',
+  'input[placeholder*="найти" i]',
+  'input[aria-label*="поиск" i]',
+  'input[aria-label*="искать" i]',
+];
 
 function isAllowedOzonHost(hostname: string): boolean {
   const normalized = (hostname || "").trim().toLowerCase();
@@ -91,12 +107,14 @@ export function buildCanonicalOzonProductUrl(value: string): string | null {
 
     const rawSegment = segments[1].trim();
     const normalizedSegment = rawSegment ? decodeURIComponent(rawSegment) : "";
-    if (!normalizedSegment) {
+    const productIdMatch = normalizedSegment.match(/(\d{5,})$/);
+    const productId = productIdMatch?.[1] ?? null;
+    if (!productId) {
       return null;
     }
 
     const canonical = new URL(DEFAULT_OZON_HOME_URL);
-    canonical.pathname = `/product/${normalizedSegment}/`;
+    canonical.pathname = `/product/${productId}/`;
     canonical.search = "";
     canonical.hash = "";
     return canonical.toString();
@@ -266,6 +284,29 @@ export function classifyOzonSnapshot(snapshot: OzonSnapshot): OzonPageState {
   return "incomplete";
 }
 
+export function classifyOzonSkuSearchSnapshot(
+  snapshot: OzonSnapshot,
+): OzonSkuSearchState {
+  if (snapshotHasOzonAntiBotSignal(snapshot)) {
+    return "anti_bot_challenge";
+  }
+
+  const normalizedText = normalizeOzonSnapshotText(snapshot);
+  if (
+    OZON_SKU_NOT_FOUND_TEXT_HINTS.some((hint) => normalizedText.includes(hint))
+  ) {
+    return "not_found";
+  }
+
+  const title = normalizeOzonTitle(snapshot.title);
+  const imageUrl = normalizeOzonImageUrl(snapshot);
+  if (title && imageUrl) {
+    return "resolved";
+  }
+
+  return "incomplete";
+}
+
 export function classifyOzonLandingSnapshot(
   snapshot: OzonSnapshot,
 ): OzonLandingState {
@@ -275,10 +316,7 @@ export function classifyOzonLandingSnapshot(
 
   try {
     const parsed = new URL(snapshot.url || "");
-    if (
-      isAllowedOzonHost(parsed.hostname) &&
-      (parsed.pathname === "/" || parsed.pathname === "")
-    ) {
+    if (isAllowedOzonHost(parsed.hostname)) {
       const hasVisibleContent =
         snapshot.documentTitle.trim().length > 0 || snapshot.bodyText.trim().length > 0;
       if (hasVisibleContent) {
@@ -416,6 +454,87 @@ async function warmOzonSession(
   throw new Error("[OZON_RESOLVE_FAILED] Ozon 首页未完成加载，无法进入商品详情页");
 }
 
+async function fillAndSubmitOzonSkuSearch(
+  page: Page,
+  sku: string,
+): Promise<void> {
+  const selectedSelector = await page.evaluate((selectors: string[]) => {
+    for (const selector of selectors) {
+      const candidate = document.querySelector<HTMLInputElement>(selector);
+      if (!candidate || candidate.disabled) {
+        continue;
+      }
+
+      const rect = candidate.getBoundingClientRect();
+      const visible = rect.width > 0 && rect.height > 0;
+      if (visible) {
+        return selector;
+      }
+    }
+
+    return null;
+  }, OZON_SEARCH_INPUT_SELECTORS);
+
+  if (!selectedSelector) {
+    throw new Error("[OZON_RESOLVE_FAILED] 未找到 Ozon 顶部搜索框");
+  }
+
+  await page.focus(selectedSelector);
+  await page.evaluate(
+    ({ selector, value }) => {
+      const input = document.querySelector<HTMLInputElement>(selector);
+      if (!input) {
+        return false;
+      }
+
+      input.value = "";
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      input.dispatchEvent(new Event("change", { bubbles: true }));
+      input.value = value;
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      input.dispatchEvent(new Event("change", { bubbles: true }));
+      return true;
+    },
+    { selector: selectedSelector, value: sku },
+  );
+
+  const submitted = await page.evaluate((selector: string) => {
+    const input = document.querySelector<HTMLInputElement>(selector);
+    if (!input) {
+      return false;
+    }
+
+    const form = input.closest("form");
+    if (form && typeof (form as HTMLFormElement).requestSubmit === "function") {
+      (form as HTMLFormElement).requestSubmit();
+      return true;
+    }
+    if (form) {
+      form.dispatchEvent(
+        new Event("submit", { bubbles: true, cancelable: true }),
+      );
+      return true;
+    }
+
+    const button = (
+      Array.from(document.querySelectorAll("button")).find((candidate) => {
+        const text = (candidate.textContent || "").toLowerCase();
+        return text.includes("искать") || text.includes("найти");
+      }) ?? null
+    ) as HTMLButtonElement | null;
+    if (button) {
+      button.click();
+      return true;
+    }
+
+    return false;
+  }, selectedSelector);
+
+  if (!submitted) {
+    await page.keyboard.press("Enter");
+  }
+}
+
 export async function resolveOzonProductViaSession(
   dependencies: ResolveOzonProductDependencies,
   productUrl: string,
@@ -480,4 +599,68 @@ export async function resolveOzonProductViaSession(
   }
 
   throw new Error("[OZON_RESOLVE_FAILED] 未从浏览器页解析到 Ozon 商品标题或主图");
+}
+
+export async function resolveOzonSkuViaSession(
+  dependencies: ResolveOzonProductDependencies,
+  sku: string,
+): Promise<OzonResolvePayload> {
+  const normalizedSku = sku.trim();
+  if (!normalizedSku) {
+    throw new Error("[OZON_RESOLVE_FAILED] Ozon SKU 为空");
+  }
+
+  const page = await ensureOzonSessionPage(dependencies);
+  await warmOzonSession(dependencies, page);
+  await fillAndSubmitOzonSkuSearch(page, normalizedSku);
+
+  const deadline =
+    Date.now() + (dependencies.resolveTimeoutMs ?? DEFAULT_RESOLVE_TIMEOUT_MS);
+  let antiBotSeen = false;
+
+  while (Date.now() < deadline) {
+    const snapshot = await collectOzonSnapshot(page);
+    const snapshotState = classifyOzonSkuSearchSnapshot(snapshot);
+
+    if (snapshotState === "anti_bot_challenge") {
+      antiBotSeen = true;
+      try {
+        await page.bringToFront();
+      } catch {}
+      await dependencies.delay(
+        dependencies.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS,
+      );
+      continue;
+    }
+
+    if (snapshotState === "not_found") {
+      throw new Error("[OZON_SKU_NOT_FOUND] Ozon SKU 未找到对应商品");
+    }
+
+    if (snapshotState === "resolved") {
+      const title = normalizeOzonTitle(snapshot.title);
+      const imageUrl = normalizeOzonImageUrl(snapshot);
+      if (!title || !imageUrl) {
+        await dependencies.delay(
+          dependencies.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS,
+        );
+        continue;
+      }
+
+      const imageBase64 = await captureOzonImageBase64(
+        page,
+        imageUrl,
+        dependencies.delay,
+      );
+      return imageBase64 ? { title, imageUrl, imageBase64 } : { title, imageUrl };
+    }
+
+    await dependencies.delay(dependencies.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS);
+  }
+
+  if (antiBotSeen) {
+    throw new Error("[ANTI_BOT_CHALLENGE] Ozon SKU 搜索触发验证且在超时前未解除");
+  }
+
+  throw new Error("[OZON_RESOLVE_FAILED] 未从 Ozon SKU 搜索中解析到商品标题或主图");
 }
