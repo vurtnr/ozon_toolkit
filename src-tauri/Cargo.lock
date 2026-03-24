@@ -772,6 +772,7 @@ dependencies = [
  "base64 0.22.1",
  "calamine",
  "image",
+ "rand 0.8.5",
  "regex",
  "reqwest 0.12.28",
  "rust_xlsxwriter",
