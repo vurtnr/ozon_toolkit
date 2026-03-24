@@ -106,6 +106,10 @@ describe("buildOzonChromeArgs", () => {
     expect(args).toContain("--user-data-dir=/tmp/ozon_profile");
     expect(args).toContain("--remote-debugging-port=9222");
     expect(args).toContain("about:blank");
+    expect(args).toContain("--disable-dev-shm-usage");
+    expect(args).toContain("--disable-gpu");
+    expect(args).toContain("--disable-session-crashed-bubble");
+    expect(args).toContain("--noerrdialogs");
     expect(args).not.toContain("--new-window");
     expect(args).not.toContain("--disable-blink-features=AutomationControlled");
     expect(args.some((value) => value.startsWith("--user-agent="))).toBe(false);

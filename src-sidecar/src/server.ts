@@ -202,6 +202,10 @@ export function buildOzonChromeArgs(
     "--start-maximized",
     "--no-first-run",
     "--no-default-browser-check",
+    "--disable-dev-shm-usage",
+    "--disable-gpu",
+    "--disable-session-crashed-bubble",
+    "--noerrdialogs",
     startUrl,
   ];
 }
