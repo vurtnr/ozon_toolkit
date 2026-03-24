@@ -1663,16 +1663,111 @@ where
                         },
                     );
                     if error == OzonResolutionFailure::AntiBotChallenge {
-                        emit_task_phase_event(
-                            sink,
-                            "waiting_for_ozon_verification",
-                            "等待 Ozon 验证",
-                            "Ozon 商品页触发验证，Chrome 已打开验证页，完成验证后会自动继续。",
-                            true,
-                        )?;
-                        GLOBAL_RECOVERY_GATE.pause();
-                        emit_blocking_alert_if_needed(sink, CODE_ANTI_BOT_CHALLENGE)?;
-                        return Err(CODE_ANTI_BOT_CHALLENGE.to_string());
+                        const MAX_OZON_ANTIBOT_RETRIES: u32 = 3;
+                        let mut antibot_attempts = 0u32;
+                        let mut last_error = error;
+                        while last_error == OzonResolutionFailure::AntiBotChallenge
+                            && antibot_attempts < MAX_OZON_ANTIBOT_RETRIES
+                        {
+                            antibot_attempts += 1;
+                            emit_task_phase_event(
+                                sink,
+                                "waiting_for_ozon_verification",
+                                "等待 Ozon 验证",
+                                "Ozon 触发验证，请在 Chrome 中完成滑块验证后点击「已验证，继续执行」。",
+                                true,
+                            )?;
+                            GLOBAL_RECOVERY_GATE.pause();
+                            emit_blocking_alert_if_needed(sink, CODE_ANTI_BOT_CHALLENGE)?;
+
+                            // Wait until user clicks "continue"
+                            while GLOBAL_RECOVERY_GATE.is_paused() {
+                                std::thread::sleep(Duration::from_millis(500));
+                            }
+
+                            emit_task_phase_event(
+                                sink,
+                                "retrying_ozon_resolve",
+                                "恢复 Ozon 搜索",
+                                &format!(
+                                    "用户已确认验证完成，重试 SKU {} (第 {} 次)",
+                                    validated_row.sku, antibot_attempts
+                                ),
+                                false,
+                            )?;
+                            let _ = emit_event(
+                                sink,
+                                EVENT_LOG,
+                                &LogEvent {
+                                    level: "info".to_string(),
+                                    message: format!(
+                                        "Ozon 验证已恢复，重试 SKU: {} (第 {} 次)",
+                                        validated_row.sku, antibot_attempts
+                                    ),
+                                },
+                            );
+
+                            // Remove cached anti-bot result so retry hits sidecar again
+                            ozon_source_cache.remove(validated_row.sku.as_str());
+
+                            match hydrate_ozon_source_via_browser(
+                                sink,
+                                client,
+                                validated_row.sku.as_str(),
+                                ozon_disk_cache,
+                                &mut ozon_session_warmed,
+                                ensure_browser_ready,
+                            ) {
+                                Ok(resolution) => {
+                                    ozon_source_cache.insert(
+                                        validated_row.sku.clone(),
+                                        Ok(resolution.clone()),
+                                    );
+                                    let mut hydrated = validated_row.clone();
+                                    hydrated.ozon_name = resolution.title;
+                                    hydrated.image_bytes = Some(resolution.image_bytes);
+                                    if hydrated.image_bytes.is_some() || use_mock_candidates {
+                                        prepared.executable_rows.push(hydrated);
+                                    } else {
+                                        finalize_preflight_row(
+                                            sink,
+                                            &mut prepared,
+                                            empty_output_row(&hydrated, "Ozon主图抓取失败"),
+                                            total_rows,
+                                        )?;
+                                    }
+                                    // Break: not AntiBotChallenge anymore
+                                    last_error = OzonResolutionFailure::InvalidUrl;
+                                }
+                                Err(retry_error) => {
+                                    let _ = emit_event(
+                                        sink,
+                                        EVENT_LOG,
+                                        &LogEvent {
+                                            level: "warn".to_string(),
+                                            message: format!(
+                                                "Ozon SKU {} 重试失败: {:?}",
+                                                validated_row.sku, retry_error
+                                            ),
+                                        },
+                                    );
+                                    last_error = retry_error;
+                                }
+                            }
+                        }
+                        // If exhausted retries and still anti-bot, skip the row
+                        if last_error == OzonResolutionFailure::AntiBotChallenge {
+                            finalize_preflight_row(
+                                sink,
+                                &mut prepared,
+                                empty_output_row(
+                                    &validated_row,
+                                    "Ozon 验证失败，已跳过",
+                                ),
+                                total_rows,
+                            )?;
+                        }
+                        continue;
                     }
                     finalize_preflight_row(
                         sink,
