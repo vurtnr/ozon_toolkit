@@ -6,6 +6,7 @@ import {
   classifyOzonSnapshot,
   isTransientPageNavigationError,
   isReusableBootstrapPageUrl,
+  isOzonHomeUrl,
   selectPreferredOzonSessionPage,
   selectReusableOzonBootstrapPage,
   type OzonSnapshot,
@@ -246,5 +247,27 @@ describe("isTransientPageNavigationError", () => {
 
   test("does not hide unrelated runtime errors", () => {
     expect(isTransientPageNavigationError(new Error("delay is not defined"))).toBe(false);
+  });
+});
+
+describe("isOzonHomeUrl", () => {
+  test("treats the ozon.ru root as a home URL", () => {
+    expect(isOzonHomeUrl("https://www.ozon.ru/")).toBe(true);
+    expect(isOzonHomeUrl("https://ozon.ru/")).toBe(true);
+    expect(isOzonHomeUrl("https://www.ozon.ru")).toBe(true);
+  });
+
+  test("treats ozon highlight/landing redirects as home URLs", () => {
+    expect(isOzonHomeUrl("https://www.ozon.ru/highlight/global?miniapp=x")).toBe(true);
+  });
+
+  test("does not treat product or search pages as home URLs", () => {
+    expect(isOzonHomeUrl("https://www.ozon.ru/product/3552213000/")).toBe(false);
+    expect(isOzonHomeUrl("https://www.ozon.ru/search/?text=test")).toBe(false);
+  });
+
+  test("does not treat non-ozon URLs as home URLs", () => {
+    expect(isOzonHomeUrl("https://www.google.com/")).toBe(false);
+    expect(isOzonHomeUrl("about:blank")).toBe(false);
   });
 });

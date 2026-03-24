@@ -93,6 +93,19 @@ function isAllowedOzonHost(hostname: string): boolean {
   return normalized === "ozon.ru" || normalized.endsWith(".ozon.ru");
 }
 
+export function isOzonHomeUrl(url: string): boolean {
+  try {
+    const parsed = new URL(url);
+    if (!isAllowedOzonHost(parsed.hostname)) {
+      return false;
+    }
+    const path = parsed.pathname.replace(/\/+$/, "");
+    return path === "" || path.startsWith("/highlight");
+  } catch {
+    return false;
+  }
+}
+
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -520,6 +533,12 @@ async function warmOzonSession(
   try {
     await page.bringToFront();
   } catch {}
+
+  // Skip navigation if already on the Ozon homepage
+  const currentUrl = page.url();
+  if (isOzonHomeUrl(currentUrl)) {
+    return;
+  }
 
   await page.goto(dependencies.landingUrl ?? DEFAULT_OZON_HOME_URL, {
     waitUntil: "domcontentloaded",
