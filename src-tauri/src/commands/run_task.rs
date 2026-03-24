@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use calamine::{open_workbook, Reader, Xlsx};
 use image::{DynamicImage, ImageFormat, Rgba, RgbaImage};
+use rand::Rng;
 use regex::Regex;
 use reqwest::blocking::Client;
 use rust_xlsxwriter::{Color, Format, Image as XlsxImage, Workbook};
@@ -47,7 +48,7 @@ use crate::recovery::{
 const DEFAULT_SIDECAR_SEARCH_URL: &str = "http://127.0.0.1:8266/search";
 const DEFAULT_SIDECAR_HEALTH_URL: &str = "http://127.0.0.1:8266/health";
 const DEFAULT_SIDECAR_SESSION_URL: &str = "http://127.0.0.1:8266/session-state";
-const DEFAULT_SIDECAR_OZON_RESOLVE_URL: &str = "http://127.0.0.1:8266/resolve-ozon-sku";
+const DEFAULT_SIDECAR_OZON_RESOLVE_URL: &str = "http://127.0.0.1:8266/resolve-ozon-product";
 const DEFAULT_SIDECAR_OZON_CLOSE_URL: &str = "http://127.0.0.1:8266/close-ozon-session";
 const DEFAULT_SIDECAR_SHUTDOWN_URL: &str = "http://127.0.0.1:8266/shutdown";
 const MOCK_CANDIDATES_ENV: &str = "RUN_TASK_MOCK_CANDIDATES_JSON";
@@ -88,6 +89,7 @@ struct TaskWorkbook {
 #[derive(Debug, Clone)]
 struct TaskRow {
     excel_row_index: u32,
+    ozon_url: String,
     ozon_name: String,
     sku: String,
     original_cells: Vec<String>,
@@ -187,7 +189,8 @@ struct SidecarSearchRequest {
 
 #[derive(Debug, Serialize)]
 struct SidecarOzonResolveRequest {
-    sku: String,
+    #[serde(rename = "productUrl")]
+    product_url: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -565,7 +568,8 @@ fn load_task_rows(excel_path: &Path) -> Result<TaskWorkbook, String> {
             .map(|v| v.to_string())
             .map(|v| v.trim().to_string())
             .unwrap_or_default();
-        let ozon_name = first_cell;
+        let ozon_url = first_cell;
+        let ozon_name = String::new();
         let sku = row
             .get(1)
             .map(|v| v.to_string())
@@ -600,6 +604,7 @@ fn load_task_rows(excel_path: &Path) -> Result<TaskWorkbook, String> {
 
         rows.push(TaskRow {
             excel_row_index: (idx + 1) as u32,
+            ozon_url,
             ozon_name,
             sku,
             original_cells,
@@ -1334,22 +1339,22 @@ fn resolve_task_row_source(
         return Ok(row.clone());
     }
 
-    emit_row_stage_event(sink, row, "resolving_ozon_sku", "正在 Ozon 搜索 SKU")
+    emit_row_stage_event(sink, row, "resolving_ozon_product", "正在访问 Ozon 商品页")
         .map_err(|_| OzonResolutionFailure::FetchFailed("emit resolving event failed".to_string()))?;
     let _ = emit_event(
         sink,
         EVENT_LOG,
         &LogEvent {
             level: "info".to_string(),
-            message: format!("正在 Ozon 搜索 SKU: {}", row.sku),
+            message: format!("正在访问 Ozon 商品页: {}", row.ozon_url),
         },
     );
 
-    if !row.sku.trim().is_empty() {
+    if !row.ozon_url.trim().is_empty() {
         Ok(row.clone())
     } else {
         Err(OzonResolutionFailure::FetchFailed(
-            "empty ozon sku".to_string(),
+            "empty ozon url".to_string(),
         ))
     }
 }
@@ -1413,12 +1418,12 @@ fn classify_sidecar_ozon_resolve_failure(
 
 fn resolve_ozon_product_via_sidecar(
     client: &Client,
-    sku: &str,
+    product_url: &str,
 ) -> Result<OzonProductResolution, OzonResolutionFailure> {
     let response = client
         .post(sidecar_ozon_resolve_url())
         .json(&SidecarOzonResolveRequest {
-            sku: sku.to_string(),
+            product_url: product_url.to_string(),
         })
         .send()
         .map_err(|e| OzonResolutionFailure::FetchFailed(format!("request sidecar failed: {e}")))?;
@@ -1493,7 +1498,7 @@ fn finalize_preflight_row(
 fn hydrate_ozon_source_via_browser<F>(
     sink: &mut dyn EventSink,
     client: &Client,
-    sku: &str,
+    ozon_url: &str,
     ozon_disk_cache: &OzonSourceCache,
     ozon_session_warmed: &mut bool,
     ensure_browser_ready: &mut F,
@@ -1514,9 +1519,9 @@ where
     }
 
     ensure_browser_ready(client).map_err(OzonResolutionFailure::FetchFailed)?;
-    let resolved = resolve_ozon_product_via_sidecar(client, sku);
+    let resolved = resolve_ozon_product_via_sidecar(client, ozon_url);
     if let Ok(resolution) = &resolved {
-        if let Err(error) = ozon_disk_cache.store(sku, resolution) {
+        if let Err(error) = ozon_disk_cache.store(ozon_url, resolution) {
             let _ = emit_event(
                 sink,
                 EVENT_LOG,
@@ -1570,19 +1575,25 @@ where
             }
         };
 
+        // Random delay between rows to mimic human browsing pace (3-8 seconds)
+        if !use_mock_candidates && validated_row.image_bytes.is_none() && !validated_row.ozon_url.trim().is_empty() {
+            let delay_ms = rand::thread_rng().gen_range(3_000u64..=8_000);
+            std::thread::sleep(Duration::from_millis(delay_ms));
+        }
+
         let resolved_row = if !use_mock_candidates
             && validated_row.image_bytes.is_none()
-            && !validated_row.sku.trim().is_empty()
+            && !validated_row.ozon_url.trim().is_empty()
         {
-            let sku = validated_row.sku.as_str();
-            let resolution = if let Some(cached) = ozon_source_cache.get(sku) {
+            let ozon_url = validated_row.ozon_url.as_str();
+            let resolution = if let Some(cached) = ozon_source_cache.get(ozon_url) {
                 cached.clone()
             } else {
-                let cache_lookup = ozon_disk_cache.lookup(sku);
+                let cache_lookup = ozon_disk_cache.lookup(ozon_url);
                 match cache_lookup {
                     Ok(OzonSourceCacheLookup::Hit(hit)) => {
                         let resolved = Ok(hit);
-                        ozon_source_cache.insert(sku.to_string(), resolved.clone());
+                        ozon_source_cache.insert(ozon_url.to_string(), resolved.clone());
                         resolved
                     }
                     Ok(OzonSourceCacheLookup::Corrupted(error)) => {
@@ -1593,31 +1604,31 @@ where
                                 level: "warn".to_string(),
                                 message: format!(
                                     "Ozon 源图缓存损坏，回退浏览器抓取: {} ({error})",
-                                    sku
+                                    ozon_url
                                 ),
                             },
                         );
                         let resolved = hydrate_ozon_source_via_browser(
                             sink,
                             client,
-                            sku,
+                            ozon_url,
                             ozon_disk_cache,
                             &mut ozon_session_warmed,
                             ensure_browser_ready,
                         );
-                        ozon_source_cache.insert(sku.to_string(), resolved.clone());
+                        ozon_source_cache.insert(ozon_url.to_string(), resolved.clone());
                         resolved
                     }
                     Ok(OzonSourceCacheLookup::Miss) => {
                         let resolved = hydrate_ozon_source_via_browser(
                             sink,
                             client,
-                            sku,
+                            ozon_url,
                             ozon_disk_cache,
                             &mut ozon_session_warmed,
                             ensure_browser_ready,
                         );
-                        ozon_source_cache.insert(sku.to_string(), resolved.clone());
+                        ozon_source_cache.insert(ozon_url.to_string(), resolved.clone());
                         resolved
                     }
                     Err(error) => {
@@ -1628,19 +1639,19 @@ where
                                 level: "warn".to_string(),
                                 message: format!(
                                     "读取 Ozon 源图缓存失败，回退浏览器抓取: {} ({error})",
-                                    sku,
+                                    ozon_url,
                                 ),
                             },
                         );
                         let resolved = hydrate_ozon_source_via_browser(
                             sink,
                             client,
-                            sku,
+                            ozon_url,
                             ozon_disk_cache,
                             &mut ozon_session_warmed,
                             ensure_browser_ready,
                         );
-                        ozon_source_cache.insert(sku.to_string(), resolved.clone());
+                        ozon_source_cache.insert(ozon_url.to_string(), resolved.clone());
                         resolved
                     }
                 }
@@ -1659,7 +1670,7 @@ where
                         EVENT_LOG,
                         &LogEvent {
                             level: "warn".to_string(),
-                            message: format!("Ozon SKU {} 解析失败: {:?}", validated_row.sku, error),
+                            message: format!("Ozon URL {} 解析失败: {:?}", validated_row.ozon_url, error),
                         },
                     );
                     if error == OzonResolutionFailure::AntiBotChallenge {
@@ -1690,8 +1701,8 @@ where
                                 "retrying_ozon_resolve",
                                 "恢复 Ozon 搜索",
                                 &format!(
-                                    "用户已确认验证完成，重试 SKU {} (第 {} 次)",
-                                    validated_row.sku, antibot_attempts
+                                    "用户已确认验证完成，重试 URL {} (第 {} 次)",
+                                    validated_row.ozon_url, antibot_attempts
                                 ),
                                 false,
                             )?;
@@ -1701,26 +1712,26 @@ where
                                 &LogEvent {
                                     level: "info".to_string(),
                                     message: format!(
-                                        "Ozon 验证已恢复，重试 SKU: {} (第 {} 次)",
-                                        validated_row.sku, antibot_attempts
+                                        "Ozon 验证已恢复，重试 URL: {} (第 {} 次)",
+                                        validated_row.ozon_url, antibot_attempts
                                     ),
                                 },
                             );
 
                             // Remove cached anti-bot result so retry hits sidecar again
-                            ozon_source_cache.remove(validated_row.sku.as_str());
+                            ozon_source_cache.remove(validated_row.ozon_url.as_str());
 
                             match hydrate_ozon_source_via_browser(
                                 sink,
                                 client,
-                                validated_row.sku.as_str(),
+                                validated_row.ozon_url.as_str(),
                                 ozon_disk_cache,
                                 &mut ozon_session_warmed,
                                 ensure_browser_ready,
                             ) {
                                 Ok(resolution) => {
                                     ozon_source_cache.insert(
-                                        validated_row.sku.clone(),
+                                        validated_row.ozon_url.clone(),
                                         Ok(resolution.clone()),
                                     );
                                     let mut hydrated = validated_row.clone();
@@ -1746,8 +1757,8 @@ where
                                         &LogEvent {
                                             level: "warn".to_string(),
                                             message: format!(
-                                                "Ozon SKU {} 重试失败: {:?}",
-                                                validated_row.sku, retry_error
+                                                "Ozon URL {} 重试失败: {:?}",
+                                                validated_row.ozon_url, retry_error
                                             ),
                                         },
                                     );
@@ -2224,6 +2235,21 @@ where
         .parent()
         .map(|p| p.join("result.xlsx"))
         .unwrap_or_else(|| PathBuf::from("result.xlsx"));
+
+    // Clear all historical data on each task start
+    {
+        let cache_root = output_anchor_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(".desktop_app_cache");
+        if cache_root.exists() {
+            let _ = std::fs::remove_dir_all(&cache_root);
+        }
+        if result_path.exists() {
+            let _ = std::fs::remove_file(&result_path);
+        }
+    }
+
     let task_workbook = load_task_rows(&excel)?;
     let total_rows = task_workbook.rows.len() as u32;
     let client = Client::new();
