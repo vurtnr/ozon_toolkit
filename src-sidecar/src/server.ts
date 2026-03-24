@@ -15,6 +15,7 @@ import { ERROR_CODES, type SidecarErrorCode } from "./error-codes";
 import {
   resolveOzonProductViaSession,
   resolveOzonSkuViaSession,
+  selectPreferredOzonSessionPage,
   type OzonResolvePayload,
 } from "./ozon_session";
 
@@ -744,6 +745,18 @@ async function ensureOzonBrowserAliveInner(): Promise<Browser> {
       (await connectToExistingProfileBrowser(profileDir)) ??
       (await launchOzonBrowserProcess(executablePath, profileDir));
     globalOzonPage = null;
+
+    // Close extra tabs — keep only one preferred page
+    const allPages = await globalOzonBrowser.pages().catch(() => []);
+    if (allPages.length > 1) {
+      const preferred =
+        selectPreferredOzonSessionPage(allPages) ?? allPages[0];
+      for (const p of allPages) {
+        if (p !== preferred && !p.isClosed()) {
+          await p.close().catch(() => undefined);
+        }
+      }
+    }
   }
 
   return globalOzonBrowser;
