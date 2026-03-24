@@ -248,6 +248,18 @@ describe("isTransientPageNavigationError", () => {
   test("does not hide unrelated runtime errors", () => {
     expect(isTransientPageNavigationError(new Error("delay is not defined"))).toBe(false);
   });
+
+  test("treats session-closed and target-closed errors as transient", () => {
+    expect(
+      isTransientPageNavigationError(new Error("Session closed. Most likely the page has been closed.")),
+    ).toBe(true);
+    expect(
+      isTransientPageNavigationError(new Error("Target closed.")),
+    ).toBe(true);
+    expect(
+      isTransientPageNavigationError(new Error("Protocol error (Runtime.callFunctionOn): Session closed.")),
+    ).toBe(true);
+  });
 });
 
 describe("isOzonHomeUrl", () => {

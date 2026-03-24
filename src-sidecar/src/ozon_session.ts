@@ -296,7 +296,10 @@ export function isTransientPageNavigationError(error: unknown): boolean {
 
   return (
     normalized.includes("execution context was destroyed") ||
-    normalized.includes("cannot find context with specified id")
+    normalized.includes("cannot find context with specified id") ||
+    normalized.includes("session closed") ||
+    normalized.includes("target closed") ||
+    normalized.includes("protocol error")
   );
 }
 
@@ -782,61 +785,74 @@ export async function resolveOzonSkuViaSession(
     throw new Error("[OZON_RESOLVE_FAILED] Ozon SKU 为空");
   }
 
-  const page = await ensureOzonSessionPage(dependencies);
-  await warmOzonSession(dependencies, page);
-  await fillAndSubmitOzonSkuSearch(page, normalizedSku);
+  const attemptResolve = async (): Promise<OzonResolvePayload> => {
+    const page = await ensureOzonSessionPage(dependencies);
+    await warmOzonSession(dependencies, page);
+    await fillAndSubmitOzonSkuSearch(page, normalizedSku);
 
-  const deadline =
-    Date.now() + (dependencies.resolveTimeoutMs ?? DEFAULT_RESOLVE_TIMEOUT_MS);
-  let antiBotSeen = false;
+    const deadline =
+      Date.now() + (dependencies.resolveTimeoutMs ?? DEFAULT_RESOLVE_TIMEOUT_MS);
+    let antiBotSeen = false;
 
-  while (Date.now() < deadline) {
-    const snapshot = await collectOzonSnapshotWithRetry(page);
-    if (!snapshot) {
-      await dependencies.delay(dependencies.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS);
-      continue;
-    }
-    const snapshotState = classifyOzonSkuSearchSnapshot(snapshot);
+    while (Date.now() < deadline) {
+      const snapshot = await collectOzonSnapshotWithRetry(page);
+      if (!snapshot) {
+        await dependencies.delay(dependencies.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS);
+        continue;
+      }
+      const snapshotState = classifyOzonSkuSearchSnapshot(snapshot);
 
-    if (snapshotState === "anti_bot_challenge") {
-      antiBotSeen = true;
-      try {
-        await page.bringToFront();
-      } catch {}
-      await dependencies.delay(
-        dependencies.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS,
-      );
-      continue;
-    }
-
-    if (snapshotState === "not_found") {
-      throw new Error("[OZON_SKU_NOT_FOUND] Ozon SKU 未找到对应商品");
-    }
-
-    if (snapshotState === "resolved") {
-      const title = normalizeOzonTitle(snapshot.title);
-      const imageUrl = normalizeOzonImageUrl(snapshot);
-      if (!title || !imageUrl) {
+      if (snapshotState === "anti_bot_challenge") {
+        antiBotSeen = true;
+        try {
+          await page.bringToFront();
+        } catch {}
         await dependencies.delay(
           dependencies.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS,
         );
         continue;
       }
 
-      const imageBase64 = await captureOzonImageBase64(
-        page,
-        imageUrl,
-        dependencies.delay,
-      );
-      return imageBase64 ? { title, imageUrl, imageBase64 } : { title, imageUrl };
+      if (snapshotState === "not_found") {
+        throw new Error("[OZON_SKU_NOT_FOUND] Ozon SKU 未找到对应商品");
+      }
+
+      if (snapshotState === "resolved") {
+        const title = normalizeOzonTitle(snapshot.title);
+        const imageUrl = normalizeOzonImageUrl(snapshot);
+        if (!title || !imageUrl) {
+          await dependencies.delay(
+            dependencies.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS,
+          );
+          continue;
+        }
+
+        const imageBase64 = await captureOzonImageBase64(
+          page,
+          imageUrl,
+          dependencies.delay,
+        );
+        return imageBase64 ? { title, imageUrl, imageBase64 } : { title, imageUrl };
+      }
+
+      await dependencies.delay(dependencies.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS);
     }
 
-    await dependencies.delay(dependencies.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS);
-  }
+    if (antiBotSeen) {
+      throw new Error("[ANTI_BOT_CHALLENGE] Ozon SKU 搜索触发验证且在超时前未解除");
+    }
 
-  if (antiBotSeen) {
-    throw new Error("[ANTI_BOT_CHALLENGE] Ozon SKU 搜索触发验证且在超时前未解除");
-  }
+    throw new Error("[OZON_RESOLVE_FAILED] 未从 Ozon SKU 搜索中解析到商品标题或主图");
+  };
 
-  throw new Error("[OZON_RESOLVE_FAILED] 未从 Ozon SKU 搜索中解析到商品标题或主图");
+  try {
+    return await attemptResolve();
+  } catch (error) {
+    if (!isTransientPageNavigationError(error)) {
+      throw error;
+    }
+    // Page/session crashed — clear session page and retry once
+    dependencies.setSessionPage(null);
+    return await attemptResolve();
+  }
 }
