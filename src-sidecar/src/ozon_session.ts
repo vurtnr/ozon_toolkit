@@ -537,14 +537,30 @@ async function warmOzonSession(
     await page.bringToFront();
   } catch {}
 
-  // Skip navigation if already on the Ozon homepage
+  const searchInputCssSelector = OZON_SEARCH_INPUT_SELECTORS
+    .map(s => `${s}:not([disabled])`)
+    .join(", ");
+
+  const waitForSearchInputInteractive = async (): Promise<void> => {
+    try {
+      await page.waitForSelector(searchInputCssSelector, {
+        visible: true,
+        timeout: 10_000,
+      });
+    } catch {}
+    // Allow JS hydration / autocomplete handlers to fully attach
+    await dependencies.delay(1_000);
+  };
+
+  // If already on the Ozon homepage, still ensure the search input is interactive
   const currentUrl = page.url();
   if (isOzonHomeUrl(currentUrl)) {
+    await waitForSearchInputInteractive();
     return;
   }
 
   await page.goto(dependencies.landingUrl ?? DEFAULT_OZON_HOME_URL, {
-    waitUntil: "domcontentloaded",
+    waitUntil: "load",
     timeout: 60_000,
   });
 
@@ -564,7 +580,7 @@ async function warmOzonSession(
     }
 
     if (landingState === "ready") {
-      await dependencies.delay(750);
+      await waitForSearchInputInteractive();
       return;
     }
 
@@ -602,22 +618,93 @@ async function fillAndSubmitOzonSkuSearch(
   }
 
   const beforeUrl = page.url();
-  await page.focus(selectedSelector);
-  try {
-    await page.click(selectedSelector, { clickCount: 3, delay: 60 });
-  } catch {
-    await page.focus(selectedSelector);
+  await page.waitForSelector(selectedSelector, { visible: true, timeout: 5_000 });
+  await delay(500);
+
+  // Dismiss any existing autocomplete/suggestion overlay
+  await page.keyboard.press("Escape");
+  await delay(500);
+
+  // Clear input reliably via JS and focus
+  const clearAndFocusInput = async (): Promise<void> => {
+    await page.evaluate((selector: string) => {
+      const input = document.querySelector<HTMLInputElement>(selector);
+      if (input) {
+        input.focus();
+        input.value = "";
+        input.dispatchEvent(new Event("input", { bubbles: true }));
+        input.dispatchEvent(new Event("change", { bubbles: true }));
+      }
+    }, selectedSelector);
+    await delay(500);
+
+    // Verify the input actually has focus; re-focus if not
+    const hasFocus = await page.evaluate((selector: string) => {
+      const input = document.querySelector<HTMLInputElement>(selector);
+      if (!input) return false;
+      if (document.activeElement !== input) {
+        input.focus();
+      }
+      return document.activeElement === input;
+    }, selectedSelector);
+
+    if (!hasFocus) {
+      await page.click(selectedSelector).catch(() => undefined);
+      await delay(300);
+    }
+  };
+
+  // Set input value directly via JS, bypassing React controlled component interception
+  const setInputValueViaJS = async (value: string): Promise<void> => {
+    await page.evaluate((selector: string, val: string) => {
+      const input = document.querySelector<HTMLInputElement>(selector);
+      if (!input) return;
+      input.focus();
+      const nativeSetter = Object.getOwnPropertyDescriptor(
+        window.HTMLInputElement.prototype, "value",
+      )?.set;
+      if (nativeSetter) {
+        nativeSetter.call(input, val);
+      } else {
+        input.value = val;
+      }
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      input.dispatchEvent(new Event("change", { bubbles: true }));
+    }, selectedSelector, value);
+  };
+
+  // Read back the current input value for verification
+  const readInputValue = async (): Promise<string> => {
+    return page.evaluate((selector: string) => {
+      const input = document.querySelector<HTMLInputElement>(selector);
+      return input?.value ?? "";
+    }, selectedSelector);
+  };
+
+  // Set value atomically via JS and verify with retries
+  await clearAndFocusInput();
+  await setInputValueViaJS(sku);
+  await delay(500);
+
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const currentValue = (await readInputValue()).trim();
+    if (currentValue === sku) break;
+
+    // Mismatch — dismiss autocomplete, clear, re-set
+    await page.keyboard.press("Escape");
+    await delay(300);
+    await clearAndFocusInput();
+    await setInputValueViaJS(sku);
+    await delay(500);
   }
 
-  const modifier = process.platform === "darwin" ? "Meta" : "Control";
-  try {
-    await page.keyboard.down(modifier);
-    await page.keyboard.press("KeyA");
-    await page.keyboard.up(modifier);
-  } catch {}
-  await page.keyboard.press("Backspace").catch(() => undefined);
-  await page.keyboard.type(sku, { delay: 55 });
-  await delay(180);
+  // Hard gate: verify input value matches SKU before submitting
+  const finalValue = (await readInputValue()).trim();
+  if (finalValue !== sku) {
+    throw new Error(
+      `[OZON_RESOLVE_FAILED] SKU 输入验证失败: 期望 "${sku}", 实际 "${finalValue}"`,
+    );
+  }
 
   const waitForSearchTransition = async (timeoutMs: number): Promise<boolean> => {
     const deadline = Date.now() + timeoutMs;
@@ -650,7 +737,7 @@ async function fillAndSubmitOzonSkuSearch(
   };
 
   await page.keyboard.press("Enter");
-  if (await waitForSearchTransition(6_000)) {
+  if (await waitForSearchTransition(10_000)) {
     return;
   }
 
@@ -699,11 +786,41 @@ async function fillAndSubmitOzonSkuSearch(
     return false;
   }, selectedSelector);
 
-  if (clicked && await waitForSearchTransition(6_000)) {
+  if (clicked && await waitForSearchTransition(10_000)) {
     return;
   }
 
   throw new Error("[OZON_RESOLVE_FAILED] Ozon SKU 搜索未触发结果页跳转");
+}
+
+export async function simulateHumanBrowsing(
+  page: Page,
+  delayFn: (ms: number) => Promise<void>,
+): Promise<void> {
+  try {
+    // Random mouse movements (2-4 points)
+    const moveCount = 2 + Math.floor(Math.random() * 3);
+    for (let i = 0; i < moveCount; i++) {
+      const x = 200 + Math.floor(Math.random() * 800);
+      const y = 150 + Math.floor(Math.random() * 500);
+      await page.mouse.move(x, y, { steps: 5 + Math.floor(Math.random() * 10) });
+      await delayFn(200 + Math.floor(Math.random() * 400));
+    }
+
+    // Scroll down 100-400px
+    const scrollDown = 100 + Math.floor(Math.random() * 300);
+    await page.evaluate((amount: number) => window.scrollBy(0, amount), scrollDown);
+    await delayFn(500 + Math.floor(Math.random() * 1000));
+
+    // Sometimes scroll back up a bit (50% chance)
+    if (Math.random() > 0.5) {
+      const scrollUp = 50 + Math.floor(Math.random() * 150);
+      await page.evaluate((amount: number) => window.scrollBy(0, -amount), scrollUp);
+      await delayFn(300 + Math.floor(Math.random() * 500));
+    }
+  } catch {
+    // Non-critical — if simulation fails (e.g. page navigated), silently continue
+  }
 }
 
 export async function resolveOzonProductViaSession(
@@ -721,6 +838,9 @@ export async function resolveOzonProductViaSession(
     waitUntil: "domcontentloaded",
     timeout: 60_000,
   });
+
+  // Simulate human browsing behavior to avoid anti-bot detection
+  await simulateHumanBrowsing(page, dependencies.delay);
 
   const deadline =
     Date.now() + (dependencies.resolveTimeoutMs ?? DEFAULT_RESOLVE_TIMEOUT_MS);
