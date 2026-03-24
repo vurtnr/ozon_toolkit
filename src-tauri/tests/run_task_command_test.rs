@@ -1573,78 +1573,66 @@ fn run_task_prefers_sidecar_returned_ozon_image_bytes_over_rust_redownload() {
 }
 
 #[test]
-fn run_task_stops_when_browser_assisted_ozon_resolve_remains_blocked() {
+fn run_task_pauses_and_skips_row_after_max_ozon_antibot_retries() {
     let _guard = lock_env();
     GLOBAL_RECOVERY_GATE.resume();
     clear_mock_pipeline_env();
     clear_sidecar_fixture_env();
 
     let excel_path = make_temp_excel_path();
-    let (ozon_base_url, ozon_handle) = spawn_ozon_antibot_server();
-    create_url_mode_workbook(
-        &excel_path,
-        &[(
-            &format!("{ozon_base_url}/product/3552213000"),
-            "SKU-OZON-STILL-BLOCKED",
-            "260 g",
-        )],
-    );
+    let result_path = excel_path.with_file_name("result.xlsx");
+    create_sku_mode_workbook(&excel_path, &[("sample-1", "SKU-ANTIBOT-001")]);
 
-    let (health_url, health_handle) = spawn_sidecar_health_server();
-    let (resolve_url, resolve_handle) = spawn_sidecar_ozon_resolve_server(
-        r#"{"success":false,"code":"ANTI_BOT_CHALLENGE","error":"[ANTI_BOT_CHALLENGE] Ozon page remains restricted"}"#.to_string(),
-        1,
+    let (resolve_url, resolve_handle) = spawn_sidecar_ozon_sku_resolve_server(
+        r#"{"success":false,"code":"ANTI_BOT_CHALLENGE","error":"[ANTI_BOT_CHALLENGE] Ozon page blocked"}"#.to_string(),
+        4,
     );
-
-    std::env::set_var("SIDECAR_HEALTH_URL", &health_url);
     std::env::set_var("SIDECAR_OZON_RESOLVE_URL", &resolve_url);
-    std::env::set_var("SIDECAR_SESSION_URL", "http://127.0.0.1:9/session-state");
-    std::env::set_var("SIDECAR_SEARCH_URL", "http://127.0.0.1:9/search");
-    set_mock_search_image_plan_env(default_mock_search_image_plan_json());
+    set_mock_vlm_env(r#"[]"#);
+
+    // Background thread: resume gate each time it becomes paused
+    let gate_resume_handle = std::thread::spawn(|| {
+        for _ in 0..4 {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while std::time::Instant::now() < deadline {
+                if GLOBAL_RECOVERY_GATE.is_paused() {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    GLOBAL_RECOVERY_GATE.resume();
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+    });
 
     let mut sink = CollectingSink::default();
-    let err = run_task_with_sink(excel_path.to_string_lossy().as_ref(), &mut sink)
-        .expect_err("task should stop when ozon browser fallback remains blocked");
+    let summary = run_task_with_sink(excel_path.to_string_lossy().as_ref(), &mut sink)
+        .expect("task should complete (skip row) after max anti-bot retries, not terminate");
 
-    assert_eq!(err, "ANTI_BOT_CHALLENGE");
-    let task_phase_events: Vec<&Value> = sink
-        .payloads
-        .iter()
-        .filter(|(name, _)| name == "task_phase")
-        .map(|(_, payload)| payload)
-        .collect();
-    assert!(
-        task_phase_events
-            .iter()
-            .any(|payload| payload["phase"] == "warming_ozon_session"),
-        "task phase stream should expose ozon session warm-up before browser hydration"
-    );
-    assert!(
-        task_phase_events
-            .iter()
-            .any(|payload| payload["phase"] == "waiting_for_ozon_verification"),
-        "task phase stream should expose ozon verification wait when hydration remains blocked"
-    );
+    assert_eq!(summary.status, "completed");
+
+    // Should have emitted blocking_alert at least once
     assert!(
         sink.payloads.iter().any(|(name, payload)| {
             name == EVENT_BLOCKING_ALERT && payload["code"] == "ANTI_BOT_CHALLENGE"
         }),
-        "blocking alert should be emitted when ozon remains blocked",
-    );
-    assert!(
-        !sink.payloads.iter().any(|(name, payload)| {
-            name == EVENT_ROW_RESULT && payload["stage"] == "planning_search_image"
-        }),
-        "1688 planning stage must not start while ozon hydration remains blocked",
+        "blocking alert should be emitted when ozon captcha is detected",
     );
 
+    // The row should be finalized (skipped) not left hanging
+    let final_rows = final_row_event_payloads(&sink);
+    assert_eq!(final_rows.len(), 1);
+    assert!(
+        final_rows[0]["status"].as_str().unwrap().contains("验证"),
+        "skipped row status should mention verification failure"
+    );
+
+    gate_resume_handle.join().expect("join gate resume thread");
     clear_mock_pipeline_env();
     clear_sidecar_fixture_env();
-    ozon_handle.join().expect("join ozon fixture server");
-    health_handle.join().expect("join health server");
     resolve_handle.join().expect("join ozon resolve server");
     remove_if_exists(&excel_path);
-    remove_if_exists(&excel_path.with_file_name("result.xlsx"));
+    remove_if_exists(&result_path);
 }
 
 #[test]
