@@ -3,6 +3,7 @@ import {
   buildChromeDialogFilters,
   coerceSettings,
   detectPlatformFromUserAgent,
+  normalizeChromeExecutablePath,
 } from "../../stores/settings";
 
 describe("Settings helpers", () => {
@@ -30,8 +31,18 @@ describe("Settings helpers", () => {
   });
 
   test("coerceSettings fills missing fields", () => {
-    const settings = coerceSettings({ chromeExecutablePath: "/Applications/Google Chrome.app" });
-    expect(settings.chromeExecutablePath).toBe("/Applications/Google Chrome.app");
+    const settings = coerceSettings({
+      chromeExecutablePath: "/Applications/Google Chrome.app",
+    });
+    expect(settings.chromeExecutablePath).toBe(
+      "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    );
     expect(settings.dashscopeApiKey).toBe("");
+  });
+
+  test("normalizes macOS app bundle paths into executable paths", () => {
+    expect(normalizeChromeExecutablePath("/Applications/Google Chrome.app")).toBe(
+      "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    );
   });
 });

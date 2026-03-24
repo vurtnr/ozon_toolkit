@@ -4,6 +4,10 @@ import {
   classifyOzonSkuSearchSnapshot,
   classifyOzonLandingSnapshot,
   classifyOzonSnapshot,
+  isTransientPageNavigationError,
+  isReusableBootstrapPageUrl,
+  selectPreferredOzonSessionPage,
+  selectReusableOzonBootstrapPage,
   type OzonSnapshot,
 } from "./ozon_session";
 
@@ -28,6 +32,73 @@ describe("buildCanonicalOzonProductUrl", () => {
     expect(
       buildCanonicalOzonProductUrl("https://www.ozon.ru/category/sport-12345/"),
     ).toBeNull();
+  });
+});
+
+describe("selectReusableOzonBootstrapPage", () => {
+  test("reuses the browser bootstrap blank page before opening a second tab", () => {
+    const blankPage = {
+      url: () => "about:blank",
+      isClosed: () => false,
+    };
+    const ozonPage = {
+      url: () => "https://www.ozon.ru/",
+      isClosed: () => false,
+    };
+
+    expect(selectReusableOzonBootstrapPage([ozonPage, blankPage])).toBe(blankPage);
+  });
+
+  test("ignores closed or already-navigated tabs when picking a reusable bootstrap page", () => {
+    const closedBlank = {
+      url: () => "about:blank",
+      isClosed: () => true,
+    };
+    const activeOzon = {
+      url: () => "https://www.ozon.ru/product/3552213000/",
+      isClosed: () => false,
+    };
+
+    expect(selectReusableOzonBootstrapPage([closedBlank, activeOzon])).toBeNull();
+  });
+});
+
+describe("selectPreferredOzonSessionPage", () => {
+  test("prefers an already-open ozon landing page before creating a second tab", () => {
+    const ozonLandingPage = {
+      url: () => "https://www.ozon.ru/",
+      isClosed: () => false,
+    };
+    const blankPage = {
+      url: () => "about:blank",
+      isClosed: () => false,
+    };
+
+    expect(selectPreferredOzonSessionPage([blankPage, ozonLandingPage])).toBe(
+      ozonLandingPage,
+    );
+  });
+
+  test("falls back to the reusable bootstrap blank tab when no ozon page exists yet", () => {
+    const blankPage = {
+      url: () => "about:blank",
+      isClosed: () => false,
+    };
+
+    expect(selectPreferredOzonSessionPage([blankPage])).toBe(blankPage);
+  });
+});
+
+describe("isReusableBootstrapPageUrl", () => {
+  test("treats blank and browser new-tab pages as reusable bootstrap tabs", () => {
+    expect(isReusableBootstrapPageUrl("about:blank")).toBe(true);
+    expect(isReusableBootstrapPageUrl("chrome://newtab/")).toBe(true);
+    expect(isReusableBootstrapPageUrl("edge://newtab/")).toBe(true);
+  });
+
+  test("does not treat real Ozon pages as reusable bootstrap tabs", () => {
+    expect(isReusableBootstrapPageUrl("https://www.ozon.ru/")).toBe(false);
+    expect(isReusableBootstrapPageUrl("https://www.ozon.ru/product/3552213000/")).toBe(false);
   });
 });
 
@@ -161,5 +232,19 @@ describe("classifyOzonSkuSearchSnapshot", () => {
     };
 
     expect(classifyOzonSkuSearchSnapshot(snapshot)).toBe("resolved");
+  });
+});
+
+describe("isTransientPageNavigationError", () => {
+  test("treats execution-context-destroyed errors as transient navigation noise", () => {
+    expect(
+      isTransientPageNavigationError(
+        new Error("Execution context was destroyed, most likely because of a navigation."),
+      ),
+    ).toBe(true);
+  });
+
+  test("does not hide unrelated runtime errors", () => {
+    expect(isTransientPageNavigationError(new Error("delay is not defined"))).toBe(false);
   });
 });

@@ -1,8 +1,9 @@
 use std::path::PathBuf;
 
 use desktop_app_lib::config::{
-    build_sidecar_env, load_settings_from_disk, resolve_effective_dashscope_api_key,
-    save_settings_to_disk, validate_dashscope_api_key_if_present, AppSettings,
+    build_sidecar_env, load_settings_from_disk, normalize_chrome_executable_path,
+    resolve_effective_dashscope_api_key, save_settings_to_disk,
+    validate_dashscope_api_key_if_present, AppSettings,
 };
 
 fn temp_settings_path() -> PathBuf {
@@ -74,6 +75,48 @@ fn sidecar_env_includes_chrome_path_when_provided() {
         "CHROME_EXECUTABLE_PATH".to_string(),
         "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe".to_string(),
     )));
+}
+
+#[test]
+fn loading_settings_normalizes_legacy_macos_app_bundle_paths() {
+    let path = temp_settings_path();
+    std::fs::write(
+        &path,
+        r#"{"dashscope_api_key":"","chrome_executable_path":"/Applications/Google Chrome.app"}"#,
+    )
+    .expect("seed legacy settings should succeed");
+
+    let loaded = load_settings_from_disk(&path).expect("load should succeed");
+    assert_eq!(
+        loaded.chrome_executable_path,
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+    );
+
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn build_sidecar_env_normalizes_macos_app_bundle_paths() {
+    let settings = AppSettings {
+        dashscope_api_key: String::new(),
+        chrome_executable_path: "/Applications/Google Chrome.app".to_string(),
+    };
+
+    let env = build_sidecar_env(&settings);
+    assert!(env.contains(&(
+        "CHROME_EXECUTABLE_PATH".to_string(),
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome".to_string(),
+    )));
+}
+
+#[test]
+fn normalize_chrome_executable_path_keeps_non_bundle_paths_intact() {
+    assert_eq!(
+        normalize_chrome_executable_path(
+            "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"
+        ),
+        "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"
+    );
 }
 
 #[test]

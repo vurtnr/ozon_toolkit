@@ -25,10 +25,33 @@ export function createDefaultSettings(): AppSettings {
   };
 }
 
+export function normalizeChromeExecutablePath(value: string): string {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return "";
+  }
+
+  const normalized = trimmed.replace(/\/+$/, "");
+  if (/\.app\/Contents\/MacOS\/[^/]+$/i.test(normalized)) {
+    return normalized;
+  }
+
+  const bundleMatch = normalized.match(/^(.*\/([^/]+)\.app)$/i);
+  if (!bundleMatch) {
+    return normalized;
+  }
+
+  const appBundlePath = bundleMatch[1];
+  const executableName = bundleMatch[2];
+  return `${appBundlePath}/Contents/MacOS/${executableName}`;
+}
+
 export function coerceSettings(input: Partial<AppSettings> | undefined): AppSettings {
   return {
     dashscopeApiKey: input?.dashscopeApiKey ?? "",
-    chromeExecutablePath: input?.chromeExecutablePath ?? "",
+    chromeExecutablePath: normalizeChromeExecutablePath(
+      input?.chromeExecutablePath ?? "",
+    ),
   };
 }
 
@@ -43,7 +66,9 @@ function fromWire(wire: AppSettingsWire | null | undefined): AppSettings {
 function toWire(settings: AppSettings): AppSettingsWire {
   return {
     dashscope_api_key: settings.dashscopeApiKey,
-    chrome_executable_path: settings.chromeExecutablePath,
+    chrome_executable_path: normalizeChromeExecutablePath(
+      settings.chromeExecutablePath,
+    ),
   };
 }
 
@@ -92,7 +117,9 @@ export async function browseChromeExecutable(
     filters,
   } as any);
 
-  return typeof selected === "string" ? selected : null;
+  return typeof selected === "string"
+    ? normalizeChromeExecutablePath(selected)
+    : null;
 }
 
 export async function loadSettings(): Promise<AppSettings> {

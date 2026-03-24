@@ -1654,6 +1654,14 @@ where
                     hydrated
                 }
                 Err(error) => {
+                    let _ = emit_event(
+                        sink,
+                        EVENT_LOG,
+                        &LogEvent {
+                            level: "warn".to_string(),
+                            message: format!("Ozon SKU {} 解析失败: {:?}", validated_row.sku, error),
+                        },
+                    );
                     if error == OzonResolutionFailure::AntiBotChallenge {
                         emit_task_phase_event(
                             sink,
@@ -2187,7 +2195,6 @@ where
             use_mock_candidates,
             &mut ensure_browser_ready,
         )?;
-        close_ozon_session_via_sidecar(&client);
         let mut processed_rows = prepared_rows.processed_rows;
         let executable_rows = prepared_rows.executable_rows;
         let mut output_rows = prepared_rows.finalized_rows;
@@ -2202,7 +2209,11 @@ where
                 true,
             )?;
             ensure_browser_ready(&client)?;
-            wait_for_sidecar_ready_session(sink, &client)?;
+            let wait_result = wait_for_sidecar_ready_session(sink, &client);
+            close_ozon_session_via_sidecar(&client);
+            wait_result?;
+        } else {
+            close_ozon_session_via_sidecar(&client);
         }
 
         if !executable_rows.is_empty() {

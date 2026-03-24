@@ -28,6 +28,34 @@ const defaultExists: ExistsFn = async (candidate: string) => {
   }
 };
 
+export function normalizeChromeExecutablePath(
+  candidate: string,
+  platform: NodeJS.Platform = process.platform,
+): string {
+  const trimmed = candidate.trim();
+  if (!trimmed) {
+    return "";
+  }
+
+  if (platform !== "darwin") {
+    return trimmed;
+  }
+
+  const normalized = trimmed.replace(/\/+$/, "");
+  if (/\.app\/Contents\/MacOS\/[^/]+$/i.test(normalized)) {
+    return normalized;
+  }
+
+  const bundleMatch = normalized.match(/^(.*\/([^/]+)\.app)$/i);
+  if (!bundleMatch) {
+    return normalized;
+  }
+
+  const appBundlePath = bundleMatch[1];
+  const executableName = bundleMatch[2];
+  return `${appBundlePath}/Contents/MacOS/${executableName}`;
+}
+
 function pushIfPresent(list: string[], value: string | undefined): void {
   if (!value) return;
   const trimmed = value.trim();
@@ -83,7 +111,10 @@ export async function findChromePath(
   const platform = options.platform ?? process.platform;
 
   const candidates: string[] = [];
-  pushIfPresent(candidates, env.CHROME_EXECUTABLE_PATH);
+  pushIfPresent(
+    candidates,
+    normalizeChromeExecutablePath(env.CHROME_EXECUTABLE_PATH ?? "", platform),
+  );
   candidates.push(...buildPlatformCandidates(env, platform));
 
   for (const candidate of candidates) {

@@ -1,5 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import {
+  buildOzonChromeArgs,
+  extractChromeSingletonLockPid,
+  parseChromeDevToolsPort,
   classifySessionStates,
   classifySessionState,
   shutdownRuntimeResources,
@@ -67,6 +70,45 @@ describe("shutdownRuntimeResources", () => {
     });
 
     expect(calls).toEqual([]);
+  });
+});
+
+describe("parseChromeDevToolsPort", () => {
+  test("reads the first line as the devtools port", () => {
+    expect(
+      parseChromeDevToolsPort(
+        "57511\n/devtools/browser/18de3a71-d85d-4095-9478-64ba49b0253b\n",
+      ),
+    ).toBe(57511);
+  });
+
+  test("returns null for invalid devtools port files", () => {
+    expect(parseChromeDevToolsPort("not-a-port\n/devtools/browser/x\n")).toBeNull();
+    expect(parseChromeDevToolsPort("")).toBeNull();
+  });
+});
+
+describe("extractChromeSingletonLockPid", () => {
+  test("extracts the chrome pid from macOS singleton lock targets", () => {
+    expect(extractChromeSingletonLockPid("anonymous-21659")).toBe(21659);
+  });
+
+  test("returns null for unsupported lock targets", () => {
+    expect(extractChromeSingletonLockPid("")).toBeNull();
+    expect(extractChromeSingletonLockPid("/tmp/not-supported")).toBeNull();
+  });
+});
+
+describe("buildOzonChromeArgs", () => {
+  test("uses a clean manual-like chrome startup for ozon without automation flags", () => {
+    const args = buildOzonChromeArgs("/tmp/ozon_profile", 9222);
+
+    expect(args).toContain("--user-data-dir=/tmp/ozon_profile");
+    expect(args).toContain("--remote-debugging-port=9222");
+    expect(args).toContain("about:blank");
+    expect(args).not.toContain("--new-window");
+    expect(args).not.toContain("--disable-blink-features=AutomationControlled");
+    expect(args.some((value) => value.startsWith("--user-agent="))).toBe(false);
   });
 });
 

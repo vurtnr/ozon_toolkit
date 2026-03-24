@@ -2,6 +2,7 @@ use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::mpsc;
 use std::sync::Mutex;
 use std::thread;
@@ -369,6 +370,7 @@ fn clear_sidecar_fixture_env() {
     std::env::remove_var("SIDECAR_SESSION_URL");
     std::env::remove_var("SIDECAR_SEARCH_URL");
     std::env::remove_var("SIDECAR_OZON_RESOLVE_URL");
+    std::env::remove_var("SIDECAR_OZON_CLOSE_URL");
 }
 
 fn spawn_sidecar_health_server() -> (String, thread::JoinHandle<()>) {
@@ -450,6 +452,100 @@ fn spawn_sidecar_session_server(bodies: Vec<&'static str>) -> (String, thread::J
     });
 
     (format!("http://{address}/session-state"), handle)
+}
+
+fn spawn_sidecar_recording_session_server(
+    bodies: Vec<&'static str>,
+    order: Arc<Mutex<Vec<String>>>,
+) -> (String, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind session listener");
+    listener
+        .set_nonblocking(true)
+        .expect("set session listener nonblocking");
+    let address = listener
+        .local_addr()
+        .expect("resolve session listener address");
+
+    let handle = thread::spawn(move || {
+        let started_at = Instant::now();
+        let mut body_iter = bodies.into_iter();
+
+        loop {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let mut buffer = [0u8; 2048];
+                    let _ = stream.read(&mut buffer);
+                    order
+                        .lock()
+                        .expect("order lock")
+                        .push("session".to_string());
+                    let Some(body) = body_iter.next() else {
+                        return;
+                    };
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(response.as_bytes());
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if started_at.elapsed() >= Duration::from_secs(5) {
+                        return;
+                    }
+                    thread::sleep(Duration::from_millis(20));
+                }
+                Err(_) => return,
+            }
+        }
+    });
+
+    (format!("http://{address}/session-state"), handle)
+}
+
+fn spawn_sidecar_ozon_close_server(
+    order: Arc<Mutex<Vec<String>>>,
+) -> (String, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind ozon close listener");
+    listener
+        .set_nonblocking(true)
+        .expect("set ozon close listener nonblocking");
+    let address = listener
+        .local_addr()
+        .expect("resolve ozon close listener address");
+
+    let handle = thread::spawn(move || {
+        let started_at = Instant::now();
+        loop {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let mut buffer = [0u8; 2048];
+                    let _ = stream.read(&mut buffer);
+                    order
+                        .lock()
+                        .expect("order lock")
+                        .push("close".to_string());
+                    let body = r#"{"success":true}"#;
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(response.as_bytes());
+                    return;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if started_at.elapsed() >= Duration::from_secs(5) {
+                        return;
+                    }
+                    thread::sleep(Duration::from_millis(20));
+                }
+                Err(_) => return,
+            }
+        }
+    });
+
+    (format!("http://{address}/close-ozon-session"), handle)
 }
 
 fn spawn_sidecar_search_server(
@@ -963,6 +1059,81 @@ fn run_task_batches_ozon_resolution_for_all_skus_before_1688_login_gate() {
     session_handle.join().expect("join session server");
     resolve_handle.join().expect("join ozon sku resolve server");
     search_handle.join().expect("join search server");
+    remove_if_exists(&excel_path);
+    remove_if_exists(&excel_path.with_file_name("result.xlsx"));
+}
+
+#[test]
+fn run_task_closes_ozon_session_after_1688_session_check_starts() {
+    let _guard = lock_env();
+    GLOBAL_RECOVERY_GATE.resume();
+    clear_mock_pipeline_env();
+    clear_sidecar_fixture_env();
+
+    let excel_path = make_temp_excel_path();
+    create_sku_mode_workbook(&excel_path, &[("sample-1", "SKU-CLOSE-ORDER-001")]);
+
+    let order = Arc::new(Mutex::new(Vec::<String>::new()));
+    let (candidate_image_url, image_server_handle) = spawn_image_server();
+    let (health_url, health_handle) = spawn_sidecar_health_server();
+    let (session_url, session_handle) = spawn_sidecar_recording_session_server(
+        vec![r#"{"success":true,"status":"ready"}"#],
+        Arc::clone(&order),
+    );
+    let (close_url, close_handle) = spawn_sidecar_ozon_close_server(Arc::clone(&order));
+    let (search_url, search_handle) = spawn_sidecar_search_server(
+        format!(
+            r#"{{"success":true,"data":[{{"title":"sample","price":"¥12.34","itemUrl":"https://detail.1688.com/offer/1.html","imageUrl":"{candidate_image_url}"}}]}}"#
+        ),
+        1,
+    );
+    let (resolve_url, resolve_handle) = spawn_sidecar_ozon_sku_resolve_server(
+        format!(
+            r#"{{"success":true,"data":{{"title":"Recovered title","imageUrl":"{candidate_image_url}"}}}}"#
+        ),
+        1,
+    );
+
+    std::env::set_var("SIDECAR_HEALTH_URL", &health_url);
+    std::env::set_var("SIDECAR_SESSION_URL", &session_url);
+    std::env::set_var("SIDECAR_OZON_CLOSE_URL", &close_url);
+    std::env::set_var("SIDECAR_SEARCH_URL", &search_url);
+    std::env::set_var("SIDECAR_OZON_RESOLVE_URL", &resolve_url);
+    set_mock_vlm_env(
+        r#"[
+          [1],
+          [1]
+        ]"#,
+    );
+    set_mock_search_image_plan_env(default_mock_search_image_plan_json());
+
+    let mut sink = CollectingSink::default();
+    let summary = run_task_with_sink(excel_path.to_string_lossy().as_ref(), &mut sink)
+        .expect("task should finish successfully");
+    assert_eq!(summary.status, "completed");
+
+    let recorded = order.lock().expect("order lock").clone();
+    let session_index = recorded
+        .iter()
+        .position(|value| value == "session")
+        .expect("session-state should be requested");
+    let close_index = recorded
+        .iter()
+        .position(|value| value == "close")
+        .expect("ozon close endpoint should be called");
+    assert!(
+        session_index < close_index,
+        "ozon session should stay open until the 1688 readiness check has started"
+    );
+
+    clear_mock_pipeline_env();
+    clear_sidecar_fixture_env();
+    image_server_handle.join().expect("join image server");
+    health_handle.join().expect("join health server");
+    session_handle.join().expect("join session server");
+    close_handle.join().expect("join close server");
+    search_handle.join().expect("join search server");
+    resolve_handle.join().expect("join resolve server");
     remove_if_exists(&excel_path);
     remove_if_exists(&excel_path.with_file_name("result.xlsx"));
 }

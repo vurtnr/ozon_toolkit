@@ -83,9 +83,63 @@ const OZON_SEARCH_INPUT_SELECTORS = [
   'input[aria-label*="искать" i]',
 ];
 
+type ReusableBootstrapPageLike = {
+  url: () => string;
+  isClosed?: () => boolean;
+};
+
 function isAllowedOzonHost(hostname: string): boolean {
   const normalized = (hostname || "").trim().toLowerCase();
   return normalized === "ozon.ru" || normalized.endsWith(".ozon.ru");
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+export function isReusableBootstrapPageUrl(url: string): boolean {
+  const normalized = (url || "").trim().toLowerCase();
+  return (
+    normalized.length === 0 ||
+    normalized === "about:blank" ||
+    normalized.startsWith("chrome://newtab") ||
+    normalized.startsWith("edge://newtab")
+  );
+}
+
+export function selectReusableOzonBootstrapPage<T extends ReusableBootstrapPageLike>(
+  pages: readonly T[],
+): T | null {
+  for (const page of pages) {
+    if (page.isClosed?.()) {
+      continue;
+    }
+
+    if (isReusableBootstrapPageUrl(page.url())) {
+      return page;
+    }
+  }
+
+  return null;
+}
+
+export function selectPreferredOzonSessionPage<T extends ReusableBootstrapPageLike>(
+  pages: readonly T[],
+): T | null {
+  for (const page of pages) {
+    if (page.isClosed?.()) {
+      continue;
+    }
+
+    try {
+      const parsed = new URL(page.url());
+      if (isAllowedOzonHost(parsed.hostname)) {
+        return page;
+      }
+    } catch {}
+  }
+
+  return selectReusableOzonBootstrapPage(pages);
 }
 
 export function buildCanonicalOzonProductUrl(value: string): string | null {
@@ -221,6 +275,37 @@ export async function collectOzonSnapshot(page: Page): Promise<OzonSnapshot> {
     OZON_BLOCKED_TEXT_HINTS,
     OZON_UNAVAILABLE_TEXT_HINTS,
   );
+}
+
+export function isTransientPageNavigationError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  const normalized = message.toLowerCase();
+
+  return (
+    normalized.includes("execution context was destroyed") ||
+    normalized.includes("cannot find context with specified id")
+  );
+}
+
+async function collectOzonSnapshotWithRetry(
+  page: Page,
+  timeoutMs: number = 2_000,
+): Promise<OzonSnapshot | null> {
+  const deadline = Date.now() + timeoutMs;
+
+  while (Date.now() < deadline) {
+    try {
+      return await collectOzonSnapshot(page);
+    } catch (error) {
+      if (!isTransientPageNavigationError(error)) {
+        throw error;
+      }
+    }
+
+    await delay(100);
+  }
+
+  return null;
 }
 
 function normalizeOzonSnapshotText(snapshot: OzonSnapshot): string {
@@ -413,6 +498,15 @@ async function ensureOzonSessionPage(
     } catch {}
   }
 
+  const reusablePage = selectPreferredOzonSessionPage(
+    await dependencies.browser.pages().catch(() => []),
+  );
+  if (reusablePage) {
+    await dependencies.applyBrowserEvasions(reusablePage);
+    dependencies.setSessionPage(reusablePage);
+    return reusablePage;
+  }
+
   const page = await dependencies.browser.newPage();
   await dependencies.applyBrowserEvasions(page);
   dependencies.setSessionPage(page);
@@ -434,7 +528,13 @@ async function warmOzonSession(
 
   const deadline = Date.now() + DEFAULT_LANDING_TIMEOUT_MS;
   while (Date.now() < deadline) {
-    const snapshot = await collectOzonSnapshot(page);
+    const snapshot = await collectOzonSnapshotWithRetry(page);
+    if (!snapshot) {
+      await dependencies.delay(
+        dependencies.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS,
+      );
+      continue;
+    }
     const landingState = classifyOzonLandingSnapshot(snapshot);
 
     if (landingState === "anti_bot_challenge") {
@@ -479,60 +579,109 @@ async function fillAndSubmitOzonSkuSearch(
     throw new Error("[OZON_RESOLVE_FAILED] 未找到 Ozon 顶部搜索框");
   }
 
+  const beforeUrl = page.url();
   await page.focus(selectedSelector);
-  await page.evaluate(
-    ({ selector, value }) => {
-      const input = document.querySelector<HTMLInputElement>(selector);
-      if (!input) {
-        return false;
+  try {
+    await page.click(selectedSelector, { clickCount: 3, delay: 60 });
+  } catch {
+    await page.focus(selectedSelector);
+  }
+
+  const modifier = process.platform === "darwin" ? "Meta" : "Control";
+  try {
+    await page.keyboard.down(modifier);
+    await page.keyboard.press("KeyA");
+    await page.keyboard.up(modifier);
+  } catch {}
+  await page.keyboard.press("Backspace").catch(() => undefined);
+  await page.keyboard.type(sku, { delay: 55 });
+  await delay(180);
+
+  const waitForSearchTransition = async (timeoutMs: number): Promise<boolean> => {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const currentUrl = page.url();
+      if (!isReusableBootstrapPageUrl(currentUrl) && currentUrl !== beforeUrl) {
+        return true;
       }
 
-      input.value = "";
-      input.dispatchEvent(new Event("input", { bubbles: true }));
-      input.dispatchEvent(new Event("change", { bubbles: true }));
-      input.value = value;
-      input.dispatchEvent(new Event("input", { bubbles: true }));
-      input.dispatchEvent(new Event("change", { bubbles: true }));
-      return true;
-    },
-    { selector: selectedSelector, value: sku },
-  );
+      const snapshot = await collectOzonSnapshotWithRetry(page);
+      if (snapshot) {
+        const state = classifyOzonSkuSearchSnapshot(snapshot);
+        if (
+          state === "resolved" ||
+          state === "not_found" ||
+          state === "anti_bot_challenge"
+        ) {
+          return true;
+        }
 
-  const submitted = await page.evaluate((selector: string) => {
+        if (!isReusableBootstrapPageUrl(snapshot.url) && snapshot.url !== beforeUrl) {
+          return true;
+        }
+      }
+
+      await delay(250);
+    }
+
+    return false;
+  };
+
+  await page.keyboard.press("Enter");
+  if (await waitForSearchTransition(6_000)) {
+    return;
+  }
+
+  const clicked = await page.evaluate((selector: string) => {
     const input = document.querySelector<HTMLInputElement>(selector);
     if (!input) {
       return false;
     }
 
+    const buttonCandidates = new Set<Element>();
     const form = input.closest("form");
-    if (form && typeof (form as HTMLFormElement).requestSubmit === "function") {
-      (form as HTMLFormElement).requestSubmit();
-      return true;
-    }
     if (form) {
-      form.dispatchEvent(
-        new Event("submit", { bubbles: true, cancelable: true }),
-      );
-      return true;
+      for (const candidate of form.querySelectorAll("button, [type='submit']")) {
+        buttonCandidates.add(candidate);
+      }
     }
 
-    const button = (
-      Array.from(document.querySelectorAll("button")).find((candidate) => {
-        const text = (candidate.textContent || "").toLowerCase();
-        return text.includes("искать") || text.includes("найти");
-      }) ?? null
-    ) as HTMLButtonElement | null;
-    if (button) {
-      button.click();
-      return true;
+    for (const candidate of document.querySelectorAll("button, [type='submit']")) {
+      buttonCandidates.add(candidate);
+    }
+
+    for (const candidate of buttonCandidates) {
+      if (!(candidate instanceof HTMLElement)) {
+        continue;
+      }
+
+      const rect = candidate.getBoundingClientRect();
+      if (rect.width <= 0 || rect.height <= 0) {
+        continue;
+      }
+
+      const text = (candidate.innerText || candidate.textContent || "")
+        .toLowerCase()
+        .replace(/\s+/g, " ")
+        .trim();
+      if (
+        text.includes("искать") ||
+        text.includes("найти") ||
+        text.includes("search")
+      ) {
+        candidate.click();
+        return true;
+      }
     }
 
     return false;
   }, selectedSelector);
 
-  if (!submitted) {
-    await page.keyboard.press("Enter");
+  if (clicked && await waitForSearchTransition(6_000)) {
+    return;
   }
+
+  throw new Error("[OZON_RESOLVE_FAILED] Ozon SKU 搜索未触发结果页跳转");
 }
 
 export async function resolveOzonProductViaSession(
@@ -556,7 +705,11 @@ export async function resolveOzonProductViaSession(
   let antiBotSeen = false;
 
   while (Date.now() < deadline) {
-    const snapshot = await collectOzonSnapshot(page);
+    const snapshot = await collectOzonSnapshotWithRetry(page);
+    if (!snapshot) {
+      await dependencies.delay(dependencies.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS);
+      continue;
+    }
     const snapshotState = classifyOzonSnapshot(snapshot);
 
     if (snapshotState === "anti_bot_challenge") {
@@ -619,7 +772,11 @@ export async function resolveOzonSkuViaSession(
   let antiBotSeen = false;
 
   while (Date.now() < deadline) {
-    const snapshot = await collectOzonSnapshot(page);
+    const snapshot = await collectOzonSnapshotWithRetry(page);
+    if (!snapshot) {
+      await dependencies.delay(dependencies.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS);
+      continue;
+    }
     const snapshotState = classifyOzonSkuSearchSnapshot(snapshot);
 
     if (snapshotState === "anti_bot_challenge") {

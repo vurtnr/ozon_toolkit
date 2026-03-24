@@ -1,6 +1,9 @@
 import path from "node:path";
 import os from "node:os";
 import type { Server } from "node:http";
+import { spawn, type ChildProcess } from "node:child_process";
+import { readFile, readlink, rm } from "node:fs/promises";
+import { createServer } from "node:net";
 import express, { type Request, type Response } from "express";
 import puppeteer, { type Browser, type Page } from "puppeteer";
 import {
@@ -62,6 +65,7 @@ type RuntimeResources = {
   page: ClosablePage | null;
   ozonPage: ClosablePage | null;
   browser: ClosableBrowser | null;
+  ozonBrowser: ClosableBrowser | null;
   server: ClosableServer | null;
 };
 
@@ -85,6 +89,12 @@ const ANTI_BOT_TEXT_HINTS = [
   "访问验证",
   "网络环境存在异常",
   "请先通过验证",
+];
+const PROFILE_RUNTIME_ENTRY_NAMES = [
+  "DevToolsActivePort",
+  "SingletonLock",
+  "SingletonCookie",
+  "SingletonSocket",
 ];
 
 export function browserUserAgentForPlatform(
@@ -128,10 +138,12 @@ function buildChromeArgs(
 
 let globalBrowser: Browser | null = null;
 let globalHomePage: Page | null = null;
+let globalOzonBrowser: Browser | null = null;
 let globalOzonPage: Page | null = null;
 let chromeExecutablePath: string | null = null;
 let httpServer: Server | null = null;
 let shutdownInFlight: Promise<void> | null = null;
+let ozonBrowserChild: ChildProcess | null = null;
 
 export function createSharedAsyncRunner<T>(
   factory: () => Promise<T>,
@@ -168,6 +180,209 @@ function resolveProfileDir(): string {
   }
 
   return path.join(os.tmpdir(), "desktop-app-sidecar", "1688_profile");
+}
+
+function resolveOzonProfileDir(): string {
+  const baseProfileDir = resolveProfileDir();
+  const baseName = path.basename(baseProfileDir);
+  if (baseName === "1688_profile") {
+    return path.join(path.dirname(baseProfileDir), "ozon_profile");
+  }
+  return `${baseProfileDir}-ozon`;
+}
+
+export function buildOzonChromeArgs(
+  profileDir: string,
+  remoteDebuggingPort: number,
+  startUrl: string = "about:blank",
+): string[] {
+  return [
+    `--user-data-dir=${profileDir}`,
+    `--remote-debugging-port=${remoteDebuggingPort}`,
+    "--start-maximized",
+    "--no-first-run",
+    "--no-default-browser-check",
+    startUrl,
+  ];
+}
+
+export function parseChromeDevToolsPort(content: string): number | null {
+  const firstLine = content.split(/\r?\n/, 1)[0]?.trim() || "";
+  if (!/^\d+$/.test(firstLine)) {
+    return null;
+  }
+
+  const port = Number.parseInt(firstLine, 10);
+  return Number.isInteger(port) && port > 0 ? port : null;
+}
+
+export function extractChromeSingletonLockPid(target: string): number | null {
+  const match = target.trim().match(/anonymous-(\d+)$/);
+  if (!match) {
+    return null;
+  }
+
+  const pid = Number.parseInt(match[1], 10);
+  return Number.isInteger(pid) && pid > 0 ? pid : null;
+}
+
+async function readChromeDevToolsPort(profileDir: string): Promise<number | null> {
+  try {
+    const content = await readFile(
+      path.join(profileDir, "DevToolsActivePort"),
+      "utf8",
+    );
+    return parseChromeDevToolsPort(content);
+  } catch {
+    return null;
+  }
+}
+
+function isPidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function terminateProcess(pid: number): Promise<void> {
+  try {
+    process.kill(pid, "SIGTERM");
+  } catch {
+    return;
+  }
+
+  const deadline = Date.now() + 3_000;
+  while (Date.now() < deadline) {
+    if (!isPidAlive(pid)) {
+      return;
+    }
+    await delay(150);
+  }
+
+  try {
+    process.kill(pid, "SIGKILL");
+  } catch {}
+}
+
+async function connectToExistingProfileBrowser(
+  profileDir: string,
+): Promise<Browser | null> {
+  const devtoolsPort = await readChromeDevToolsPort(profileDir);
+  if (!devtoolsPort) {
+    return null;
+  }
+
+  try {
+    return await puppeteer.connect({
+      browserURL: `http://127.0.0.1:${devtoolsPort}`,
+      defaultViewport: null,
+    });
+  } catch {
+    return null;
+  }
+}
+
+async function findAvailableTcpPort(): Promise<number> {
+  return await new Promise<number>((resolve, reject) => {
+    const server = createServer();
+    server.unref();
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      const address = server.address();
+      const port =
+        typeof address === "object" && address ? address.port : 0;
+      server.close((error) => {
+        if (error) {
+          reject(error);
+          return;
+        }
+        resolve(port);
+      });
+    });
+  });
+}
+
+async function connectToBrowserByPort(port: number): Promise<Browser | null> {
+  try {
+    return await puppeteer.connect({
+      browserURL: `http://127.0.0.1:${port}`,
+      defaultViewport: null,
+    });
+  } catch {
+    return null;
+  }
+}
+
+async function waitForBrowserConnectionByPort(
+  port: number,
+  timeoutMs: number = 20_000,
+): Promise<Browser> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const browser = await connectToBrowserByPort(port);
+    if (browser) {
+      return browser;
+    }
+    await delay(200);
+  }
+
+  throw new Error("[OZON_BROWSER_CONNECT_FAILED] 无法连接到 Ozon 浏览器调试端口");
+}
+
+async function cleanupStaleProfileRuntime(profileDir: string): Promise<void> {
+  try {
+    const singletonTarget = await readlink(path.join(profileDir, "SingletonLock"));
+    const pid = extractChromeSingletonLockPid(singletonTarget);
+    if (pid) {
+      await terminateProcess(pid);
+    }
+  } catch {}
+
+  await Promise.all(
+    PROFILE_RUNTIME_ENTRY_NAMES.map((entry) =>
+      rm(path.join(profileDir, entry), {
+        force: true,
+        recursive: true,
+      }).catch(() => undefined),
+    ),
+  );
+}
+
+async function launchOzonBrowserProcess(
+  executablePath: string,
+  profileDir: string,
+): Promise<Browser> {
+  await cleanupStaleProfileRuntime(profileDir);
+  const remoteDebuggingPort = await findAvailableTcpPort();
+  const child = spawn(
+    executablePath,
+    buildOzonChromeArgs(profileDir, remoteDebuggingPort),
+    {
+      stdio: "ignore",
+    },
+  );
+  ozonBrowserChild = child;
+
+  try {
+    const browser = await waitForBrowserConnectionByPort(remoteDebuggingPort);
+    child.once("exit", () => {
+      if (ozonBrowserChild?.pid === child.pid) {
+        ozonBrowserChild = null;
+      }
+    });
+    return browser;
+  } catch (error) {
+    if (child.pid) {
+      await terminateProcess(child.pid).catch(() => undefined);
+    }
+    if (ozonBrowserChild?.pid === child.pid) {
+      ozonBrowserChild = null;
+    }
+    throw error;
+  }
 }
 
 function normalizeVisibleText(value: string): string {
@@ -369,69 +584,41 @@ async function ensure1688SessionReady(page: Page): Promise<void> {
 }
 
 async function resolveOzonProductViaBrowser(productUrl: string): Promise<OzonResolvePayload> {
-  const activeHomePage = await ensureBrowserAndPageAlive();
-  const restoreHomePageFocus = async () => {
-    try {
-      if (activeHomePage && !activeHomePage.isClosed()) {
-        await activeHomePage.bringToFront();
-      }
-    } catch {}
-  };
-
+  await ensureOzonBrowserAlive();
   try {
-    const payload = await resolveOzonProductViaSession(
+    return await resolveOzonProductViaSession(
       {
-        browser: globalBrowser as Browser,
+        browser: globalOzonBrowser as Browser,
         getSessionPage: () => globalOzonPage,
         setSessionPage: (page) => {
           globalOzonPage = page;
         },
-        applyBrowserEvasions,
+        applyBrowserEvasions: async () => undefined,
         delay,
       },
       productUrl,
     );
-    await restoreHomePageFocus();
-    return payload;
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    if (!message.includes("[ANTI_BOT_CHALLENGE]")) {
-      await restoreHomePageFocus();
-    }
     throw error;
   }
 }
 
 async function resolveOzonSkuViaBrowser(sku: string): Promise<OzonResolvePayload> {
-  const activeHomePage = await ensureBrowserAndPageAlive();
-  const restoreHomePageFocus = async () => {
-    try {
-      if (activeHomePage && !activeHomePage.isClosed()) {
-        await activeHomePage.bringToFront();
-      }
-    } catch {}
-  };
-
+  await ensureOzonBrowserAlive();
   try {
-    const payload = await resolveOzonSkuViaSession(
+    return await resolveOzonSkuViaSession(
       {
-        browser: globalBrowser as Browser,
+        browser: globalOzonBrowser as Browser,
         getSessionPage: () => globalOzonPage,
         setSessionPage: (page) => {
           globalOzonPage = page;
         },
-        applyBrowserEvasions,
+        applyBrowserEvasions: async () => undefined,
         delay,
       },
       sku,
     );
-    await restoreHomePageFocus();
-    return payload;
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    if (!message.includes("[ANTI_BOT_CHALLENGE]")) {
-      await restoreHomePageFocus();
-    }
     throw error;
   }
 }
@@ -441,6 +628,11 @@ async function closeOzonSessionPage(): Promise<void> {
     await globalOzonPage.close().catch(() => undefined);
   }
   globalOzonPage = null;
+  if (globalOzonBrowser && globalOzonBrowser.isConnected()) {
+    await globalOzonBrowser.close().catch(() => undefined);
+  }
+  globalOzonBrowser = null;
+  ozonBrowserChild = null;
 }
 
 async function applyBrowserEvasions(page: Page): Promise<void> {
@@ -487,24 +679,74 @@ async function applyBrowserEvasions(page: Page): Promise<void> {
   }, navigatorPlatform);
 }
 
-async function ensureBrowserAndPageAliveInner(): Promise<Page> {
+async function ensureBrowserAliveInner(): Promise<Browser> {
   if (!globalBrowser || !globalBrowser.isConnected()) {
     if (globalBrowser) {
       await globalBrowser.close().catch(() => undefined);
     }
 
     const executablePath = await resolveChromePath();
-    globalBrowser = await puppeteer.launch({
-      headless: false,
-      executablePath,
-      defaultViewport: null,
-      userDataDir: resolveProfileDir(),
-      ignoreDefaultArgs: ["--enable-automation"],
-      args: buildChromeArgs(),
-    });
+    const profileDir = resolveProfileDir();
+    const launchBrowser = () =>
+      puppeteer.launch({
+        headless: false,
+        executablePath,
+        defaultViewport: null,
+        userDataDir: profileDir,
+        ignoreDefaultArgs: ["--enable-automation"],
+        args: buildChromeArgs(),
+      });
+
+    globalBrowser =
+      (await connectToExistingProfileBrowser(profileDir)) ??
+      null;
+
+    if (!globalBrowser) {
+      try {
+        globalBrowser = await launchBrowser();
+      } catch (error) {
+        const recovered = await connectToExistingProfileBrowser(profileDir);
+        if (recovered) {
+          globalBrowser = recovered;
+        } else {
+          const message = error instanceof Error ? error.message : String(error);
+          const likelyProfileConflict =
+            /existing browser session|Failed to launch the browser process/i.test(message);
+          if (!likelyProfileConflict) {
+            throw error;
+          }
+
+          await cleanupStaleProfileRuntime(profileDir);
+          globalBrowser = await launchBrowser();
+        }
+      }
+    }
     globalHomePage = null;
     globalOzonPage = null;
   }
+
+  return globalBrowser;
+}
+
+async function ensureOzonBrowserAliveInner(): Promise<Browser> {
+  if (!globalOzonBrowser || !globalOzonBrowser.isConnected()) {
+    if (globalOzonBrowser) {
+      await globalOzonBrowser.close().catch(() => undefined);
+    }
+
+    const executablePath = await resolveChromePath();
+    const profileDir = resolveOzonProfileDir();
+    globalOzonBrowser =
+      (await connectToExistingProfileBrowser(profileDir)) ??
+      (await launchOzonBrowserProcess(executablePath, profileDir));
+    globalOzonPage = null;
+  }
+
+  return globalOzonBrowser;
+}
+
+async function ensureBrowserAndPageAliveInner(): Promise<Page> {
+  await ensureBrowserAliveInner();
 
   let needNewPage = false;
   if (!globalHomePage || globalHomePage.isClosed()) {
@@ -534,6 +776,14 @@ async function ensureBrowserAndPageAliveInner(): Promise<Page> {
   return ensurePageReadyForSessionCheck(globalHomePage);
 }
 
+const ensureBrowserAlive = createSharedAsyncRunner(
+  ensureBrowserAliveInner,
+);
+
+const ensureOzonBrowserAlive = createSharedAsyncRunner(
+  ensureOzonBrowserAliveInner,
+);
+
 const ensureBrowserAndPageAlive = createSharedAsyncRunner(
   ensureBrowserAndPageAliveInner,
 );
@@ -547,6 +797,10 @@ export async function shutdownRuntimeResources(
 
   if (resources.ozonPage && !resources.ozonPage.isClosed()) {
     await resources.ozonPage.close().catch(() => undefined);
+  }
+
+  if (resources.ozonBrowser && resources.ozonBrowser.isConnected()) {
+    await resources.ozonBrowser.close().catch(() => undefined);
   }
 
   if (resources.browser && resources.browser.isConnected()) {
@@ -570,12 +824,15 @@ async function shutdownSidecarProcess(exitCode?: number): Promise<void> {
       page: globalHomePage,
       ozonPage: globalOzonPage,
       browser: globalBrowser,
+      ozonBrowser: globalOzonBrowser,
       server: httpServer,
     };
     globalHomePage = null;
     globalOzonPage = null;
     globalBrowser = null;
+    globalOzonBrowser = null;
     httpServer = null;
+    ozonBrowserChild = null;
 
     await shutdownRuntimeResources(resources);
   })();
