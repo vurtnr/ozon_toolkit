@@ -16,9 +16,26 @@ fn candidate(price: &str, item_url: &str) -> Candidate {
     Candidate {
         title: format!("title-{item_url}"),
         price: price.to_string(),
+        sales: "".to_string(),
         item_url: item_url.to_string(),
         image_url: format!("https://img.example/{item_url}.jpg"),
         cos_score_permille: 0,
+    }
+}
+
+fn candidate_with_rank(
+    price: &str,
+    sales: &str,
+    item_url: &str,
+    cos_score_permille: u16,
+) -> Candidate {
+    Candidate {
+        title: format!("title-{item_url}"),
+        price: price.to_string(),
+        sales: sales.to_string(),
+        item_url: item_url.to_string(),
+        image_url: format!("https://img.example/{item_url}.jpg"),
+        cos_score_permille,
     }
 }
 
@@ -159,7 +176,7 @@ fn orchestrator_uses_fallback_image_when_primary_returns_no_match() {
 }
 
 #[test]
-fn orchestrator_uses_fallback_image_when_primary_matches_without_price() {
+fn orchestrator_keeps_primary_match_when_primary_matches_without_price() {
     let fetcher = RecordingFetcher::with_responses(vec![
         Ok(vec![candidate("面议", "first-pass-no-price")]),
         Ok(vec![candidate("¥6.60", "second-pass")]),
@@ -184,16 +201,14 @@ fn orchestrator_uses_fallback_image_when_primary_matches_without_price() {
 
     assert_eq!(
         fetcher.recorded_calls(),
-        vec![
-            "/tmp/search_primary.png".to_string(),
-            "/tmp/search_fallback.png".to_string(),
-        ]
+        vec!["/tmp/search_primary.png".to_string()]
     );
     assert_eq!(
         result.summary,
-        MatchSummary::Cheapest(candidate("¥6.60", "second-pass"))
+        MatchSummary::Cheapest(candidate("面议", "first-pass-no-price"))
     );
     assert_eq!(result.no_match_reason, None);
+    assert!(!result.used_fallback_image);
 }
 
 #[test]
@@ -260,10 +275,14 @@ fn orchestrator_keeps_price_unavailable_when_fallback_finds_no_match() {
     .expect("orchestration should succeed");
 
     assert_eq!(
-        result.summary,
-        MatchSummary::MatchedButPriceUnavailable { total_matches: 1 }
+        fetcher.recorded_calls(),
+        vec!["/tmp/search_primary.png".to_string()]
     );
-    assert!(result.used_fallback_image);
+    assert_eq!(
+        result.summary,
+        MatchSummary::Cheapest(candidate("面议", "first-pass-no-price"))
+    );
+    assert!(!result.used_fallback_image);
     assert_eq!(result.no_match_reason, None);
 }
 
@@ -324,22 +343,24 @@ fn verify_single_candidate_returns_true_when_slot_one_matches() {
 }
 
 #[test]
-fn pick_cheapest_after_final_review_returns_cheapest_confirmed_candidate() {
-    let vlm = ScriptedVlm::with_replies(vec![Ok(vec![1])]);
+fn pick_cheapest_after_final_review_prefers_highest_similarity_then_highest_sales() {
+    let vlm = ScriptedVlm::with_replies(vec![Ok(vec![1, 2])]);
     let result = pick_cheapest_after_final_review(
         &vlm,
         "data:image/png;base64,processed-search",
         Some("data:image/jpeg;base64,source"),
         vec![
-            candidate("¥8.80", "candidate-b"),
-            candidate("¥6.60", "candidate-a"),
+            candidate_with_rank("¥8.80", "月销80", "candidate-b", 920),
+            candidate_with_rank("¥16.60", "月销900", "candidate-a", 980),
         ],
         Some("sample ozon name"),
     );
 
     assert_eq!(
         result,
-        MatchSummary::Cheapest(candidate("¥6.60", "candidate-a"))
+        MatchSummary::Cheapest(candidate_with_rank(
+            "¥16.60", "月销900", "candidate-a", 980,
+        ))
     );
 }
 
@@ -365,7 +386,7 @@ fn pick_cheapest_after_final_review_batches_strict_reviews() {
 
     assert_eq!(
         result,
-        MatchSummary::Cheapest(candidate("¥18.20", "candidate-3"))
+        MatchSummary::Cheapest(candidate("¥6.20", "candidate-6"))
     );
     assert_eq!(
         vlm.recorded_calls(),
@@ -387,28 +408,33 @@ fn pick_cheapest_after_final_review_batches_strict_reviews() {
 }
 
 #[test]
-fn pick_cheapest_after_final_review_prefers_first_matching_price_batch_while_still_finishing_review_wave() {
+fn pick_cheapest_after_final_review_prefers_best_confirmed_match_while_still_finishing_review_wave() {
     let vlm = ScriptedVlm::with_replies(vec![Ok(vec![2]), Ok(vec![1])]);
     let result = pick_cheapest_after_final_review(
         &vlm,
         "data:image/png;base64,processed-search",
         Some("data:image/jpeg;base64,source"),
         vec![
-            candidate("¥12.80", "candidate-1"),
-            candidate("¥15.90", "candidate-2"),
-            candidate("¥18.20", "candidate-3"),
-            candidate("¥9.60", "candidate-4"),
-            candidate("¥7.80", "candidate-5"),
-            candidate("¥6.20", "candidate-6"),
-            candidate("¥20.10", "candidate-7"),
-            candidate("¥22.40", "candidate-8"),
+            candidate_with_rank("¥12.80", "月销11", "candidate-1", 910),
+            candidate_with_rank("¥15.90", "月销13", "candidate-2", 900),
+            candidate_with_rank("¥18.20", "月销17", "candidate-3", 890),
+            candidate_with_rank("¥9.60", "月销19", "candidate-4", 880),
+            candidate_with_rank("¥7.80", "月销50", "candidate-5", 990),
+            candidate_with_rank("¥6.20", "月销9", "candidate-6", 700),
+            candidate_with_rank("¥20.10", "月销8", "candidate-7", 680),
+            candidate_with_rank("¥22.40", "月销7", "candidate-8", 670),
         ],
         Some("sample ozon name"),
     );
 
     assert_eq!(
         result,
-        MatchSummary::Cheapest(candidate("¥7.80", "candidate-5"))
+        MatchSummary::Cheapest(candidate_with_rank(
+            "¥7.80",
+            "月销50",
+            "candidate-5",
+            990,
+        ))
     );
     assert_eq!(
         vlm.recorded_calls(),
@@ -434,20 +460,25 @@ fn pick_cheapest_after_final_review_prefers_first_matching_price_batch_while_sti
 }
 
 #[test]
-fn process_candidates_returns_matched_without_price_when_only_unpriced_matches_exist() {
+fn process_candidates_returns_best_match_even_when_only_unpriced_matches_exist() {
     let vlm = ScriptedVlm::with_replies(vec![Ok(vec![1]), Ok(vec![1])]);
     let result = process_candidates(
         &vlm,
         "data:image/png;base64,processed-search",
         Some("data:image/jpeg;base64,source"),
-        vec![candidate("面议", "candidate-a")],
+        vec![candidate_with_rank("面议", "月销12", "candidate-a", 860)],
         Some("sample ozon name"),
     )
     .expect("candidate processing should succeed");
 
     assert_eq!(
         result,
-        MatchSummary::MatchedButPriceUnavailable { total_matches: 1 }
+        MatchSummary::Cheapest(candidate_with_rank(
+            "面议",
+            "月销12",
+            "candidate-a",
+            860,
+        ))
     );
 }
 

@@ -9,6 +9,7 @@ use crate::core::ozon_product::OzonProductResolution;
 
 const CACHE_ENTRY_META_FILE: &str = "meta.json";
 const CACHE_ENTRY_IMAGE_FILE: &str = "source.png";
+const MIN_OZON_SOURCE_IMAGE_DIMENSION: u32 = 120;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OzonSourceCacheLookup {
@@ -96,6 +97,9 @@ impl OzonSourceCache {
                 "ozon cache image is empty".to_string(),
             ));
         }
+        if let Err(error) = validate_ozon_source_image_bytes(&image_bytes) {
+            return Ok(OzonSourceCacheLookup::Corrupted(error));
+        }
 
         Ok(OzonSourceCacheLookup::Hit(OzonProductResolution {
             title: metadata.title,
@@ -169,11 +173,92 @@ fn cache_key_for_source(normalized_source_key: &str) -> String {
 }
 
 fn normalize_cache_image_bytes(bytes: &[u8]) -> Result<Vec<u8>, String> {
-    let dynamic = image::load_from_memory(bytes)
-        .map_err(|e| format!("decode ozon cache image failed: {e}"))?;
+    let dynamic = decode_ozon_source_image(bytes)?;
+    validate_decoded_ozon_source_image(&dynamic)?;
     let mut cursor = Cursor::new(Vec::new());
     dynamic
         .write_to(&mut cursor, ImageFormat::Png)
         .map_err(|e| format!("encode ozon cache image failed: {e}"))?;
     Ok(cursor.into_inner())
+}
+
+pub fn validate_ozon_source_image_bytes(bytes: &[u8]) -> Result<(), String> {
+    let dynamic = decode_ozon_source_image(bytes)?;
+    validate_decoded_ozon_source_image(&dynamic)
+}
+
+fn decode_ozon_source_image(bytes: &[u8]) -> Result<image::DynamicImage, String> {
+    image::load_from_memory(bytes).map_err(|e| format!("decode ozon source image failed: {e}"))
+}
+
+fn validate_decoded_ozon_source_image(dynamic: &image::DynamicImage) -> Result<(), String> {
+    let width = dynamic.width();
+    let height = dynamic.height();
+    if width < MIN_OZON_SOURCE_IMAGE_DIMENSION || height < MIN_OZON_SOURCE_IMAGE_DIMENSION {
+        return Err(format!(
+            "ozon source image too small: {}x{}",
+            width, height
+        ));
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use image::{DynamicImage, ImageBuffer, Rgba};
+
+    fn build_png(width: u32, height: u32) -> Vec<u8> {
+        let image = DynamicImage::ImageRgba8(ImageBuffer::from_pixel(
+            width,
+            height,
+            Rgba([12, 34, 56, 255]),
+        ));
+        let mut cursor = Cursor::new(Vec::new());
+        image
+            .write_to(&mut cursor, ImageFormat::Png)
+            .expect("png should encode");
+        cursor.into_inner()
+    }
+
+    #[test]
+    fn lookup_marks_tiny_cached_image_as_corrupted() {
+        let cache_root = std::env::temp_dir().join(format!(
+            "ozon-cache-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time should move forward")
+                .as_nanos()
+        ));
+        let cache = OzonSourceCache::new(cache_root.clone());
+        let source_key = "https://www.ozon.ru/product/3570411009/";
+        let entry_dir = cache
+            .entry_dir(source_key)
+            .expect("cache entry dir should resolve");
+        std::fs::create_dir_all(&entry_dir).expect("cache entry dir should exist");
+        std::fs::write(
+            entry_dir.join(CACHE_ENTRY_META_FILE),
+            serde_json::to_vec_pretty(&OzonCacheMetadata {
+                source_key: normalize_cache_source_key(source_key)
+                    .expect("source key should normalize"),
+                title: "Tiny QR".to_string(),
+                image_url: "https://ir.ozone.ru/s3/multimedia-1-7/wc800/8908721791.jpg"
+                    .to_string(),
+            })
+            .expect("metadata should serialize"),
+        )
+        .expect("metadata should write");
+        std::fs::write(entry_dir.join(CACHE_ENTRY_IMAGE_FILE), build_png(68, 68))
+            .expect("image should write");
+
+        let lookup = cache.lookup(source_key).expect("lookup should succeed");
+
+        let _ = std::fs::remove_dir_all(cache_root);
+
+        assert!(
+            matches!(lookup, OzonSourceCacheLookup::Corrupted(_)),
+            "tiny cached images should be invalidated instead of reused"
+        );
+    }
 }

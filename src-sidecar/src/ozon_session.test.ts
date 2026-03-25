@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import * as ozonSession from "./ozon_session";
 import {
   buildCanonicalOzonProductUrl,
   classifyOzonSkuSearchSnapshot,
@@ -7,8 +8,12 @@ import {
   isTransientPageNavigationError,
   isReusableBootstrapPageUrl,
   isOzonHomeUrl,
+  scoreOzonImageCaptureCandidate,
+  selectFirstRecommendedProductHref,
   selectPreferredOzonSessionPage,
   selectReusableOzonBootstrapPage,
+  type OzonImageCaptureCandidateMetrics,
+  type OzonRecommendedProductCandidate,
   type OzonSnapshot,
 } from "./ozon_session";
 
@@ -204,6 +209,64 @@ describe("classifyOzonSnapshot", () => {
 
     expect(classifyOzonSnapshot(snapshot)).toBe("incomplete");
   });
+
+  test("treats detail not-found pages as unavailable even if recommendation cards expose images", () => {
+    const snapshot: OzonSnapshot = {
+      url: "https://www.ozon.ru/product/3570411009/",
+      documentTitle: "Такой страницы не существует",
+      title: "Комплект гастроемкостей",
+      imageUrl: "https://ir.ozone.ru/s3/multimedia-1-7/wc800/8908721791.jpg",
+      bodyText: "Такой страницы не существует Вернуться на главную Комплект гастроемкостей",
+      hasAntiBotChallenge: false,
+      isUnavailable: false,
+    };
+
+    expect(classifyOzonSnapshot(snapshot)).toBe("unavailable");
+  });
+});
+
+describe("shouldAttemptRecommendedProductHop", () => {
+  test("disables recommended-product hop on explicit not-found detail pages", () => {
+    const snapshot: OzonSnapshot = {
+      url: "https://www.ozon.ru/product/3570411009/",
+      documentTitle: "Такой страницы не существует",
+      title: "Комплект гастроемкостей",
+      imageUrl: "https://ir.ozone.ru/s3/multimedia-1-7/wc800/8908721791.jpg",
+      bodyText: "Такой страницы не существует Вернуться на главную Комплект гастроемкостей",
+      hasAntiBotChallenge: false,
+      isUnavailable: false,
+    };
+
+    const hopGuard = (
+      ozonSession as {
+        shouldAttemptRecommendedProductHop?: (snapshot: OzonSnapshot) => boolean;
+      }
+    ).shouldAttemptRecommendedProductHop;
+
+    expect(typeof hopGuard).toBe("function");
+    expect(hopGuard?.(snapshot)).toBe(false);
+  });
+
+  test("keeps recommended-product hop for generic unavailable product pages", () => {
+    const snapshot: OzonSnapshot = {
+      url: "https://www.ozon.ru/product/3552213000/",
+      documentTitle: "Товар закончился",
+      title: "Товар закончился",
+      imageUrl: null,
+      bodyText: "Такого товара нет",
+      hasAntiBotChallenge: false,
+      isUnavailable: true,
+    };
+
+    const hopGuard = (
+      ozonSession as {
+        shouldAttemptRecommendedProductHop?: (snapshot: OzonSnapshot) => boolean;
+      }
+    ).shouldAttemptRecommendedProductHop;
+
+    expect(typeof hopGuard).toBe("function");
+    expect(hopGuard?.(snapshot)).toBe(true);
+  });
 });
 
 describe("classifyOzonSkuSearchSnapshot", () => {
@@ -281,5 +344,142 @@ describe("isOzonHomeUrl", () => {
   test("does not treat non-ozon URLs as home URLs", () => {
     expect(isOzonHomeUrl("https://www.google.com/")).toBe(false);
     expect(isOzonHomeUrl("about:blank")).toBe(false);
+  });
+});
+
+describe("scoreOzonImageCaptureCandidate", () => {
+  const baseCandidate: OzonImageCaptureCandidateMetrics = {
+    currentSrc: "https://ir.ozone.ru/s3/multimedia-1-z/wc800/9119999447.jpg",
+    naturalWidth: 900,
+    naturalHeight: 900,
+    rectWidth: 360,
+    rectHeight: 360,
+    rectTop: 120,
+    rectBottom: 480,
+    viewportHeight: 900,
+  };
+
+  test("rejects visible qr-like images when they do not match the expected product image url", () => {
+    expect(
+      scoreOzonImageCaptureCandidate(
+        {
+          ...baseCandidate,
+          currentSrc: "https://cdn.example.com/share/qr-code.png",
+        },
+        "https://ir.ozone.ru/s3/multimedia-1-z/wc800/9119999447.jpg",
+      ),
+    ).toBe(Number.NEGATIVE_INFINITY);
+  });
+
+  test("accepts the product image when the filename matches even if the size segment differs", () => {
+    expect(
+      scoreOzonImageCaptureCandidate(
+        {
+          ...baseCandidate,
+          currentSrc: "https://ir.ozone.ru/s3/multimedia-1-z/wc100/9119999447.jpg",
+        },
+        "https://ir.ozone.ru/s3/multimedia-1-z/wc800/9119999447.jpg",
+      ),
+    ).toBeGreaterThan(0);
+  });
+});
+
+describe("selectFirstRecommendedProductHref", () => {
+  test("chooses the first product from the earliest valid multi-product container", () => {
+    const currentUrl = "https://www.ozon.ru/product/1111111111/";
+    const candidates: OzonRecommendedProductCandidate[] = [
+      {
+        href: "https://www.ozon.ru/product/2222222222/",
+        top: 180,
+        left: 40,
+        containerKey: "sidebar",
+        containerTop: 160,
+        containerLeft: 20,
+        containerArea: 30_000,
+        containerProductCount: 1,
+      },
+      {
+        href: "https://www.ozon.ru/product/3333333333/",
+        top: 220,
+        left: 120,
+        containerKey: "main-grid",
+        containerTop: 200,
+        containerLeft: 100,
+        containerArea: 280_000,
+        containerProductCount: 4,
+      },
+      {
+        href: "https://www.ozon.ru/product/4444444444/",
+        top: 220,
+        left: 300,
+        containerKey: "main-grid",
+        containerTop: 200,
+        containerLeft: 100,
+        containerArea: 280_000,
+        containerProductCount: 4,
+      },
+    ];
+
+    expect(selectFirstRecommendedProductHref(candidates, currentUrl)).toBe(
+      "https://www.ozon.ru/product/3333333333/",
+    );
+  });
+
+  test("excludes the current product url and still picks the first remaining product", () => {
+    const currentUrl = "https://www.ozon.ru/product/3333333333/";
+    const candidates: OzonRecommendedProductCandidate[] = [
+      {
+        href: "https://www.ozon.ru/product/3333333333/?from_sku=3333333333",
+        top: 220,
+        left: 120,
+        containerKey: "main-grid",
+        containerTop: 200,
+        containerLeft: 100,
+        containerArea: 280_000,
+        containerProductCount: 3,
+      },
+      {
+        href: "https://www.ozon.ru/product/4444444444/",
+        top: 220,
+        left: 300,
+        containerKey: "main-grid",
+        containerTop: 200,
+        containerLeft: 100,
+        containerArea: 280_000,
+        containerProductCount: 3,
+      },
+    ];
+
+    expect(selectFirstRecommendedProductHref(candidates, currentUrl)).toBe(
+      "https://www.ozon.ru/product/4444444444/",
+    );
+  });
+
+  test("returns null when only single-item containers exist", () => {
+    const currentUrl = "https://www.ozon.ru/product/1111111111/";
+    const candidates: OzonRecommendedProductCandidate[] = [
+      {
+        href: "https://www.ozon.ru/product/2222222222/",
+        top: 180,
+        left: 40,
+        containerKey: "sidebar",
+        containerTop: 160,
+        containerLeft: 20,
+        containerArea: 30_000,
+        containerProductCount: 1,
+      },
+      {
+        href: "https://www.ozon.ru/product/3333333333/",
+        top: 420,
+        left: 60,
+        containerKey: "footer",
+        containerTop: 400,
+        containerLeft: 20,
+        containerArea: 40_000,
+        containerProductCount: 1,
+      },
+    ];
+
+    expect(selectFirstRecommendedProductHref(candidates, currentUrl)).toBeNull();
   });
 });

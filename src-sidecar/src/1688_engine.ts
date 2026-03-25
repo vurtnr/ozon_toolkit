@@ -51,6 +51,7 @@ interface SearchResultRecord {
   priceMajor: string;
   priceMinor: string;
   legacyPriceText: string;
+  cardText: string;
   sales: string;
   moq: string;
   shopName: string;
@@ -433,6 +434,24 @@ export function assemblePriceFromFragments(
   return extractNumeric(fallbackText);
 }
 
+export function extractSalesText(cardText: string): string {
+  const normalized = (cardText || "").replace(/\s+/g, " ").trim();
+  if (!normalized) return "";
+
+  const patterns = [
+    /(?:月销|销量|累计成交|成交|已售|售出)\s*[:：]?\s*([0-9]+(?:\.[0-9]+)?(?:万|千)?\+?)/i,
+    /([0-9]+(?:\.[0-9]+)?(?:万|千)?\+?)\s*(?:人付款|人已付款|笔成交|件成交|笔已售|件已售)/i,
+  ];
+
+  for (const pattern of patterns) {
+    const matched = normalized.match(pattern);
+    const value = matched?.[1]?.trim();
+    if (value) return value;
+  }
+
+  return "";
+}
+
 export type ResultPageRecallOptions = {
   forceFullCrop: boolean;
   scrapeCurrentPage: () => Promise<SearchResult[]>;
@@ -654,6 +673,7 @@ export async function search1688ByImage(
       const parsedItems = cards.map((card) => {
         const titleEl = card.querySelector('div[class*="titleText"]');
         const title = titleEl ? titleEl.innerText.trim() : "";
+        const cardText = (card.textContent || "").replace(/\s+/g, " ").trim();
         const priceContainer = card.querySelector('div[class*="priceItem"]');
         let priceMajor = "";
         let priceMinor = "";
@@ -691,7 +711,7 @@ export async function search1688ByImage(
           const match = reportData.match(/object_id@(\d+)/);
           if (match && match[1]) itemUrl = `https://detail.1688.com/offer/${match[1]}.html`;
         }
-        return { title, priceMajor, priceMinor, legacyPriceText, sales: "", moq: "", shopName, itemUrl, imageUrl, isAd, cosScore };
+        return { title, priceMajor, priceMinor, legacyPriceText, cardText, sales: "", moq: "", shopName, itemUrl, imageUrl, isAd, cosScore };
       });
 
       const isScoreValid = parsedItems.filter((item) => item.cosScore > 0).length > 0;
@@ -749,7 +769,7 @@ export async function search1688ByImage(
       return {
         title: item.title,
         price: priceValue ? `¥${priceValue}` : "暂无",
-        sales: item.sales,
+        sales: extractSalesText(item.cardText),
         moq: item.moq,
         shopName: item.shopName,
         itemUrl: item.itemUrl,

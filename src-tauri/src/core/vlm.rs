@@ -1015,6 +1015,7 @@ mod tests {
         Candidate {
             title: title.to_string(),
             price: "¥1.00".to_string(),
+            sales: "".to_string(),
             item_url: "https://detail.1688.com/offer/1.html".to_string(),
             image_url: "https://img.1688.com/1.jpg".to_string(),
             cos_score_permille: 0,
@@ -1141,6 +1142,7 @@ mod tests {
         let candidates = vec![Candidate {
             title: "sample webp".to_string(),
             price: "¥1.00".to_string(),
+            sales: "".to_string(),
             item_url: "https://detail.1688.com/offer/1.html".to_string(),
             image_url: format!("http://{address}/sample.webp"),
             cos_score_permille: 0,

@@ -254,8 +254,8 @@ where
                     trace: result.trace,
                 });
                 has_successful_review = true;
-                if confirmed_matches.is_empty() && !normalized.is_empty() {
-                    confirmed_matches = collect_matched_candidates(candidates, &normalized);
+                if !normalized.is_empty() {
+                    confirmed_matches.extend(collect_matched_candidates(candidates, &normalized));
                 }
             }
             Err(_) => {}

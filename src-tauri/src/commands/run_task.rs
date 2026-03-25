@@ -24,7 +24,9 @@ use crate::core::orchestrator::{
     orchestrate_match, CandidateFetcher, NoMatchReason, OrchestrationDiagnostics, SearchPass,
     VlmCallStage,
 };
-use crate::core::ozon_cache::{OzonSourceCache, OzonSourceCacheLookup};
+use crate::core::ozon_cache::{
+    validate_ozon_source_image_bytes, OzonSourceCache, OzonSourceCacheLookup,
+};
 use crate::core::ozon_product::{OzonProductResolution, OzonResolutionFailure};
 use crate::core::search_image::{
     generate_search_images, parse_search_image_plan, GeneratedSearchImages, SearchImagePlan,
@@ -667,6 +669,17 @@ fn sanitize_filename(input: &str) -> String {
     }
 }
 
+fn create_run_task_temp_dir() -> PathBuf {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    std::env::temp_dir().join(format!(
+        "desktop_app_temp_images-{}-{unique}",
+        std::process::id()
+    ))
+}
+
 impl TaskDiagnosticsSession {
     fn new(output_anchor_path: &Path) -> Result<Self, String> {
         let root = diagnostics_root_for_excel(output_anchor_path);
@@ -1304,7 +1317,11 @@ fn validate_task_runtime_prerequisites(
 
     let has_any_extractable_image = task_rows
         .iter()
-        .any(|row| row.image_bytes.is_some() || !row.sku.trim().is_empty());
+        .any(|row| {
+            row.image_bytes.is_some()
+                || !row.sku.trim().is_empty()
+                || !row.ozon_url.trim().is_empty()
+        });
     if !has_any_extractable_image && !use_mock_candidates {
         return Err(
             "未提取到可搜索来源：请确认 Excel 中至少包含可用 SKU，或保留可复用的嵌入图片。"
@@ -1335,22 +1352,21 @@ fn resolve_task_row_source(
     sink: &mut dyn EventSink,
     row: &TaskRow,
 ) -> Result<TaskRow, OzonResolutionFailure> {
-    if row.image_bytes.is_some() {
-        return Ok(row.clone());
-    }
-
-    emit_row_stage_event(sink, row, "resolving_ozon_product", "正在访问 Ozon 商品页")
-        .map_err(|_| OzonResolutionFailure::FetchFailed("emit resolving event failed".to_string()))?;
-    let _ = emit_event(
-        sink,
-        EVENT_LOG,
-        &LogEvent {
-            level: "info".to_string(),
-            message: format!("正在访问 Ozon 商品页: {}", row.ozon_url),
-        },
-    );
-
     if !row.ozon_url.trim().is_empty() {
+        emit_row_stage_event(sink, row, "resolving_ozon_product", "正在访问 Ozon 商品页")
+            .map_err(|_| {
+                OzonResolutionFailure::FetchFailed("emit resolving event failed".to_string())
+            })?;
+        let _ = emit_event(
+            sink,
+            EVENT_LOG,
+            &LogEvent {
+                level: "info".to_string(),
+                message: format!("正在访问 Ozon 商品页: {}", row.ozon_url),
+            },
+        );
+        Ok(row.clone())
+    } else if row.image_bytes.is_some() {
         Ok(row.clone())
     } else {
         Err(OzonResolutionFailure::FetchFailed(
@@ -1383,6 +1399,18 @@ fn decode_sidecar_ozon_image_bytes(image_base64: &str) -> Result<Vec<u8>, OzonRe
     BASE64_STANDARD.decode(image_base64).map_err(|e| {
         OzonResolutionFailure::FetchFailed(format!("decode sidecar image bytes failed: {e}"))
     })
+}
+
+fn decode_valid_sidecar_ozon_image_bytes(
+    image_base64: &str,
+) -> Result<Vec<u8>, OzonResolutionFailure> {
+    let image_bytes = decode_sidecar_ozon_image_bytes(image_base64)?;
+    validate_ozon_source_image_bytes(&image_bytes).map_err(|error| {
+        OzonResolutionFailure::FetchFailed(format!(
+            "sidecar returned invalid ozon image bytes: {error}"
+        ))
+    })?;
+    Ok(image_bytes)
 }
 
 fn classify_sidecar_ozon_resolve_failure(
@@ -1464,7 +1492,10 @@ fn resolve_ozon_product_via_sidecar(
         .map(str::trim)
         .filter(|value| !value.is_empty())
     {
-        decode_sidecar_ozon_image_bytes(encoded)?
+        match decode_valid_sidecar_ozon_image_bytes(encoded) {
+            Ok(image_bytes) => image_bytes,
+            Err(_) => download_image_bytes_for_browser_resolve(client, &payload.image_url)?,
+        }
     } else {
         download_image_bytes_for_browser_resolve(client, &payload.image_url)?
     };
@@ -1576,15 +1607,12 @@ where
         };
 
         // Random delay between rows to mimic human browsing pace (3-8 seconds)
-        if !use_mock_candidates && validated_row.image_bytes.is_none() && !validated_row.ozon_url.trim().is_empty() {
+        if !use_mock_candidates && !validated_row.ozon_url.trim().is_empty() {
             let delay_ms = rand::thread_rng().gen_range(3_000u64..=8_000);
             std::thread::sleep(Duration::from_millis(delay_ms));
         }
 
-        let resolved_row = if !use_mock_candidates
-            && validated_row.image_bytes.is_none()
-            && !validated_row.ozon_url.trim().is_empty()
-        {
+        let resolved_row = if !use_mock_candidates && !validated_row.ozon_url.trim().is_empty() {
             let ozon_url = validated_row.ozon_url.as_str();
             let resolution = if let Some(cached) = ozon_source_cache.get(ozon_url) {
                 cached.clone()
@@ -2230,7 +2258,7 @@ where
         return Err(code);
     }
 
-    let temp_dir = std::env::temp_dir().join("desktop_app_temp_images");
+    let temp_dir = create_run_task_temp_dir();
     let result_path = output_anchor_path
         .parent()
         .map(|p| p.join("result.xlsx"))
@@ -3155,6 +3183,8 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::thread;
 
+    use image::{DynamicImage, ImageBuffer, Rgba};
+
     use crate::events::EVENT_BLOCKING_ALERT;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -3221,6 +3251,19 @@ mod tests {
         address
     }
 
+    fn build_png_base64(width: u32, height: u32) -> String {
+        let image = DynamicImage::ImageRgba8(ImageBuffer::from_pixel(
+            width,
+            height,
+            Rgba([90, 120, 180, 255]),
+        ));
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        image
+            .write_to(&mut cursor, ImageFormat::Png)
+            .expect("png should encode");
+        BASE64_STANDARD.encode(cursor.into_inner())
+    }
+
     #[test]
     fn wait_for_sidecar_ready_session_emits_login_alert_once_then_continues() {
         let _guard = ENV_LOCK.lock().expect("env lock should acquire");
@@ -3268,6 +3311,18 @@ mod tests {
     }
 
     #[test]
+    fn decode_sidecar_ozon_image_bytes_rejects_tiny_qr_like_images() {
+        let encoded = build_png_base64(68, 68);
+
+        let result = decode_valid_sidecar_ozon_image_bytes(&encoded);
+
+        assert!(
+            result.is_err(),
+            "tiny qr-like screenshots must not be trusted as Ozon source images"
+        );
+    }
+
+    #[test]
     fn run_blocking_task_offloads_work_to_background_thread() {
         let caller_thread = thread::current().id();
         let worker_thread = Arc::new(Mutex::new(None));
@@ -3286,5 +3341,69 @@ mod tests {
             .expect("worker thread lock")
             .expect("worker thread should be recorded");
         assert_ne!(caller_thread, observed);
+    }
+
+    #[test]
+    fn prepare_task_rows_prefers_ozon_url_over_embedded_workbook_image() {
+        let _guard = ENV_LOCK.lock().expect("env lock should acquire");
+        let resolve_url = spawn_mock_session_server(vec![
+            r#"{"success":false,"error":"[OZON_PRODUCT_UNAVAILABLE] Ozon 商品页显示为不可访问或已下架"}"#,
+        ])
+        .replace("/session-state", "/resolve-ozon-product");
+        std::env::set_var(SIDECAR_OZON_RESOLVE_URL_ENV, &resolve_url);
+
+        let cache_root = std::env::temp_dir().join(format!(
+            "ozon-url-authoritative-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time should move forward")
+                .as_nanos()
+        ));
+        let ozon_cache = OzonSourceCache::new(cache_root.clone());
+        let client = Client::new();
+        let mut sink = CollectingSink::default();
+        let mut ensure_browser_ready_calls = 0usize;
+        let task_rows = vec![TaskRow {
+            excel_row_index: 2,
+            ozon_url: "https://www.ozon.ru/product/3570411011".to_string(),
+            ozon_name: String::new(),
+            sku: "SKU-EMBEDDED-UNAVAILABLE".to_string(),
+            original_cells: vec![
+                "https://www.ozon.ru/product/3570411011".to_string(),
+                "SKU-EMBEDDED-UNAVAILABLE".to_string(),
+            ],
+            image_bytes: Some(vec![1, 2, 3]),
+        }];
+
+        let prepared = prepare_task_rows_for_execution(
+            &mut sink,
+            &client,
+            &task_rows,
+            1,
+            &ozon_cache,
+            false,
+            &mut |_| {
+                ensure_browser_ready_calls += 1;
+                Ok(())
+            },
+        )
+        .expect("preflight should complete");
+
+        std::env::remove_var(SIDECAR_OZON_RESOLVE_URL_ENV);
+        let _ = std::fs::remove_dir_all(&cache_root);
+
+        assert_eq!(
+            ensure_browser_ready_calls, 1,
+            "rows with ozon_url should still go through browser-side resolution even when workbook embeds an image"
+        );
+        assert!(
+            prepared.executable_rows.is_empty(),
+            "unavailable ozon rows must not enter executable matching rows"
+        );
+        assert_eq!(prepared.finalized_rows.len(), 1);
+        assert_eq!(
+            prepared.finalized_rows[0].status,
+            "Ozon商品已下架或不可访问"
+        );
     }
 }

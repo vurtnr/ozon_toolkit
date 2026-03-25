@@ -19,6 +19,7 @@ use desktop_app_lib::events::{
     EventSink, EVENT_BLOCKING_ALERT, EVENT_LOG, EVENT_PROGRESS, EVENT_ROW_RESULT, EVENT_TASK_DONE,
 };
 use desktop_app_lib::recovery::GLOBAL_RECOVERY_GATE;
+use image::{DynamicImage, ImageBuffer, ImageFormat, Rgba};
 use rust_xlsxwriter::Workbook;
 use serde_json::Value;
 use zip::ZipArchive;
@@ -310,12 +311,21 @@ fn default_mock_search_image_plan_json() -> &'static str {
     }"#
 }
 
+fn build_png_bytes(width: u32, height: u32) -> Vec<u8> {
+    let image = DynamicImage::ImageRgba8(ImageBuffer::from_pixel(
+        width,
+        height,
+        Rgba([48, 96, 160, 255]),
+    ));
+    let mut cursor = std::io::Cursor::new(Vec::new());
+    image
+        .write_to(&mut cursor, ImageFormat::Png)
+        .expect("png should encode");
+    cursor.into_inner()
+}
+
 fn spawn_image_server() -> (String, thread::JoinHandle<()>) {
-    const SAMPLE_PNG_BYTES: &[u8] = &[
-        137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1, 8, 6,
-        0, 0, 0, 31, 21, 196, 137, 0, 0, 0, 13, 73, 68, 65, 84, 120, 156, 99, 248, 207, 192, 240,
-        31, 0, 5, 0, 1, 255, 137, 153, 61, 29, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
-    ];
+    let sample_png_bytes = build_png_bytes(320, 320);
 
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind image listener");
     listener
@@ -337,10 +347,10 @@ fn spawn_image_server() -> (String, thread::JoinHandle<()>) {
                     let _ = stream.read(&mut buffer);
                     let response = format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                        SAMPLE_PNG_BYTES.len()
+                        sample_png_bytes.len()
                     );
                     let _ = stream.write_all(response.as_bytes());
-                    let _ = stream.write_all(SAMPLE_PNG_BYTES);
+                    let _ = stream.write_all(&sample_png_bytes);
                     served_any = true;
                     last_activity = Instant::now();
                 }
@@ -1527,11 +1537,7 @@ fn run_task_prefers_sidecar_returned_ozon_image_bytes_over_rust_redownload() {
     let (health_url, health_handle) = spawn_sidecar_health_server();
     let (session_url, session_handle) =
         spawn_sidecar_session_server(vec![r#"{"success":true,"status":"ready"}"#]);
-    let embedded_png = BASE64_STANDARD.encode(vec![
-        137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1, 8, 6,
-        0, 0, 0, 31, 21, 196, 137, 0, 0, 0, 13, 73, 68, 65, 84, 120, 156, 99, 248, 207, 192, 240,
-        31, 0, 5, 0, 1, 255, 137, 153, 61, 29, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
-    ]);
+    let embedded_png = BASE64_STANDARD.encode(build_png_bytes(320, 320));
     let (resolve_url, resolve_handle) = spawn_sidecar_ozon_resolve_server(
         format!(
             r#"{{"success":true,"data":{{"title":"Recovered title","imageUrl":"https://example.invalid/unreachable.png","imageBase64":"{embedded_png}"}}}}"#
@@ -1561,6 +1567,76 @@ fn run_task_prefers_sidecar_returned_ozon_image_bytes_over_rust_redownload() {
     let mut sink = CollectingSink::default();
     let summary = run_task_with_sink(excel_path.to_string_lossy().as_ref(), &mut sink)
         .expect("browser-assisted ozon resolve should use returned image bytes directly");
+
+    assert_eq!(summary.status, "completed");
+    let final_rows = final_row_event_payloads(&sink);
+    assert_eq!(final_rows.len(), 1);
+    assert_eq!(final_rows[0]["status"], "AI比对成功(主搜索图召回)");
+
+    clear_mock_pipeline_env();
+    clear_sidecar_fixture_env();
+    ozon_handle.join().expect("join ozon fixture server");
+    image_server_handle.join().expect("join image server");
+    health_handle.join().expect("join health server");
+    session_handle.join().expect("join session server");
+    resolve_handle.join().expect("join ozon resolve server");
+    search_handle.join().expect("join search server");
+    remove_if_exists(&excel_path);
+    remove_if_exists(&excel_path.with_file_name("result.xlsx"));
+}
+
+#[test]
+fn run_task_falls_back_to_redownload_when_sidecar_returns_tiny_ozon_image_bytes() {
+    let _guard = lock_env();
+    GLOBAL_RECOVERY_GATE.resume();
+    clear_mock_pipeline_env();
+    clear_sidecar_fixture_env();
+
+    let excel_path = make_temp_excel_path();
+    let (ozon_base_url, ozon_handle) = spawn_ozon_antibot_server();
+    create_url_mode_workbook(
+        &excel_path,
+        &[(
+            &format!("{ozon_base_url}/product/3552213011"),
+            "SKU-OZON-TINY-BYTES",
+            "230 g",
+        )],
+    );
+
+    let (candidate_image_url, image_server_handle) = spawn_image_server();
+    let (health_url, health_handle) = spawn_sidecar_health_server();
+    let (session_url, session_handle) =
+        spawn_sidecar_session_server(vec![r#"{"success":true,"status":"ready"}"#]);
+    let tiny_embedded_png = BASE64_STANDARD.encode(build_png_bytes(68, 68));
+    let (resolve_url, resolve_handle) = spawn_sidecar_ozon_resolve_server(
+        format!(
+            r#"{{"success":true,"data":{{"title":"Recovered title","imageUrl":"{candidate_image_url}","imageBase64":"{tiny_embedded_png}"}}}}"#
+        ),
+        1,
+    );
+    let (search_url, search_handle) = spawn_sidecar_search_server(
+        format!(
+            r#"{{"success":true,"data":[{{"title":"candidate","price":"¥12.34","itemUrl":"https://detail.1688.com/offer/1.html","imageUrl":"{candidate_image_url}"}}]}}"#
+        ),
+        2,
+    );
+
+    std::env::set_var("SIDECAR_HEALTH_URL", &health_url);
+    std::env::set_var("SIDECAR_SESSION_URL", &session_url);
+    std::env::set_var("SIDECAR_OZON_RESOLVE_URL", &resolve_url);
+    std::env::set_var("SIDECAR_SEARCH_URL", &search_url);
+    std::env::set_var(
+        "RUN_TASK_MOCK_VLM_REPLIES_JSON",
+        r#"[
+          [1],
+          [1]
+        ]"#,
+    );
+    set_mock_search_image_plan_env(default_mock_search_image_plan_json());
+
+    let mut sink = CollectingSink::default();
+    let summary = run_task_with_sink(excel_path.to_string_lossy().as_ref(), &mut sink)
+        .expect("tiny sidecar image bytes should fall back to redownloading the ozon image url");
 
     assert_eq!(summary.status, "completed");
     let final_rows = final_row_event_payloads(&sink);

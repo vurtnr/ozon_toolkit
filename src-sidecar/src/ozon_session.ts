@@ -16,6 +16,28 @@ export interface OzonSnapshot {
   isUnavailable: boolean;
 }
 
+export interface OzonRecommendedProductCandidate {
+  href: string;
+  top: number;
+  left: number;
+  containerKey: string;
+  containerTop: number;
+  containerLeft: number;
+  containerArea: number;
+  containerProductCount: number;
+}
+
+export interface OzonImageCaptureCandidateMetrics {
+  currentSrc: string;
+  naturalWidth: number;
+  naturalHeight: number;
+  rectWidth: number;
+  rectHeight: number;
+  rectTop: number;
+  rectBottom: number;
+  viewportHeight: number;
+}
+
 export type OzonPageState =
   | "resolved"
   | "anti_bot_challenge"
@@ -45,6 +67,7 @@ const DEFAULT_OZON_HOME_URL = "https://www.ozon.ru/";
 const DEFAULT_RESOLVE_TIMEOUT_MS = 180_000;
 const DEFAULT_POLL_INTERVAL_MS = 1_000;
 const DEFAULT_LANDING_TIMEOUT_MS = 60_000;
+const DEFAULT_RECOMMENDED_HOP_TIMEOUT_MS = 8_000;
 
 const OZON_ANTI_BOT_URL_HINTS = ["__rr=", "abt_att=1", "captcha"];
 const OZON_ANTI_BOT_TEXT_HINTS = [
@@ -67,6 +90,7 @@ const OZON_BLOCKED_TEXT_HINTS = [
 ];
 const OZON_UNAVAILABLE_TEXT_HINTS = [
   "такого товара нет",
+  "такой страницы не существует",
   "страница не найдена",
   "извините, такой страницы нет",
   "товар закончился",
@@ -104,6 +128,63 @@ export function isOzonHomeUrl(url: string): boolean {
   } catch {
     return false;
   }
+}
+
+function extractComparableImageToken(value: string | null | undefined): string | null {
+  const normalized = (value || "").trim();
+  if (!normalized) {
+    return null;
+  }
+
+  try {
+    const parsed = new URL(normalized);
+    const segments = parsed.pathname.split("/").filter(Boolean);
+    const lastSegment = segments[segments.length - 1]?.trim().toLowerCase() || "";
+    return lastSegment || null;
+  } catch {
+    const match = normalized.match(/([a-z0-9_-]+\.(?:jpg|jpeg|png|webp|gif|bmp))(?:[?#].*)?$/i);
+    return match?.[1]?.toLowerCase() ?? null;
+  }
+}
+
+export function scoreOzonImageCaptureCandidate(
+  candidate: OzonImageCaptureCandidateMetrics,
+  expectedImageUrl: string | null,
+): number {
+  const renderedArea =
+    Math.max(candidate.rectWidth, 0) * Math.max(candidate.rectHeight, 0);
+  const naturalArea =
+    Math.max(candidate.naturalWidth, 0) * Math.max(candidate.naturalHeight, 0);
+  const isVisible = candidate.rectWidth >= 40 && candidate.rectHeight >= 40;
+  const isLikelyProductImage =
+    candidate.naturalWidth >= 120 &&
+    candidate.naturalHeight >= 120 &&
+    candidate.rectTop < candidate.viewportHeight + 200 &&
+    candidate.rectBottom > -200;
+
+  if (!isVisible || !isLikelyProductImage) {
+    return Number.NEGATIVE_INFINITY;
+  }
+
+  const expectedToken = extractComparableImageToken(expectedImageUrl);
+  const currentToken = extractComparableImageToken(candidate.currentSrc);
+  const matchesExpected = Boolean(
+    expectedToken && currentToken && expectedToken === currentToken,
+  );
+
+  if (expectedToken && !matchesExpected) {
+    return Number.NEGATIVE_INFINITY;
+  }
+
+  let nextScore = naturalArea + renderedArea;
+  if (matchesExpected) {
+    nextScore += 1_000_000_000;
+  }
+  if (candidate.rectTop >= 0 && candidate.rectTop <= candidate.viewportHeight) {
+    nextScore += 100_000;
+  }
+
+  return nextScore;
 }
 
 function delay(ms: number): Promise<void> {
@@ -188,6 +269,107 @@ export function buildCanonicalOzonProductUrl(value: string): string | null {
   } catch {
     return null;
   }
+}
+
+export function selectFirstRecommendedProductHref(
+  candidates: readonly OzonRecommendedProductCandidate[],
+  currentUrl: string,
+): string | null {
+  const currentCanonicalUrl = buildCanonicalOzonProductUrl(currentUrl);
+  const normalizedCandidates = candidates
+    .map((candidate) => {
+      const canonicalHref = buildCanonicalOzonProductUrl(candidate.href);
+      if (!canonicalHref) {
+        return null;
+      }
+
+      if (currentCanonicalUrl && canonicalHref === currentCanonicalUrl) {
+        return null;
+      }
+
+      if (
+        !Number.isFinite(candidate.top) ||
+        !Number.isFinite(candidate.left) ||
+        !Number.isFinite(candidate.containerTop) ||
+        !Number.isFinite(candidate.containerLeft) ||
+        !Number.isFinite(candidate.containerArea)
+      ) {
+        return null;
+      }
+
+      if (candidate.containerProductCount < 2) {
+        return null;
+      }
+
+      return {
+        ...candidate,
+        canonicalHref,
+      };
+    })
+    .filter(
+      (
+        candidate,
+      ): candidate is OzonRecommendedProductCandidate & { canonicalHref: string } =>
+        candidate !== null,
+    );
+
+  if (normalizedCandidates.length === 0) {
+    return null;
+  }
+
+  const groupedCandidates = new Map<
+    string,
+    {
+      containerTop: number;
+      containerLeft: number;
+      containerArea: number;
+      containerProductCount: number;
+      items: Array<OzonRecommendedProductCandidate & { canonicalHref: string }>;
+    }
+  >();
+
+  for (const candidate of normalizedCandidates) {
+    const key = candidate.containerKey.trim() || `${candidate.containerTop}:${candidate.containerLeft}`;
+    const existing = groupedCandidates.get(key);
+    if (existing) {
+      existing.items.push(candidate);
+      existing.containerProductCount = Math.max(
+        existing.containerProductCount,
+        candidate.containerProductCount,
+      );
+      existing.containerArea = Math.max(existing.containerArea, candidate.containerArea);
+      existing.containerTop = Math.min(existing.containerTop, candidate.containerTop);
+      existing.containerLeft = Math.min(existing.containerLeft, candidate.containerLeft);
+      continue;
+    }
+
+    groupedCandidates.set(key, {
+      containerTop: candidate.containerTop,
+      containerLeft: candidate.containerLeft,
+      containerArea: candidate.containerArea,
+      containerProductCount: candidate.containerProductCount,
+      items: [candidate],
+    });
+  }
+
+  const selectedGroup = [...groupedCandidates.values()].sort((leftGroup, rightGroup) => {
+    return (
+      leftGroup.containerTop - rightGroup.containerTop ||
+      leftGroup.containerLeft - rightGroup.containerLeft ||
+      rightGroup.containerProductCount - leftGroup.containerProductCount ||
+      rightGroup.containerArea - leftGroup.containerArea
+    );
+  })[0];
+
+  if (!selectedGroup) {
+    return null;
+  }
+
+  const selectedCandidate = [...selectedGroup.items].sort((leftCandidate, rightCandidate) => {
+    return leftCandidate.top - rightCandidate.top || leftCandidate.left - rightCandidate.left;
+  })[0];
+
+  return selectedCandidate?.canonicalHref ?? null;
 }
 
 export async function collectOzonSnapshot(page: Page): Promise<OzonSnapshot> {
@@ -372,7 +554,11 @@ export function classifyOzonSnapshot(snapshot: OzonSnapshot): OzonPageState {
     return "anti_bot_challenge";
   }
 
-  if (snapshot.isUnavailable) {
+  const normalizedText = normalizeOzonSnapshotText(snapshot);
+  if (
+    snapshot.isUnavailable ||
+    OZON_UNAVAILABLE_TEXT_HINTS.some((hint) => normalizedText.includes(hint))
+  ) {
     return "unavailable";
   }
 
@@ -383,6 +569,11 @@ export function classifyOzonSnapshot(snapshot: OzonSnapshot): OzonPageState {
   }
 
   return "incomplete";
+}
+
+export function shouldAttemptRecommendedProductHop(snapshot: OzonSnapshot): boolean {
+  const normalizedText = normalizeOzonSnapshotText(snapshot);
+  return !OZON_SKU_NOT_FOUND_TEXT_HINTS.some((hint) => normalizedText.includes(hint));
 }
 
 export function classifyOzonSkuSearchSnapshot(
@@ -441,34 +632,20 @@ async function captureOzonImageBase64(
 
   for (const handle of imageHandles) {
     try {
-      const score = await handle.evaluate((img, expected) => {
+      const metrics = await handle.evaluate((img) => {
         const rect = img.getBoundingClientRect();
-        const currentSrc = (img.currentSrc || img.getAttribute("src") || "").trim();
-        const naturalWidth = img.naturalWidth || 0;
-        const naturalHeight = img.naturalHeight || 0;
-        const renderedArea = Math.max(rect.width, 0) * Math.max(rect.height, 0);
-        const naturalArea = naturalWidth * naturalHeight;
-        const isVisible = rect.width >= 40 && rect.height >= 40;
-        const isLikelyProductImage =
-          naturalWidth >= 120 &&
-          naturalHeight >= 120 &&
-          rect.top < window.innerHeight + 200 &&
-          rect.bottom > -200;
-
-        if (!isVisible || !isLikelyProductImage) {
-          return Number.NEGATIVE_INFINITY;
-        }
-
-        let nextScore = naturalArea + renderedArea;
-        if (expected && currentSrc === expected) {
-          nextScore += 1_000_000_000;
-        }
-        if (rect.top >= 0 && rect.top <= window.innerHeight) {
-          nextScore += 100_000;
-        }
-
-        return nextScore;
-      }, normalizedExpected);
+        return {
+          currentSrc: (img.currentSrc || img.getAttribute("src") || "").trim(),
+          naturalWidth: img.naturalWidth || 0,
+          naturalHeight: img.naturalHeight || 0,
+          rectWidth: rect.width,
+          rectHeight: rect.height,
+          rectTop: rect.top,
+          rectBottom: rect.bottom,
+          viewportHeight: window.innerHeight,
+        };
+      });
+      const score = scoreOzonImageCaptureCandidate(metrics, normalizedExpected);
 
       if (score > bestScore) {
         if (bestHandle) {
@@ -500,6 +677,314 @@ async function captureOzonImageBase64(
   } finally {
     await bestHandle.dispose().catch(() => undefined);
   }
+}
+
+async function collectRecommendedProductCandidates(
+  page: Page,
+  currentUrl: string,
+): Promise<OzonRecommendedProductCandidate[]> {
+  const currentCanonicalUrl = buildCanonicalOzonProductUrl(currentUrl);
+
+  return page.evaluate((currentCanonicalUrl: string | null) => {
+    const isAllowedOzonHost = (hostname: string): boolean => {
+      const normalized = (hostname || "").trim().toLowerCase();
+      return normalized === "ozon.ru" || normalized.endsWith(".ozon.ru");
+    };
+
+    const canonicalizeProductUrl = (value: string): string | null => {
+      const trimmed = (value || "").trim();
+      if (!trimmed) {
+        return null;
+      }
+
+      try {
+        const parsed = new URL(trimmed, window.location.href);
+        if (!isAllowedOzonHost(parsed.hostname)) {
+          return null;
+        }
+
+        const segments = parsed.pathname.split("/").filter(Boolean);
+        if (segments[0] !== "product" || !segments[1]) {
+          return null;
+        }
+
+        const rawSegment = decodeURIComponent(segments[1].trim());
+        const productIdMatch = rawSegment.match(/(\d{5,})$/);
+        const productId = productIdMatch?.[1] ?? null;
+        if (!productId) {
+          return null;
+        }
+
+        const canonical = new URL("https://www.ozon.ru/");
+        canonical.pathname = `/product/${productId}/`;
+        canonical.search = "";
+        canonical.hash = "";
+        return canonical.toString();
+      } catch {
+        return null;
+      }
+    };
+
+    const isVisible = (element: Element | null): element is HTMLElement => {
+      if (!(element instanceof HTMLElement)) {
+        return false;
+      }
+
+      const style = window.getComputedStyle(element);
+      const rect = element.getBoundingClientRect();
+      return (
+        style.display !== "none" &&
+        style.visibility !== "hidden" &&
+        style.opacity !== "0" &&
+        rect.width > 0 &&
+        rect.height > 0
+      );
+    };
+
+    const visibleProductAnchors = Array.from(
+      document.querySelectorAll<HTMLAnchorElement>("a[href]"),
+    ).filter((anchor) => {
+      if (!isVisible(anchor)) {
+        return false;
+      }
+
+      const canonicalHref = canonicalizeProductUrl(anchor.href || anchor.getAttribute("href") || "");
+      if (!canonicalHref) {
+        return false;
+      }
+
+      return canonicalHref !== currentCanonicalUrl;
+    });
+
+    const containerIds = new WeakMap<HTMLElement, string>();
+    let nextContainerId = 1;
+
+    const getContainerId = (container: HTMLElement): string => {
+      const existing = containerIds.get(container);
+      if (existing) {
+        return existing;
+      }
+
+      const nextId = `recommended-container-${nextContainerId++}`;
+      containerIds.set(container, nextId);
+      return nextId;
+    };
+
+    return visibleProductAnchors
+      .map((anchor) => {
+        const canonicalHref = canonicalizeProductUrl(
+          anchor.href || anchor.getAttribute("href") || "",
+        );
+        if (!canonicalHref) {
+          return null;
+        }
+
+        const anchorRect = anchor.getBoundingClientRect();
+        let containerMeta:
+          | {
+              containerKey: string;
+              containerTop: number;
+              containerLeft: number;
+              containerArea: number;
+              containerProductCount: number;
+            }
+          | null = null;
+
+        for (let element = anchor.parentElement; element; element = element.parentElement) {
+          if (!isVisible(element)) {
+            continue;
+          }
+
+          const rect = element.getBoundingClientRect();
+          if (rect.width < 320 || rect.height < 120) {
+            continue;
+          }
+
+          const productLinks = Array.from(
+            element.querySelectorAll<HTMLAnchorElement>("a[href]"),
+          )
+            .filter((link) => isVisible(link))
+            .map((link) => canonicalizeProductUrl(link.href || link.getAttribute("href") || ""))
+            .filter((href): href is string => href !== null && href !== currentCanonicalUrl);
+
+          const uniqueProductLinks = [...new Set(productLinks)];
+          if (uniqueProductLinks.length < 2) {
+            continue;
+          }
+
+          containerMeta = {
+            containerKey: getContainerId(element),
+            containerTop: rect.top,
+            containerLeft: rect.left,
+            containerArea: rect.width * rect.height,
+            containerProductCount: uniqueProductLinks.length,
+          };
+          break;
+        }
+
+        if (!containerMeta) {
+          return null;
+        }
+
+        return {
+          href: canonicalHref,
+          top: anchorRect.top,
+          left: anchorRect.left,
+          ...containerMeta,
+        };
+      })
+      .filter(
+        (
+          candidate,
+        ): candidate is OzonRecommendedProductCandidate => candidate !== null,
+      );
+  }, currentCanonicalUrl);
+}
+
+async function waitForOzonUrlChange(
+  page: Page,
+  previousUrl: string,
+  delayFn: (ms: number) => Promise<void>,
+  timeoutMs: number = DEFAULT_RECOMMENDED_HOP_TIMEOUT_MS,
+): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+
+  while (Date.now() < deadline) {
+    const currentUrl = page.url();
+    if (currentUrl && currentUrl !== previousUrl) {
+      return true;
+    }
+
+    const snapshot = await collectOzonSnapshotWithRetry(page, 500);
+    if (snapshot?.url && snapshot.url !== previousUrl) {
+      return true;
+    }
+
+    await delayFn(200);
+  }
+
+  return false;
+}
+
+async function clickRecommendedProductByHref(
+  page: Page,
+  targetHref: string,
+): Promise<boolean> {
+  return page.evaluate((targetHref: string) => {
+    const isAllowedOzonHost = (hostname: string): boolean => {
+      const normalized = (hostname || "").trim().toLowerCase();
+      return normalized === "ozon.ru" || normalized.endsWith(".ozon.ru");
+    };
+
+    const canonicalizeProductUrl = (value: string): string | null => {
+      const trimmed = (value || "").trim();
+      if (!trimmed) {
+        return null;
+      }
+
+      try {
+        const parsed = new URL(trimmed, window.location.href);
+        if (!isAllowedOzonHost(parsed.hostname)) {
+          return null;
+        }
+
+        const segments = parsed.pathname.split("/").filter(Boolean);
+        if (segments[0] !== "product" || !segments[1]) {
+          return null;
+        }
+
+        const rawSegment = decodeURIComponent(segments[1].trim());
+        const productIdMatch = rawSegment.match(/(\d{5,})$/);
+        const productId = productIdMatch?.[1] ?? null;
+        if (!productId) {
+          return null;
+        }
+
+        const canonical = new URL("https://www.ozon.ru/");
+        canonical.pathname = `/product/${productId}/`;
+        canonical.search = "";
+        canonical.hash = "";
+        return canonical.toString();
+      } catch {
+        return null;
+      }
+    };
+
+    const isVisible = (element: Element | null): element is HTMLElement => {
+      if (!(element instanceof HTMLElement)) {
+        return false;
+      }
+
+      const style = window.getComputedStyle(element);
+      const rect = element.getBoundingClientRect();
+      return (
+        style.display !== "none" &&
+        style.visibility !== "hidden" &&
+        style.opacity !== "0" &&
+        rect.width > 0 &&
+        rect.height > 0
+      );
+    };
+
+    const anchors = Array.from(
+      document.querySelectorAll<HTMLAnchorElement>("a[href]"),
+    )
+      .filter((anchor) => isVisible(anchor))
+      .filter((anchor) => {
+        const canonicalHref = canonicalizeProductUrl(anchor.href || anchor.getAttribute("href") || "");
+        return canonicalHref === targetHref;
+      })
+      .sort((leftAnchor, rightAnchor) => {
+        const leftRect = leftAnchor.getBoundingClientRect();
+        const rightRect = rightAnchor.getBoundingClientRect();
+        return leftRect.top - rightRect.top || leftRect.left - rightRect.left;
+      });
+
+    const targetAnchor = anchors[0];
+    if (!targetAnchor) {
+      return false;
+    }
+
+    targetAnchor.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
+    targetAnchor.removeAttribute("target");
+    targetAnchor.click();
+    return true;
+  }, targetHref);
+}
+
+async function hopToFirstRecommendedProductDetail(
+  page: Page,
+  currentUrl: string,
+  delayFn: (ms: number) => Promise<void>,
+): Promise<boolean> {
+  const targetHref = selectFirstRecommendedProductHref(
+    await collectRecommendedProductCandidates(page, currentUrl),
+    currentUrl,
+  );
+  if (!targetHref) {
+    return false;
+  }
+
+  const previousUrl = page.url();
+  let clickTriggered = false;
+
+  try {
+    clickTriggered = await clickRecommendedProductByHref(page, targetHref);
+  } catch (error) {
+    if (!isTransientPageNavigationError(error)) {
+      throw error;
+    }
+  }
+
+  if (clickTriggered && await waitForOzonUrlChange(page, previousUrl, delayFn)) {
+    return true;
+  }
+
+  await page.goto(targetHref, {
+    waitUntil: "domcontentloaded",
+    timeout: 60_000,
+  });
+  return true;
 }
 
 async function ensureOzonSessionPage(
@@ -845,6 +1330,7 @@ export async function resolveOzonProductViaSession(
   const deadline =
     Date.now() + (dependencies.resolveTimeoutMs ?? DEFAULT_RESOLVE_TIMEOUT_MS);
   let antiBotSeen = false;
+  let recommendedProductHopAttempted = false;
 
   while (Date.now() < deadline) {
     const snapshot = await collectOzonSnapshotWithRetry(page);
@@ -866,6 +1352,22 @@ export async function resolveOzonProductViaSession(
     }
 
     if (snapshotState === "unavailable") {
+      if (
+        !recommendedProductHopAttempted &&
+        shouldAttemptRecommendedProductHop(snapshot)
+      ) {
+        recommendedProductHopAttempted = true;
+        const jumpedIntoRecommendedProduct = await hopToFirstRecommendedProductDetail(
+          page,
+          snapshot.url || canonicalProductUrl,
+          dependencies.delay,
+        );
+        if (jumpedIntoRecommendedProduct) {
+          await dependencies.delay(500);
+          continue;
+        }
+      }
+
       throw new Error("[OZON_PRODUCT_UNAVAILABLE] Ozon 商品页显示为不可访问或已下架");
     }
 

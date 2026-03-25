@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::sync::OnceLock;
 
@@ -22,7 +23,7 @@ struct ScoredCandidate {
     index: usize,
     candidate: Candidate,
     relevance_score: f32,
-    price_value: Option<f64>,
+    sales_value: Option<f64>,
 }
 
 pub fn parse_price_value(price: &str) -> Option<f64> {
@@ -72,6 +73,36 @@ pub fn parse_positive_price_value(price: &str) -> Option<f64> {
     parse_price_value(price).filter(|value| *value > 0.0)
 }
 
+pub fn parse_sales_value(sales: &str) -> Option<f64> {
+    static SALES_RE: OnceLock<Regex> = OnceLock::new();
+
+    let normalized = sales
+        .replace([',', '，', ' '], "")
+        .replace("＋", "+")
+        .trim()
+        .to_string();
+    if normalized.is_empty() {
+        return None;
+    }
+
+    let sales_re = SALES_RE.get_or_init(|| {
+        Regex::new(r"([0-9]+(?:\.[0-9]+)?)(万|千)?\+?")
+            .expect("invalid sales regex")
+    });
+    let captures = sales_re.captures(&normalized)?;
+    let base_value = captures
+        .get(1)
+        .and_then(|value| value.as_str().parse::<f64>().ok())
+        .filter(|value| value.is_finite())?;
+    let multiplier = match captures.get(2).map(|value| value.as_str()) {
+        Some("万") => 10_000.0,
+        Some("千") => 1_000.0,
+        _ => 1.0,
+    };
+
+    Some(base_value * multiplier)
+}
+
 fn price_sort_key(price: &str) -> f64 {
     parse_positive_price_value(price).unwrap_or(f64::MAX)
 }
@@ -109,7 +140,7 @@ pub fn select_screening_candidates(
                 deduped.len(),
                 ozon_name_opt,
             ),
-            price_value: parse_positive_price_value(&candidate.price),
+            sales_value: parse_sales_value(&candidate.sales),
             index,
             candidate,
         })
@@ -132,7 +163,7 @@ pub fn select_screening_candidates(
         .map(|entry| entry.candidate.item_url.clone())
         .collect::<HashSet<_>>();
 
-    for entry in price_relevance_frontier(&scored)
+    for entry in sales_relevance_frontier(&scored)
         .into_iter()
         .take(frontier_limit)
     {
@@ -177,14 +208,7 @@ pub fn build_verification_chunks(
 }
 
 pub fn find_cheapest(candidates: Vec<Candidate>) -> Option<Candidate> {
-    let mut valid_items = candidates;
-    if valid_items.is_empty() {
-        return None;
-    }
-    sort_candidates_by_price(&mut valid_items);
-    valid_items
-        .into_iter()
-        .find(|item| parse_positive_price_value(&item.price).is_some())
+    select_best_match(candidates)
 }
 
 pub fn summarize_matches(candidates: Vec<Candidate>) -> MatchSummary {
@@ -192,11 +216,7 @@ pub fn summarize_matches(candidates: Vec<Candidate>) -> MatchSummary {
         return MatchSummary::NoMatch;
     }
 
-    let total_matches = candidates.len();
-    match find_cheapest(candidates) {
-        Some(cheapest) => MatchSummary::Cheapest(cheapest),
-        None => MatchSummary::MatchedButPriceUnavailable { total_matches },
-    }
+    MatchSummary::Cheapest(select_best_match(candidates).expect("non-empty candidates"))
 }
 
 pub fn collect_matched_candidates(chunk: &[Candidate], match_ids: &[usize]) -> Vec<Candidate> {
@@ -211,50 +231,48 @@ pub fn prepare_final_review_candidates(candidates: Vec<Candidate>, limit: usize)
         return Vec::new();
     }
 
-    let priced = dedupe_candidates_by_url(candidates)
-        .into_iter()
-        .filter(|item| parse_positive_price_value(&item.price).is_some())
-        .collect::<Vec<_>>();
-    if priced.len() <= limit {
-        let mut selected = priced;
-        sort_candidates_by_price(&mut selected);
-        return selected;
+    let deduped = dedupe_candidates_by_url(candidates);
+    if deduped.len() <= limit {
+        return deduped;
     }
 
-    let late_price_slots = 2.min(limit.saturating_sub(1));
-    let rank_window = limit.saturating_sub(late_price_slots).max(1).min(priced.len());
-    let mut selected_urls = priced
+    let late_sales_slots = 2.min(limit.saturating_sub(1));
+    let rank_window = limit.saturating_sub(late_sales_slots).max(1).min(deduped.len());
+    let mut selected_urls = deduped
         .iter()
         .take(rank_window)
         .map(|candidate| candidate.item_url.clone())
         .collect::<HashSet<_>>();
 
-    let mut cheapest_late_candidates = priced
+    let mut highest_sales_late_candidates = deduped
         .iter()
         .skip(rank_window)
-        .filter_map(|candidate| {
-            parse_positive_price_value(&candidate.price).map(|price_value| (price_value, candidate))
-        })
+        .filter_map(|candidate| parse_sales_value(&candidate.sales).map(|sales_value| (sales_value, candidate)))
         .collect::<Vec<_>>();
-    cheapest_late_candidates.sort_by(|a, b| {
-        a.0.partial_cmp(&b.0)
+    highest_sales_late_candidates.sort_by(|a, b| {
+        b.0.partial_cmp(&a.0)
             .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                b.1.cos_score_permille
+                    .cmp(&a.1.cos_score_permille)
+            })
             .then_with(|| a.1.item_url.cmp(&b.1.item_url))
     });
 
-    for (_, candidate) in cheapest_late_candidates {
+    for (_, candidate) in highest_sales_late_candidates {
         selected_urls.insert(candidate.item_url.clone());
         if selected_urls.len() == limit {
             break;
         }
     }
 
-    let mut selected = priced
+    let mut selected = deduped
         .into_iter()
         .filter(|candidate| selected_urls.contains(&candidate.item_url))
         .collect::<Vec<_>>();
-    sort_candidates_by_price(&mut selected);
-    selected.truncate(limit);
+    if selected.len() > limit {
+        selected.truncate(limit);
+    }
     selected
 }
 
@@ -370,20 +388,71 @@ fn resolve_screening_limit(
     bounded_limit
 }
 
-fn price_relevance_frontier(scored: &[ScoredCandidate]) -> Vec<ScoredCandidate> {
+fn select_best_match(candidates: Vec<Candidate>) -> Option<Candidate> {
+    let mut best_candidate: Option<(usize, Candidate)> = None;
+
+    for (index, candidate) in candidates.into_iter().enumerate() {
+        let should_replace = match &best_candidate {
+            None => true,
+            Some((best_index, best)) => is_better_match_candidate(
+                &candidate,
+                index,
+                best,
+                *best_index,
+            ),
+        };
+
+        if should_replace {
+            best_candidate = Some((index, candidate));
+        }
+    }
+
+    best_candidate.map(|(_, candidate)| candidate)
+}
+
+fn compare_optional_f64_desc(left: Option<f64>, right: Option<f64>) -> Ordering {
+    match (left, right) {
+        (Some(left), Some(right)) => left.partial_cmp(&right).unwrap_or(Ordering::Equal),
+        (Some(_), None) => Ordering::Greater,
+        (None, Some(_)) => Ordering::Less,
+        (None, None) => Ordering::Equal,
+    }
+}
+
+fn is_better_match_candidate(
+    candidate: &Candidate,
+    index: usize,
+    current_best: &Candidate,
+    current_best_index: usize,
+) -> bool {
+    candidate
+        .cos_score_permille
+        .cmp(&current_best.cos_score_permille)
+        .then_with(|| {
+            compare_optional_f64_desc(
+                parse_sales_value(&candidate.sales),
+                parse_sales_value(&current_best.sales),
+            )
+        })
+        .then_with(|| current_best_index.cmp(&index))
+        .then_with(|| current_best.item_url.cmp(&candidate.item_url))
+        .is_gt()
+}
+
+fn sales_relevance_frontier(scored: &[ScoredCandidate]) -> Vec<ScoredCandidate> {
     let mut frontier = scored
         .iter()
         .filter(|candidate| {
-            candidate.price_value.is_some()
+            candidate.sales_value.is_some()
                 && candidate.relevance_score >= MIN_FRONTIER_RELEVANCE_SCORE
         })
-        .filter(|candidate| !is_price_relevance_dominated(candidate, scored))
+        .filter(|candidate| !is_sales_relevance_dominated(candidate, scored))
         .cloned()
         .collect::<Vec<_>>();
 
     frontier.sort_by(|a, b| {
-        a.price_value
-            .partial_cmp(&b.price_value)
+        b.sales_value
+            .partial_cmp(&a.sales_value)
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| {
                 b.relevance_score
@@ -395,8 +464,8 @@ fn price_relevance_frontier(scored: &[ScoredCandidate]) -> Vec<ScoredCandidate> 
     frontier
 }
 
-fn is_price_relevance_dominated(candidate: &ScoredCandidate, pool: &[ScoredCandidate]) -> bool {
-    let Some(candidate_price) = candidate.price_value else {
+fn is_sales_relevance_dominated(candidate: &ScoredCandidate, pool: &[ScoredCandidate]) -> bool {
+    let Some(candidate_sales) = candidate.sales_value else {
         return true;
     };
 
@@ -404,15 +473,15 @@ fn is_price_relevance_dominated(candidate: &ScoredCandidate, pool: &[ScoredCandi
         if other.index == candidate.index {
             return false;
         }
-        let Some(other_price) = other.price_value else {
+        let Some(other_sales) = other.sales_value else {
             return false;
         };
 
         let relevance_not_worse = other.relevance_score + f32::EPSILON >= candidate.relevance_score;
-        let price_not_higher = other_price <= candidate_price;
+        let sales_not_lower = other_sales + f64::EPSILON >= candidate_sales;
         let strictly_better = other.relevance_score > candidate.relevance_score + f32::EPSILON
-            || other_price + f64::EPSILON < candidate_price;
+            || other_sales > candidate_sales + f64::EPSILON;
 
-        relevance_not_worse && price_not_higher && strictly_better
+        relevance_not_worse && sales_not_lower && strictly_better
     })
 }

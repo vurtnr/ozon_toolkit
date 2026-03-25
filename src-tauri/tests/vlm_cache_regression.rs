@@ -20,6 +20,7 @@ fn candidate(url: &str, title: &str) -> Candidate {
     Candidate {
         title: title.to_string(),
         price: "¥1.00".to_string(),
+        sales: "".to_string(),
         item_url: format!("https://detail.1688.com/offer/{title}.html"),
         image_url: url.to_string(),
         cos_score_permille: 0,

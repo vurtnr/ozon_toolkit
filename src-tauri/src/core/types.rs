@@ -4,6 +4,8 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 pub struct Candidate {
     pub title: String,
     pub price: String,
+    #[serde(default)]
+    pub sales: String,
     #[serde(rename = "itemUrl")]
     pub item_url: String,
     #[serde(rename = "imageUrl")]

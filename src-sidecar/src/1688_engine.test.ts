@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   executeResultPageRecall,
+  extractSalesText,
   isLikelySearchResultsUrl,
   shouldKeepWaitingForSearchConfirm,
   shouldEnsureHomePageBeforeSessionCheck,
@@ -42,6 +43,20 @@ const sampleResults: SearchResult[] = [
     cosScore: 0.88,
   },
 ];
+
+describe("extractSalesText", () => {
+  test("extracts common sales formats from 1688 card text", () => {
+    expect(extractSalesText("月销 123 笔 成交")).toBe("123");
+    expect(extractSalesText("已售 2.5万+ 件")).toBe("2.5万+");
+    expect(extractSalesText("成交 980 笔")).toBe("980");
+    expect(extractSalesText("3000人付款")).toBe("3000");
+  });
+
+  test("returns empty string when no sales signal exists", () => {
+    expect(extractSalesText("暂无销量 店铺上新")).toBe("");
+    expect(extractSalesText("")).toBe("");
+  });
+});
 
 describe("executeResultPageRecall", () => {
   test("keeps default search path when forceFullCrop is false", async () => {
