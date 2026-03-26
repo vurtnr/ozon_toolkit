@@ -25,7 +25,8 @@ use crate::core::orchestrator::{
     VlmCallStage,
 };
 use crate::core::ozon_cache::{
-    validate_ozon_source_image_bytes, OzonSourceCache, OzonSourceCacheLookup,
+    validate_ozon_source_image_bytes, validate_ozon_source_metadata, OzonSourceCache,
+    OzonSourceCacheLookup,
 };
 use crate::core::ozon_product::{OzonProductResolution, OzonResolutionFailure};
 use crate::core::search_image::{
@@ -370,6 +371,14 @@ impl SearchImagePlanner for RuntimeVlmClient {
         match self {
             Self::DashScope(client) => client.plan_search_images(ozon_image_base64, ozon_name),
             Self::Mock(client) => client.plan_search_images(ozon_image_base64, ozon_name),
+        }
+    }
+}
+
+impl RuntimeVlmClient {
+    fn clear_tile_cache(&self) {
+        if let Self::DashScope(client) = self {
+            client.clear_tile_cache();
         }
     }
 }
@@ -1486,6 +1495,11 @@ fn resolve_ozon_product_via_sidecar(
     let payload = parsed.data.ok_or_else(|| {
         OzonResolutionFailure::FetchFailed("sidecar response missing data".to_string())
     })?;
+    validate_ozon_source_metadata(&payload.title, &payload.image_url).map_err(|error| {
+        OzonResolutionFailure::FetchFailed(format!(
+            "sidecar returned generic ozon source metadata: {error}"
+        ))
+    })?;
     let image_bytes = if let Some(encoded) = payload
         .image_base64
         .as_deref()
@@ -1794,7 +1808,6 @@ where
                                 }
                             }
                         }
-                        // If exhausted retries and still anti-bot, skip the row
                         if last_error == OzonResolutionFailure::AntiBotChallenge {
                             finalize_preflight_row(
                                 sink,
@@ -1802,6 +1815,16 @@ where
                                 empty_output_row(
                                     &validated_row,
                                     "Ozon 验证失败，已跳过",
+                                ),
+                                total_rows,
+                            )?;
+                        } else if last_error != OzonResolutionFailure::InvalidUrl {
+                            finalize_preflight_row(
+                                sink,
+                                &mut prepared,
+                                empty_output_row(
+                                    &validated_row,
+                                    map_ozon_resolution_failure_to_status(&last_error).as_str(),
                                 ),
                                 total_rows,
                             )?;
@@ -2384,6 +2407,7 @@ where
             let mut row_stage_timings = RowStageTimings::default();
 
             if resolved_row.image_bytes.is_some() || use_mock_candidates {
+                vlm_client.clear_tile_cache();
                 let compare_started_at = Instant::now();
                 emit_row_stage_event(
                     sink,

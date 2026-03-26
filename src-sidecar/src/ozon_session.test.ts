@@ -5,6 +5,8 @@ import {
   classifyOzonSkuSearchSnapshot,
   classifyOzonLandingSnapshot,
   classifyOzonSnapshot,
+  shouldHopFromIncompleteSnapshot,
+  shouldHopFromResolvedSnapshot,
   isTransientPageNavigationError,
   isReusableBootstrapPageUrl,
   isOzonHomeUrl,
@@ -266,6 +268,85 @@ describe("shouldAttemptRecommendedProductHop", () => {
 
     expect(typeof hopGuard).toBe("function");
     expect(hopGuard?.(snapshot)).toBe(true);
+  });
+});
+
+describe("shouldHopFromResolvedSnapshot", () => {
+  test("requires hopping into the first product when a low-confidence generic title resolves on a multi-product page", () => {
+    const snapshot: OzonSnapshot = {
+      url: "https://www.ozon.ru/product/3560192694/",
+      documentTitle: "Чехол для планшета - купить на OZON",
+      title: "Чехол для планшета - купить на OZON",
+      imageUrl: "https://ir.ozone.ru/s3/multimedia-1-z/wc800/9119999447.jpg",
+      bodyText: "Чехол для планшета купить на ozon похожие товары",
+      hasAntiBotChallenge: false,
+      isUnavailable: false,
+      titleSource: "document_title",
+    };
+
+    expect(shouldHopFromResolvedSnapshot(snapshot)).toBe(true);
+  });
+
+  test("requires hopping when the page only exposes generic Ozon og metadata and the site logo image", () => {
+    const snapshot: OzonSnapshot = {
+      url: "https://www.ozon.ru/product/3560192694/",
+      documentTitle: "Чехол для планшета - купить на OZON",
+      title: "Чехол для планшета - купить на OZON",
+      titleSource: "meta_og",
+      imageUrl: "https://ir.ozone.ru/s3/cms/logo/og_ozon_ru.png",
+      imageSource: "meta_og",
+      bodyText: "Похожие предложения Рекомендуем также",
+      hasAntiBotChallenge: false,
+      isUnavailable: false,
+    };
+
+    expect(shouldHopFromResolvedSnapshot(snapshot)).toBe(true);
+  });
+
+  test("keeps real detail pages on the current product when the title comes from structured product data", () => {
+    const snapshot: OzonSnapshot = {
+      url: "https://www.ozon.ru/product/3552213000/",
+      documentTitle: "Морская верёвочная лестница",
+      title: "Морская верёвочная лестница",
+      imageUrl: "https://cdn.ozon.ru/images/main.jpeg",
+      bodyText: "Описание товара",
+      hasAntiBotChallenge: false,
+      isUnavailable: false,
+      titleSource: "json_ld",
+    };
+
+    expect(shouldHopFromResolvedSnapshot(snapshot)).toBe(false);
+  });
+});
+
+describe("shouldHopFromIncompleteSnapshot", () => {
+  test("requires hopping when an intermediate page exposes only generic marketplace text before the real detail page", () => {
+    const snapshot: OzonSnapshot = {
+      url: "https://www.ozon.ru/product/3569938663/",
+      documentTitle: "Чехол для планшета - купить на OZON",
+      title: "Чехол для планшета - купить на OZON",
+      titleSource: "document_title",
+      imageUrl: null,
+      bodyText: "Похожие предложения Рекомендуем также",
+      hasAntiBotChallenge: false,
+      isUnavailable: false,
+    };
+
+    expect(shouldHopFromIncompleteSnapshot(snapshot)).toBe(true);
+  });
+
+  test("does not hop from explicit not-found pages even if recommendation text is present", () => {
+    const snapshot: OzonSnapshot = {
+      url: "https://www.ozon.ru/product/3570411009/",
+      documentTitle: "Такой страницы не существует",
+      title: null,
+      imageUrl: null,
+      bodyText: "Такой страницы не существует Похожие предложения",
+      hasAntiBotChallenge: false,
+      isUnavailable: false,
+    };
+
+    expect(shouldHopFromIncompleteSnapshot(snapshot)).toBe(false);
   });
 });
 

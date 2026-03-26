@@ -39,6 +39,19 @@ fn candidate_with_rank(
     }
 }
 
+fn candidate_series(count: usize) -> Vec<Candidate> {
+    (0..count)
+        .map(|index| {
+            candidate_with_rank(
+                &format!("¥{}", 10 + index),
+                &format!("月销{}", 200 - index),
+                &format!("candidate-{index}"),
+                780,
+            )
+        })
+        .collect()
+}
+
 #[derive(Default)]
 struct RecordingFetcher {
     responses: Mutex<VecDeque<Result<Vec<Candidate>, String>>>,
@@ -301,6 +314,52 @@ fn process_candidates_returns_no_match_when_groups_succeed_without_hits() {
     .expect("candidate processing should succeed");
 
     assert_eq!(result, MatchSummary::NoMatch);
+}
+
+#[test]
+fn process_candidates_stops_after_first_screening_wave_when_early_hits_exist() {
+    let vlm = ScriptedVlm::with_replies(vec![Ok(vec![1]), Ok(vec![]), Ok(vec![1])]);
+
+    let result = process_candidates(
+        &vlm,
+        "data:image/png;base64,processed-search",
+        Some("data:image/jpeg;base64,source"),
+        candidate_series(27),
+        Some("candidate"),
+    )
+    .expect("candidate processing should succeed");
+
+    assert!(matches!(result, MatchSummary::Cheapest(_)));
+    assert_eq!(
+        vlm.recorded_calls()
+            .into_iter()
+            .map(|call| call.candidate_count)
+            .collect::<Vec<_>>(),
+        vec![9, 9, 1],
+    );
+}
+
+#[test]
+fn process_candidates_expands_to_second_screening_wave_after_early_miss() {
+    let vlm = ScriptedVlm::with_replies(vec![Ok(vec![]), Ok(vec![]), Ok(vec![1]), Ok(vec![1])]);
+
+    let result = process_candidates(
+        &vlm,
+        "data:image/png;base64,processed-search",
+        Some("data:image/jpeg;base64,source"),
+        candidate_series(27),
+        Some("candidate"),
+    )
+    .expect("candidate processing should succeed");
+
+    assert!(matches!(result, MatchSummary::Cheapest(_)));
+    assert_eq!(
+        vlm.recorded_calls()
+            .into_iter()
+            .map(|call| call.candidate_count)
+            .collect::<Vec<_>>(),
+        vec![9, 9, 9, 1],
+    );
 }
 
 #[test]

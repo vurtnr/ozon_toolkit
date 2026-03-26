@@ -134,6 +134,20 @@ impl DashScopeVlmClient {
             env::var("DASHSCOPE_API_KEY").map_err(|_| "❌ 找不到 DASHSCOPE_API_KEY".to_string())?;
         Self::new(api_key)
     }
+
+    pub fn clear_tile_cache(&self) {
+        if let Ok(mut tile_cache) = self.tile_cache.lock() {
+            tile_cache.clear();
+        }
+    }
+
+    #[cfg(test)]
+    fn tile_cache_len(&self) -> usize {
+        self.tile_cache
+            .lock()
+            .map(|tile_cache| tile_cache.len())
+            .unwrap_or(0)
+    }
 }
 
 #[derive(Debug)]
@@ -1003,12 +1017,13 @@ mod tests {
     use std::time::Duration;
 
     use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
+    use image::DynamicImage;
     use reqwest::blocking::Client;
 
     use super::{
         build_prompts, build_screening_prompts, create_grid_artifact, fit_within_dimensions,
-        parallel_map_limited, Candidate, ReferenceImages, VlmBatchRequest, VlmCallTrace,
-        VlmClient, VlmMatchResult,
+        parallel_map_limited, Candidate, DashScopeVlmClient, ReferenceImages, VlmBatchRequest,
+        VlmCallTrace, VlmClient, VlmMatchResult,
     };
 
     fn candidate(title: &str) -> Candidate {
@@ -1181,6 +1196,23 @@ mod tests {
         assert_eq!(super::resolve_parallel_vlm_batch_limit(2), 2);
         assert_eq!(super::resolve_parallel_vlm_batch_limit(3), 3);
         assert_eq!(super::resolve_parallel_vlm_batch_limit(4), 3);
+    }
+
+    #[test]
+    fn clear_tile_cache_drops_cached_tiles() {
+        let client = DashScopeVlmClient::new("test-key").expect("vlm client should construct");
+        client
+            .tile_cache
+            .lock()
+            .expect("tile cache lock")
+            .insert(
+                "300:https://img.example/candidate.jpg".to_string(),
+                DynamicImage::new_rgba8(1, 1),
+            );
+
+        assert_eq!(client.tile_cache_len(), 1);
+        client.clear_tile_cache();
+        assert_eq!(client.tile_cache_len(), 0);
     }
 
     #[derive(Default)]

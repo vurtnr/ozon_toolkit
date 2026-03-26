@@ -652,6 +652,55 @@ fn spawn_sidecar_ozon_resolve_server(
     (format!("http://{address}/resolve-ozon-product"), handle)
 }
 
+fn spawn_sidecar_ozon_resolve_sequence_server(
+    response_bodies: Vec<String>,
+) -> (String, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind ozon resolve listener");
+    listener
+        .set_nonblocking(true)
+        .expect("set ozon resolve listener nonblocking");
+    let address = listener
+        .local_addr()
+        .expect("resolve ozon resolve listener address");
+
+    let handle = thread::spawn(move || {
+        let started_at = Instant::now();
+        let mut remaining = response_bodies.into_iter();
+
+        loop {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let Some(response_body) = remaining.next() else {
+                        return;
+                    };
+
+                    let mut buffer = [0u8; 4096];
+                    let _ = stream.read(&mut buffer);
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        response_body.len(),
+                        response_body
+                    );
+                    let _ = stream.write_all(response.as_bytes());
+
+                    if remaining.len() == 0 {
+                        return;
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if started_at.elapsed() >= Duration::from_secs(30) {
+                        return;
+                    }
+                    thread::sleep(Duration::from_millis(20));
+                }
+                Err(_) => return,
+            }
+        }
+    });
+
+    (format!("http://{address}/resolve-ozon-product"), handle)
+}
+
 fn spawn_sidecar_ozon_sku_resolve_server(
     response_body: String,
     max_requests: usize,
@@ -1714,6 +1763,56 @@ fn run_task_pauses_and_skips_row_after_max_ozon_antibot_retries() {
     clear_mock_pipeline_env();
     clear_sidecar_fixture_env();
     resolve_handle.join().expect("join ozon resolve server");
+    remove_if_exists(&excel_path);
+    remove_if_exists(&result_path);
+}
+
+#[test]
+fn run_task_finalizes_row_when_ozon_antibot_retry_ends_in_unavailable() {
+    let _guard = lock_env();
+    GLOBAL_RECOVERY_GATE.resume();
+    clear_mock_pipeline_env();
+    clear_sidecar_fixture_env();
+
+    let excel_path = make_temp_excel_path();
+    let result_path = excel_path.with_file_name("result.xlsx");
+    create_url_mode_workbook(
+        &excel_path,
+        &[("https://www.ozon.ru/product/3570411009", "SKU-ANTIBOT-UNAVAILABLE", "400 g")],
+    );
+
+    let (resolve_url, resolve_handle) = spawn_sidecar_ozon_resolve_sequence_server(vec![
+        r#"{"success":false,"code":"ANTI_BOT_CHALLENGE","error":"[ANTI_BOT_CHALLENGE] Ozon page blocked"}"#.to_string(),
+        r#"{"success":false,"error":"[OZON_PRODUCT_UNAVAILABLE] Ozon 商品页显示为不可访问或已下架"}"#.to_string(),
+    ]);
+    std::env::set_var("SIDECAR_OZON_RESOLVE_URL", &resolve_url);
+    set_mock_vlm_env(r#"[]"#);
+
+    let gate_resume_handle = std::thread::spawn(|| {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while std::time::Instant::now() < deadline {
+            if GLOBAL_RECOVERY_GATE.is_paused() {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                GLOBAL_RECOVERY_GATE.resume();
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    });
+
+    let mut sink = CollectingSink::default();
+    let summary = run_task_with_sink(excel_path.to_string_lossy().as_ref(), &mut sink)
+        .expect("task should complete and finalize the row after retrying ozon anti-bot");
+
+    assert_eq!(summary.status, "completed");
+    let final_rows = final_row_event_payloads(&sink);
+    assert_eq!(final_rows.len(), 1);
+    assert_eq!(final_rows[0]["status"], "Ozon商品已下架或不可访问");
+
+    gate_resume_handle.join().expect("join gate resume thread");
+    clear_mock_pipeline_env();
+    clear_sidecar_fixture_env();
+    resolve_handle.join().expect("join ozon resolve sequence server");
     remove_if_exists(&excel_path);
     remove_if_exists(&result_path);
 }

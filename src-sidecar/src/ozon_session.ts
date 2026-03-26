@@ -6,11 +6,16 @@ export interface OzonResolvePayload {
   imageBase64?: string;
 }
 
+export type OzonTitleSource = "json_ld" | "meta_og" | "h1" | "document_title";
+export type OzonImageSource = "json_ld" | "meta_og" | "dom_img";
+
 export interface OzonSnapshot {
   url: string;
   documentTitle: string;
   title: string | null;
+  titleSource?: OzonTitleSource;
   imageUrl: string | null;
+  imageSource?: OzonImageSource;
   bodyText: string;
   hasAntiBotChallenge: boolean;
   isUnavailable: boolean;
@@ -97,6 +102,22 @@ const OZON_UNAVAILABLE_TEXT_HINTS = [
   "нет в наличии",
 ];
 const OZON_SKU_NOT_FOUND_TEXT_HINTS = ["такой страницы не существует"];
+const OZON_GENERIC_RESOLVED_TITLE_HINTS = [
+  "купить на ozon",
+  "цена на ozon",
+  "доставка на ozon",
+];
+const OZON_GENERIC_IMAGE_URL_HINTS = [
+  "og_ozon_ru.png",
+  "/s3/cms/logo/",
+  "/cms/logo/",
+];
+const OZON_MULTI_PRODUCT_BODY_HINTS = [
+  "похожие товары",
+  "похожие предложения",
+  "с этим товаром ищут",
+  "рекомендуем также",
+];
 const OZON_SEARCH_INPUT_SELECTORS = [
   'input[type="search"]',
   'input[name="text"]',
@@ -375,7 +396,11 @@ export function selectFirstRecommendedProductHref(
 export async function collectOzonSnapshot(page: Page): Promise<OzonSnapshot> {
   return page.evaluate(
     (antiBotUrlHints: string[], antiBotTextHints: string[], unavailableTextHints: string[]) => {
-      const readJsonLdProduct = (): { title: string | null; imageUrl: string | null } => {
+      const readJsonLdProduct = (): {
+        title: string | null;
+        imageUrl: string | null;
+        titleSource: OzonTitleSource | null;
+      } => {
         const scripts = Array.from(
           document.querySelectorAll<HTMLScriptElement>('script[type="application/ld+json"]'),
         );
@@ -426,26 +451,42 @@ export async function collectOzonSnapshot(page: Page): Promise<OzonSnapshot> {
                       ? ((image as { url?: string }).url ?? null)
                       : null;
 
-              return { title, imageUrl };
+              return { title, imageUrl, titleSource: title ? "json_ld" : null };
             }
           } catch {}
         }
 
-        return { title: null, imageUrl: null };
+        return { title: null, imageUrl: null, titleSource: null };
       };
 
       const jsonLd = readJsonLdProduct();
+      const ogTitle =
+        document.querySelector('meta[property="og:title"]')?.getAttribute("content") || null;
+      const h1Title = document.querySelector("h1")?.textContent || null;
+      const documentTitle = document.title || "";
       const rawTitle =
         jsonLd.title ||
-        document.querySelector('meta[property="og:title"]')?.getAttribute("content") ||
-        document.querySelector("h1")?.textContent ||
-        document.title ||
+        ogTitle ||
+        h1Title ||
+        documentTitle ||
         null;
+      const titleSource =
+        jsonLd.titleSource ||
+        (ogTitle ? "meta_og" : null) ||
+        (h1Title ? "h1" : null) ||
+        (documentTitle.trim() ? "document_title" : null);
+      const ogImageUrl =
+        document.querySelector('meta[property="og:image"]')?.getAttribute("content") || null;
+      const domImageUrl = document.querySelector("img")?.getAttribute("src") || null;
       const rawImageUrl =
         jsonLd.imageUrl ||
-        document.querySelector('meta[property="og:image"]')?.getAttribute("content") ||
-        document.querySelector("img")?.getAttribute("src") ||
+        ogImageUrl ||
+        domImageUrl ||
         null;
+      const imageSource =
+        (jsonLd.imageUrl ? "json_ld" : null) ||
+        (ogImageUrl ? "meta_og" : null) ||
+        (domImageUrl ? "dom_img" : null);
       const bodyText = (document.body?.innerText || "").slice(0, 20_000);
       const normalizedBody = bodyText.toLowerCase();
       const normalizedTitle = (document.title || "").toLowerCase();
@@ -453,9 +494,11 @@ export async function collectOzonSnapshot(page: Page): Promise<OzonSnapshot> {
 
       return {
         url: window.location.href,
-        documentTitle: document.title || "",
+        documentTitle,
         title: rawTitle ? rawTitle.trim() : null,
+        titleSource: titleSource ?? undefined,
         imageUrl: rawImageUrl ? rawImageUrl.trim() : null,
+        imageSource: imageSource ?? undefined,
         bodyText,
         hasAntiBotChallenge:
           document.querySelector("#captcha-input") !== null ||
@@ -571,9 +614,65 @@ export function classifyOzonSnapshot(snapshot: OzonSnapshot): OzonPageState {
   return "incomplete";
 }
 
-export function shouldAttemptRecommendedProductHop(snapshot: OzonSnapshot): boolean {
+function snapshotHasExplicitNotFoundSignal(snapshot: OzonSnapshot): boolean {
   const normalizedText = normalizeOzonSnapshotText(snapshot);
-  return !OZON_SKU_NOT_FOUND_TEXT_HINTS.some((hint) => normalizedText.includes(hint));
+  return OZON_SKU_NOT_FOUND_TEXT_HINTS.some((hint) => normalizedText.includes(hint));
+}
+
+function snapshotHasGenericResolvedTitle(snapshot: OzonSnapshot): boolean {
+  const title = normalizeOzonTitle(snapshot.title);
+  if (!title) {
+    return false;
+  }
+  const normalizedTitle = title.toLowerCase();
+  return (
+    snapshot.titleSource !== "json_ld" &&
+    snapshot.titleSource !== "h1" &&
+    OZON_GENERIC_RESOLVED_TITLE_HINTS.some((hint) => normalizedTitle.includes(hint))
+  );
+}
+
+function snapshotHasGenericResolvedImage(snapshot: OzonSnapshot): boolean {
+  const normalizedImageUrl = normalizeOzonImageUrl(snapshot)?.toLowerCase() || "";
+  if (!normalizedImageUrl) {
+    return false;
+  }
+
+  return OZON_GENERIC_IMAGE_URL_HINTS.some((hint) => normalizedImageUrl.includes(hint));
+}
+
+function snapshotHasIntermediateBodySignal(snapshot: OzonSnapshot): boolean {
+  const normalizedBody = normalizeOzonSnapshotText(snapshot);
+  return OZON_MULTI_PRODUCT_BODY_HINTS.some((hint) => normalizedBody.includes(hint));
+}
+
+function snapshotLooksLikeIntermediateListing(snapshot: OzonSnapshot): boolean {
+  return snapshotHasGenericResolvedTitle(snapshot) || snapshotHasGenericResolvedImage(snapshot);
+}
+
+export function shouldHopFromResolvedSnapshot(snapshot: OzonSnapshot): boolean {
+  const title = normalizeOzonTitle(snapshot.title);
+  const imageUrl = normalizeOzonImageUrl(snapshot);
+  if (!title || !imageUrl) {
+    return false;
+  }
+
+  return !snapshotHasExplicitNotFoundSignal(snapshot) && snapshotLooksLikeIntermediateListing(snapshot);
+}
+
+export function shouldHopFromIncompleteSnapshot(snapshot: OzonSnapshot): boolean {
+  if (snapshotHasExplicitNotFoundSignal(snapshot)) {
+    return false;
+  }
+
+  return (
+    snapshotLooksLikeIntermediateListing(snapshot) ||
+    (!normalizeOzonTitle(snapshot.title) && snapshotHasIntermediateBodySignal(snapshot))
+  );
+}
+
+export function shouldAttemptRecommendedProductHop(snapshot: OzonSnapshot): boolean {
+  return !snapshotHasExplicitNotFoundSignal(snapshot);
 }
 
 export function classifyOzonSkuSearchSnapshot(
@@ -1372,6 +1471,22 @@ export async function resolveOzonProductViaSession(
     }
 
     if (snapshotState === "resolved") {
+      if (
+        !recommendedProductHopAttempted &&
+        shouldHopFromResolvedSnapshot(snapshot)
+      ) {
+        recommendedProductHopAttempted = true;
+        const jumpedIntoRecommendedProduct = await hopToFirstRecommendedProductDetail(
+          page,
+          snapshot.url || canonicalProductUrl,
+          dependencies.delay,
+        );
+        if (jumpedIntoRecommendedProduct) {
+          await dependencies.delay(500);
+          continue;
+        }
+      }
+
       const title = normalizeOzonTitle(snapshot.title);
       const imageUrl = normalizeOzonImageUrl(snapshot);
       if (!title || !imageUrl) {
@@ -1386,6 +1501,23 @@ export async function resolveOzonProductViaSession(
         dependencies.delay,
       );
       return imageBase64 ? { title, imageUrl, imageBase64 } : { title, imageUrl };
+    }
+
+    if (
+      snapshotState === "incomplete" &&
+      !recommendedProductHopAttempted &&
+      shouldHopFromIncompleteSnapshot(snapshot)
+    ) {
+      recommendedProductHopAttempted = true;
+      const jumpedIntoRecommendedProduct = await hopToFirstRecommendedProductDetail(
+        page,
+        snapshot.url || canonicalProductUrl,
+        dependencies.delay,
+      );
+      if (jumpedIntoRecommendedProduct) {
+        await dependencies.delay(500);
+        continue;
+      }
     }
 
     await dependencies.delay(dependencies.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS);

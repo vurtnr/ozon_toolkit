@@ -18,7 +18,7 @@ fn make_temp_dir(name: &str) -> PathBuf {
 }
 
 fn sample_resolution() -> OzonProductResolution {
-    let image = RgbaImage::from_fn(2, 2, |x, y| {
+    let image = RgbaImage::from_fn(320, 320, |x, y| {
         if (x + y) % 2 == 0 {
             Rgba([220, 40, 40, 255])
         } else {

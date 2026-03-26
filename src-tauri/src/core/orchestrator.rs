@@ -9,6 +9,7 @@ use super::types::{Candidate, MatchSummary};
 use super::vlm::{normalize_match_ids, ReferenceImages, VlmBatchRequest, VlmCallTrace, VlmClient};
 
 const FINAL_REVIEW_BATCH_SIZE: usize = 4;
+const EARLY_SCREENING_CHUNK_COUNT: usize = 2;
 
 pub trait CandidateFetcher {
     fn fetch_candidates(&self, image_path: &Path) -> Result<Vec<Candidate>, String>;
@@ -338,45 +339,43 @@ where
             diagnostics: CandidateProcessDiagnostics::default(),
         });
     }
-    diagnostics.screening_candidate_count += selected_candidates.len();
     let chunks = selected_candidates
         .chunks(super::matcher::GRID_CANDIDATE_SIZE)
         .map(|chunk| chunk.to_vec())
         .collect::<Vec<_>>();
-    diagnostics.screening_chunk_count += chunks.len();
-
     let mut merged_matches = Vec::new();
     let mut has_success_group = false;
     let screening_started_at = Instant::now();
+    let early_chunk_count = chunks.len().min(EARLY_SCREENING_CHUNK_COUNT);
+    let (early_chunks, late_chunks) = chunks.split_at(early_chunk_count);
+    let early_report = process_screening_wave(
+        vlm,
+        search_reference_image_base64,
+        ozon_name_opt,
+        diagnostics,
+        pass_label,
+        early_chunks,
+        0,
+    );
+    diagnostics.screening_candidate_count += early_report.processed_candidate_count;
+    diagnostics.screening_chunk_count += early_report.processed_chunk_count;
+    has_success_group |= early_report.has_success_group;
+    merged_matches.extend(early_report.matched_candidates);
 
-    let requests = chunks
-        .iter()
-        .map(|chunk| VlmBatchRequest {
-            references: ReferenceImages::screening(search_reference_image_base64),
-            candidates: chunk,
-        })
-        .collect::<Vec<_>>();
-
-    for (chunk_index, (chunk, result)) in chunks
-        .iter()
-        .zip(vlm.match_candidate_grids(&requests, ozon_name_opt))
-        .enumerate()
-    {
-        match result {
-            Ok(result) => {
-                let normalized = normalize_match_ids(&result.match_ids, chunk.len());
-                diagnostics.vlm_calls.push(RecordedVlmCall {
-                    pass_label: pass_label.to_string(),
-                    stage: VlmCallStage::Screening,
-                    chunk_index: chunk_index + 1,
-                    match_ids: normalized.clone(),
-                    trace: result.trace,
-                });
-                has_success_group = true;
-                merged_matches.extend(collect_matched_candidates(&chunk, &normalized));
-            }
-            Err(_) => {}
-        }
+    if merged_matches.is_empty() && !late_chunks.is_empty() {
+        let late_report = process_screening_wave(
+            vlm,
+            search_reference_image_base64,
+            ozon_name_opt,
+            diagnostics,
+            pass_label,
+            late_chunks,
+            early_chunk_count,
+        );
+        diagnostics.screening_candidate_count += late_report.processed_candidate_count;
+        diagnostics.screening_chunk_count += late_report.processed_chunk_count;
+        has_success_group |= late_report.has_success_group;
+        merged_matches.extend(late_report.matched_candidates);
     }
     diagnostics.screening_elapsed_ms += elapsed_millis(screening_started_at.elapsed());
 
@@ -404,6 +403,74 @@ where
         diagnostics,
         pass_label,
     ))
+}
+
+struct ScreeningWaveReport {
+    processed_candidate_count: usize,
+    processed_chunk_count: usize,
+    has_success_group: bool,
+    matched_candidates: Vec<Candidate>,
+}
+
+fn process_screening_wave<V>(
+    vlm: &V,
+    search_reference_image_base64: &str,
+    ozon_name_opt: Option<&str>,
+    diagnostics: &mut OrchestrationDiagnostics,
+    pass_label: &str,
+    chunks: &[Vec<Candidate>],
+    chunk_offset: usize,
+) -> ScreeningWaveReport
+where
+    V: VlmClient,
+{
+    if chunks.is_empty() {
+        return ScreeningWaveReport {
+            processed_candidate_count: 0,
+            processed_chunk_count: 0,
+            has_success_group: false,
+            matched_candidates: Vec::new(),
+        };
+    }
+
+    let requests = chunks
+        .iter()
+        .map(|chunk| VlmBatchRequest {
+            references: ReferenceImages::screening(search_reference_image_base64),
+            candidates: chunk,
+        })
+        .collect::<Vec<_>>();
+
+    let mut has_success_group = false;
+    let mut matched_candidates = Vec::new();
+    for (chunk_index, (chunk, result)) in chunks
+        .iter()
+        .zip(vlm.match_candidate_grids(&requests, ozon_name_opt))
+        .enumerate()
+    {
+        match result {
+            Ok(result) => {
+                let normalized = normalize_match_ids(&result.match_ids, chunk.len());
+                diagnostics.vlm_calls.push(RecordedVlmCall {
+                    pass_label: pass_label.to_string(),
+                    stage: VlmCallStage::Screening,
+                    chunk_index: chunk_offset + chunk_index + 1,
+                    match_ids: normalized.clone(),
+                    trace: result.trace,
+                });
+                has_success_group = true;
+                matched_candidates.extend(collect_matched_candidates(chunk, &normalized));
+            }
+            Err(_) => {}
+        }
+    }
+
+    ScreeningWaveReport {
+        processed_candidate_count: chunks.iter().map(Vec::len).sum(),
+        processed_chunk_count: chunks.len(),
+        has_success_group,
+        matched_candidates,
+    }
 }
 
 fn resolve_no_match_reason(diagnostics: [&CandidateProcessDiagnostics; 2]) -> NoMatchReason {

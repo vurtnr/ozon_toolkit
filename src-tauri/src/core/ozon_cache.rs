@@ -30,6 +30,27 @@ struct OzonCacheMetadata {
     image_url: String,
 }
 
+pub fn validate_ozon_source_metadata(title: &str, image_url: &str) -> Result<(), String> {
+    let normalized_title = title.trim().to_lowercase();
+    let normalized_image_url = image_url.trim().to_lowercase();
+    let title_looks_generic = ["купить на ozon", "цена на ozon", "доставка на ozon"]
+        .into_iter()
+        .any(|hint| normalized_title.contains(hint));
+    let image_looks_generic = ["og_ozon_ru.png", "/s3/cms/logo/", "/cms/logo/"]
+        .into_iter()
+        .any(|hint| normalized_image_url.contains(hint));
+
+    if title_looks_generic || image_looks_generic {
+        return Err("generic ozon listing metadata".to_string());
+    }
+
+    Ok(())
+}
+
+fn validate_ozon_cache_metadata(metadata: &OzonCacheMetadata) -> Result<(), String> {
+    validate_ozon_source_metadata(&metadata.title, &metadata.image_url)
+}
+
 pub fn cache_root_for_output_anchor(output_anchor_path: &Path) -> PathBuf {
     output_anchor_path
         .parent()
@@ -83,6 +104,9 @@ impl OzonSourceCache {
                 "ozon cache metadata key mismatch".to_string(),
             ));
         }
+        if let Err(error) = validate_ozon_cache_metadata(&metadata) {
+            return Ok(OzonSourceCacheLookup::Corrupted(error));
+        }
 
         let image_bytes = match std::fs::read(&image_path) {
             Ok(bytes) => bytes,
@@ -122,6 +146,7 @@ impl OzonSourceCache {
             title: resolution.title.clone(),
             image_url: resolution.image_url.clone(),
         };
+        validate_ozon_cache_metadata(&metadata)?;
         let metadata_bytes = serde_json::to_vec_pretty(&metadata)
             .map_err(|e| format!("serialize ozon cache metadata failed: {e}"))?;
         let image_bytes = normalize_cache_image_bytes(&resolution.image_bytes)?;
@@ -260,5 +285,49 @@ mod tests {
             matches!(lookup, OzonSourceCacheLookup::Corrupted(_)),
             "tiny cached images should be invalidated instead of reused"
         );
+    }
+
+    #[test]
+    fn lookup_marks_generic_ozon_listing_cache_as_corrupted() {
+        let cache_root = std::env::temp_dir().join(format!(
+            "ozon-cache-generic-listing-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time should move forward")
+                .as_nanos()
+        ));
+        let cache = OzonSourceCache::new(cache_root.clone());
+        let source_key = "https://www.ozon.ru/product/3560192694/";
+        let entry_dir = cache
+            .entry_dir(source_key)
+            .expect("cache entry dir should resolve");
+        std::fs::create_dir_all(&entry_dir).expect("cache entry dir should exist");
+        std::fs::write(
+            entry_dir.join(CACHE_ENTRY_META_FILE),
+            serde_json::to_vec_pretty(&OzonCacheMetadata {
+                source_key: normalize_cache_source_key(source_key)
+                    .expect("source key should normalize"),
+                title: "Чехол для планшета - купить на OZON".to_string(),
+                image_url: "https://ir.ozone.ru/s3/cms/logo/og_ozon_ru.png".to_string(),
+            })
+            .expect("metadata should serialize"),
+        )
+        .expect("metadata should write");
+        std::fs::write(entry_dir.join(CACHE_ENTRY_IMAGE_FILE), build_png(320, 320))
+            .expect("image should write");
+
+        let lookup = cache.lookup(source_key).expect("lookup should succeed");
+
+        let _ = std::fs::remove_dir_all(cache_root);
+
+        match lookup {
+            OzonSourceCacheLookup::Corrupted(error) => {
+                assert!(
+                    error.contains("generic ozon listing metadata"),
+                    "unexpected corruption error: {error}"
+                );
+            }
+            other => panic!("expected generic listing cache entry to be invalidated, got {other:?}"),
+        }
     }
 }
