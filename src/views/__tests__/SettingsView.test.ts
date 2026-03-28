@@ -3,7 +3,9 @@ import {
   buildChromeDialogFilters,
   coerceSettings,
   detectPlatformFromUserAgent,
+  isValidProfitRatioInput,
   normalizeChromeExecutablePath,
+  sanitizeProfitRatioInput,
 } from "../../stores/settings";
 
 describe("Settings helpers", () => {
@@ -38,11 +40,25 @@ describe("Settings helpers", () => {
       "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
     );
     expect(settings.dashscopeApiKey).toBe("");
+    expect(settings.profitRatio).toBe("");
   });
 
   test("normalizes macOS app bundle paths into executable paths", () => {
     expect(normalizeChromeExecutablePath("/Applications/Google Chrome.app")).toBe(
       "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
     );
+  });
+
+  test("sanitizes profit ratio input to digits and two decimals", () => {
+    expect(sanitizeProfitRatioInput("12.3456")).toBe("12.34");
+    expect(sanitizeProfitRatioInput("abc18.2x5")).toBe("18.25");
+    expect(sanitizeProfitRatioInput("001.20")).toBe("001.20");
+  });
+
+  test("validates profit ratio input for task execution", () => {
+    expect(isValidProfitRatioInput("12.34")).toBe(true);
+    expect(isValidProfitRatioInput("0")).toBe(false);
+    expect(isValidProfitRatioInput("100")).toBe(false);
+    expect(isValidProfitRatioInput("")).toBe(false);
   });
 });

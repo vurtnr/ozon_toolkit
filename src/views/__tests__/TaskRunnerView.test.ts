@@ -43,10 +43,11 @@ describe("Task runner helpers", () => {
   });
 
   test("enables run only when upload has completed", () => {
-    expect(shouldEnableRun(false, false, "/tmp/uploaded.xlsx")).toBe(true);
-    expect(shouldEnableRun(false, true, "/tmp/uploaded.xlsx")).toBe(false);
-    expect(shouldEnableRun(true, false, "/tmp/uploaded.xlsx")).toBe(false);
-    expect(shouldEnableRun(false, false, "")).toBe(false);
+    expect(shouldEnableRun(false, false, "/tmp/uploaded.xlsx", true)).toBe(true);
+    expect(shouldEnableRun(false, true, "/tmp/uploaded.xlsx", true)).toBe(false);
+    expect(shouldEnableRun(true, false, "/tmp/uploaded.xlsx", true)).toBe(false);
+    expect(shouldEnableRun(false, false, "", true)).toBe(false);
+    expect(shouldEnableRun(false, false, "/tmp/uploaded.xlsx", false)).toBe(false);
   });
 
   test("formats file size text", () => {

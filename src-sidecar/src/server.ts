@@ -7,6 +7,7 @@ import { createServer } from "node:net";
 import express, { type Request, type Response } from "express";
 import puppeteer, { type Browser, type Page } from "puppeteer";
 import {
+  extract1688DetailFreight,
   search1688ByImage,
   shouldEnsureHomePageBeforeSessionCheck,
 } from "./1688_engine";
@@ -30,6 +31,11 @@ interface OzonResolveRequestBody {
 
 interface OzonSkuResolveRequestBody {
   sku?: string;
+}
+
+interface Resolve1688DetailPricingRequestBody {
+  itemUrl?: string;
+  cardPrice?: string;
 }
 
 interface SidecarErrorPayload {
@@ -588,6 +594,126 @@ async function ensure1688SessionReady(page: Page): Promise<void> {
   }
 }
 
+async function ensure1688DetailPageAccessible(page: Page): Promise<void> {
+  const snapshot = await collectSessionSnapshot(page);
+  if (snapshot.hasAntiBotChallenge) {
+    throw new Error("[ANTI_BOT_CHALLENGE] 触发 1688 底层拦截，请先在浏览器完成验证");
+  }
+  if (snapshotHasLoginSignal(snapshot)) {
+    throw new Error("[LOGIN_REQUIRED] 当前 1688 未登录，请先在浏览器完成登录");
+  }
+}
+
+async function collect1688DetailFreightSignals(page: Page): Promise<string[]> {
+  return page.evaluate(() => {
+    const isVisible = (element: Element | null): element is HTMLElement => {
+      if (!(element instanceof HTMLElement)) {
+        return false;
+      }
+      const style = window.getComputedStyle(element);
+      const rect = element.getBoundingClientRect();
+      return (
+        style.display !== "none" &&
+        style.visibility !== "hidden" &&
+        rect.width > 0 &&
+        rect.height > 0
+      );
+    };
+
+    const values = new Set<string>();
+    const pushText = (value: string | null | undefined) => {
+      const normalized = (value || "").replace(/\s+/g, " ").trim();
+      if (!normalized) {
+        return;
+      }
+      values.add(normalized);
+    };
+
+    const selectors = [
+      ".service-item",
+      '[class*="service-item"]',
+      '[class*="serviceItem"]',
+      '[class*="freight"]',
+      '[class*="logistics"]',
+    ];
+
+    const serviceNodes = Array.from(
+      document.querySelectorAll<HTMLElement>(selectors.join(",")),
+    );
+    for (const element of serviceNodes.slice(0, 120)) {
+      if (!isVisible(element)) {
+        continue;
+      }
+      pushText(element.innerText || element.textContent);
+      pushText(element.parentElement?.innerText || element.parentElement?.textContent);
+      pushText(
+        `${element.previousElementSibling?.textContent || ""} ${element.innerText || element.textContent || ""}`,
+      );
+      pushText(
+        `${element.innerText || element.textContent || ""} ${element.nextElementSibling?.textContent || ""}`,
+      );
+    }
+
+    if (values.size === 0) {
+      const fallbackNodes = Array.from(
+        document.querySelectorAll<HTMLElement>("div, span, em, b"),
+      );
+      for (const element of fallbackNodes.slice(0, 300)) {
+        if (!isVisible(element)) {
+          continue;
+        }
+        const text = (element.innerText || element.textContent || "").replace(/\s+/g, " ").trim();
+        if (!text) {
+          continue;
+        }
+        if (
+          text.includes("包邮") ||
+          text.includes("运费") ||
+          text.includes("物流") ||
+          text.includes("配送")
+        ) {
+          pushText(text);
+        }
+      }
+    }
+
+    return [...values];
+  });
+}
+
+async function resolve1688DetailPricingViaBrowser(itemUrl: string): Promise<{
+  freightText: string | null;
+  freightValue: number | null;
+  isFreeShipping: boolean;
+}> {
+  const browser = await ensureBrowserAlive();
+  const detailPage = await browser.newPage();
+
+  try {
+    await applyBrowserEvasions(detailPage);
+    await detailPage.goto(itemUrl, {
+      waitUntil: "domcontentloaded",
+      timeout: 60_000,
+    });
+    await delay(1_200);
+    await ensure1688DetailPageAccessible(detailPage);
+    await detailPage.waitForNetworkIdle({ timeout: 3_000 }).catch(() => undefined);
+
+    const signals = await collect1688DetailFreightSignals(detailPage);
+    const freight = extract1688DetailFreight(signals);
+
+    return freight ?? {
+      freightText: null,
+      freightValue: null,
+      isFreeShipping: false,
+    };
+  } finally {
+    if (!detailPage.isClosed()) {
+      await detailPage.close().catch(() => undefined);
+    }
+  }
+}
+
 async function resolveOzonProductViaBrowser(productUrl: string): Promise<OzonResolvePayload> {
   await ensureOzonBrowserAlive();
   try {
@@ -1023,6 +1149,32 @@ app.post("/search", async (req: Request<unknown, unknown, SearchRequestBody>, re
     return res.status(statusCode).json(payload);
   }
 });
+
+app.post(
+  "/resolve-1688-detail-pricing",
+  async (
+    req: Request<unknown, unknown, Resolve1688DetailPricingRequestBody>,
+    res: Response,
+  ) => {
+    const itemUrl = (req.body?.itemUrl || "").trim();
+    if (!itemUrl) {
+      return res.status(400).json({
+        success: false,
+        code: ERROR_CODES.UNKNOWN,
+        error: "missing itemUrl",
+      });
+    }
+
+    try {
+      const data = await resolve1688DetailPricingViaBrowser(itemUrl);
+      return res.json({ success: true, data });
+    } catch (error) {
+      const payload = buildErrorPayload(error);
+      const statusCode = payload.code === ERROR_CODES.UNKNOWN ? 500 : 200;
+      return res.status(statusCode).json(payload);
+    }
+  },
+);
 
 app.post(
   "/resolve-ozon-product",

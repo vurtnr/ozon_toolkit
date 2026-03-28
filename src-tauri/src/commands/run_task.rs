@@ -17,9 +17,10 @@ use tauri::Manager;
 
 use crate::config::{
     build_sidecar_env, load_settings_from_disk, resolve_effective_dashscope_api_key,
-    settings_file_path, AppSettings,
+    resolve_effective_profit_ratio, settings_file_path, AppSettings,
 };
 use crate::core::excel::extract_wps_images;
+use crate::core::matcher::parse_price_value;
 use crate::core::orchestrator::{
     orchestrate_match, CandidateFetcher, NoMatchReason, OrchestrationDiagnostics, SearchPass,
     VlmCallStage,
@@ -52,6 +53,8 @@ const DEFAULT_SIDECAR_SEARCH_URL: &str = "http://127.0.0.1:8266/search";
 const DEFAULT_SIDECAR_HEALTH_URL: &str = "http://127.0.0.1:8266/health";
 const DEFAULT_SIDECAR_SESSION_URL: &str = "http://127.0.0.1:8266/session-state";
 const DEFAULT_SIDECAR_OZON_RESOLVE_URL: &str = "http://127.0.0.1:8266/resolve-ozon-product";
+const DEFAULT_SIDECAR_1688_DETAIL_PRICING_URL: &str =
+    "http://127.0.0.1:8266/resolve-1688-detail-pricing";
 const DEFAULT_SIDECAR_OZON_CLOSE_URL: &str = "http://127.0.0.1:8266/close-ozon-session";
 const DEFAULT_SIDECAR_SHUTDOWN_URL: &str = "http://127.0.0.1:8266/shutdown";
 const MOCK_CANDIDATES_ENV: &str = "RUN_TASK_MOCK_CANDIDATES_JSON";
@@ -66,6 +69,7 @@ const SIDECAR_SHUTDOWN_URL_ENV: &str = "SIDECAR_SHUTDOWN_URL";
 const SIDECAR_URL_ENV: &str = "SIDECAR_SEARCH_URL";
 const SIDECAR_SESSION_URL_ENV: &str = "SIDECAR_SESSION_URL";
 const SIDECAR_OZON_RESOLVE_URL_ENV: &str = "SIDECAR_OZON_RESOLVE_URL";
+const SIDECAR_1688_DETAIL_PRICING_URL_ENV: &str = "SIDECAR_1688_DETAIL_PRICING_URL";
 const SIDECAR_OZON_CLOSE_URL_ENV: &str = "SIDECAR_OZON_CLOSE_URL";
 const SIDECAR_EXECUTABLE_PATH_ENV: &str = "SIDECAR_EXECUTABLE_PATH";
 const SIDECAR_PROFILE_DIR_ENV: &str = "SIDECAR_PROFILE_DIR";
@@ -191,6 +195,14 @@ struct SidecarSearchRequest {
 }
 
 #[derive(Debug, Serialize)]
+struct Sidecar1688DetailPricingRequest {
+    #[serde(rename = "itemUrl")]
+    item_url: String,
+    #[serde(rename = "cardPrice")]
+    card_price: String,
+}
+
+#[derive(Debug, Serialize)]
 struct SidecarOzonResolveRequest {
     #[serde(rename = "productUrl")]
     product_url: String,
@@ -200,6 +212,24 @@ struct SidecarOzonResolveRequest {
 struct SidecarSearchResponse {
     success: bool,
     data: Option<Vec<Candidate>>,
+    code: Option<String>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct Sidecar1688DetailPricingPayload {
+    #[serde(rename = "freightText")]
+    freight_text: Option<String>,
+    #[serde(rename = "freightValue")]
+    freight_value: Option<f64>,
+    #[serde(rename = "isFreeShipping", default)]
+    is_free_shipping: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct Sidecar1688DetailPricingResponse {
+    success: bool,
+    data: Option<Sidecar1688DetailPricingPayload>,
     code: Option<String>,
     error: Option<String>,
 }
@@ -993,6 +1023,14 @@ fn sidecar_ozon_resolve_url() -> String {
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
         .unwrap_or_else(|| DEFAULT_SIDECAR_OZON_RESOLVE_URL.to_string())
+}
+
+fn sidecar_1688_detail_pricing_url() -> String {
+    std::env::var(SIDECAR_1688_DETAIL_PRICING_URL_ENV)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| DEFAULT_SIDECAR_1688_DETAIL_PRICING_URL.to_string())
 }
 
 fn sidecar_ozon_close_url() -> String {
@@ -1935,27 +1973,242 @@ fn fetch_candidates_with_session_recovery(
     }
 }
 
+fn format_1688_price_value(value: f64) -> String {
+    let normalized = format!("{value:.2}");
+    let trimmed = normalized.trim_end_matches('0').trim_end_matches('.');
+    format!("¥{trimmed}")
+}
+
+fn merge_1688_price_with_freight(card_price: &str, freight_value: Option<f64>) -> String {
+    let Some(freight) = freight_value.filter(|value| value.is_finite() && *value > 0.0) else {
+        return card_price.to_string();
+    };
+    let Some(base_price) = parse_price_value(card_price).filter(|value| value.is_finite()) else {
+        return card_price.to_string();
+    };
+
+    format_1688_price_value(base_price + freight)
+}
+
+fn fetch_1688_detail_pricing_from_sidecar(
+    client: &Client,
+    item_url: &str,
+    card_price: &str,
+) -> Result<Sidecar1688DetailPricingPayload, String> {
+    let request_body = Sidecar1688DetailPricingRequest {
+        item_url: item_url.to_string(),
+        card_price: card_price.to_string(),
+    };
+
+    let response = client
+        .post(sidecar_1688_detail_pricing_url())
+        .json(&request_body)
+        .send()
+        .map_err(|e| format!("request sidecar detail pricing failed: {e}"))?;
+
+    let status = response.status();
+    let text = response
+        .text()
+        .map_err(|e| format!("read sidecar detail pricing response failed: {e}"))?;
+
+    let parsed = serde_json::from_str::<Sidecar1688DetailPricingResponse>(&text)
+        .map_err(|e| format!("parse sidecar detail pricing response failed: {e}; body={text}"))?;
+
+    if !status.is_success() {
+        return Err(parsed
+            .code
+            .or(parsed.error)
+            .unwrap_or_else(|| format!("sidecar detail pricing http error {status}")));
+    }
+
+    if parsed.success {
+        return Ok(parsed.data.unwrap_or(Sidecar1688DetailPricingPayload {
+            freight_text: None,
+            freight_value: None,
+            is_free_shipping: false,
+        }));
+    }
+
+    Err(parsed
+        .code
+        .or(parsed.error)
+        .unwrap_or_else(|| "UNKNOWN_SIDECAR_DETAIL_PRICING_ERROR".to_string()))
+}
+
+fn fetch_1688_detail_pricing_with_session_recovery(
+    sink: &mut dyn EventSink,
+    client: &Client,
+    item_url: &str,
+    card_price: &str,
+) -> Result<Sidecar1688DetailPricingPayload, String> {
+    loop {
+        match fetch_1688_detail_pricing_from_sidecar(client, item_url, card_price) {
+            Ok(payload) => return Ok(payload),
+            Err(code) if code == CODE_LOGIN_REQUIRED => {
+                wait_for_sidecar_ready_session(sink, client)?;
+            }
+            Err(code) => return Err(code),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ProfitAnalysis {
+    competitor_price_text: Option<String>,
+    break_even_price_text: Option<String>,
+    listing_price_text: Option<String>,
+    is_profitable_text: Option<String>,
+    is_premium_text: Option<String>,
+}
+
+fn normalize_header_label(value: &str) -> String {
+    value.split_whitespace().collect::<String>().to_lowercase()
+}
+
+fn find_header_index(headers: &[String], aliases: &[&str]) -> Option<usize> {
+    let normalized_aliases = aliases
+        .iter()
+        .map(|alias| normalize_header_label(alias))
+        .collect::<Vec<_>>();
+    headers.iter().position(|header| {
+        let normalized = normalize_header_label(header);
+        normalized_aliases.iter().any(|alias| alias == &normalized)
+    })
+}
+
+fn get_row_cell_by_header_aliases<'a>(
+    headers: &[String],
+    row: &'a [String],
+    aliases: &[&str],
+) -> Option<&'a str> {
+    let index = find_header_index(headers, aliases)?;
+    row.get(index).map(String::as_str)
+}
+
+fn format_decimal_price(value: f64) -> String {
+    format!("{value:.2}")
+}
+
+fn parse_weight_grams(weight_text: &str) -> Option<f64> {
+    static WEIGHT_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+
+    let captures = WEIGHT_RE
+        .get_or_init(|| {
+            Regex::new(r"(?i)^\s*([0-9]+(?:\.[0-9]+)?)\s*g\s*$")
+                .expect("invalid weight regex")
+        })
+        .captures(weight_text.trim())?;
+
+    captures
+        .get(1)
+        .and_then(|value| value.as_str().parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value >= 0.0)
+}
+
+fn build_profit_analysis(
+    cost_price_text: Option<&str>,
+    competitor_price_text: Option<&str>,
+    weight_text: Option<&str>,
+    profit_ratio: f64,
+) -> Result<ProfitAnalysis, String> {
+    if !profit_ratio.is_finite() || profit_ratio <= 0.0 || profit_ratio >= 100.0 {
+        return Err("利润比例必须大于 0 且小于 100".to_string());
+    }
+
+    let competitor_price_text = competitor_price_text
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+
+    let Some(cost_price_value) = cost_price_text.and_then(parse_price_value) else {
+        return Ok(ProfitAnalysis {
+            competitor_price_text,
+            ..ProfitAnalysis::default()
+        });
+    };
+    let Some(competitor_price_value) = competitor_price_text
+        .as_deref()
+        .and_then(parse_price_value)
+    else {
+        return Ok(ProfitAnalysis {
+            competitor_price_text,
+            ..ProfitAnalysis::default()
+        });
+    };
+    let Some(weight_grams) = weight_text.and_then(parse_weight_grams) else {
+        return Ok(ProfitAnalysis {
+            competitor_price_text,
+            ..ProfitAnalysis::default()
+        });
+    };
+
+    let break_even_price = if weight_grams < 500.0 {
+        cost_price_value + (3.0 + weight_grams * 0.035) + competitor_price_value * 0.169
+    } else {
+        cost_price_value + (16.0 + weight_grams * 0.025) + competitor_price_value * 0.229
+    };
+    let listing_price = break_even_price / (1.0 - profit_ratio / 100.0);
+    let is_profitable = competitor_price_value - break_even_price > 0.0;
+    let is_premium = listing_price > competitor_price_value;
+
+    Ok(ProfitAnalysis {
+        competitor_price_text,
+        break_even_price_text: Some(format_decimal_price(break_even_price)),
+        listing_price_text: Some(format_decimal_price(listing_price)),
+        is_profitable_text: Some(if is_profitable { "是" } else { "否" }.to_string()),
+        is_premium_text: Some(if is_premium { "是" } else { "否" }.to_string()),
+    })
+}
+
 fn write_result_workbook(
     result_path: &Path,
     headers: &[String],
     rows: &[TaskOutputRow],
     client: &Client,
+    profit_ratio: Option<f64>,
 ) -> Result<(), String> {
     let mut workbook = Workbook::new();
     let worksheet = workbook.add_worksheet();
     let header_format = Format::new().set_bold().set_background_color(Color::Silver);
+    let include_profit_columns = profit_ratio.is_some();
     let base_col_len = headers.len() as u16;
     let price_col = base_col_len;
-    let item_url_col = base_col_len + 1;
-    let status_col = base_col_len + 2;
-    let ai_col = base_col_len + 3;
-    let elapsed_col = base_col_len + 4;
-    let original_image_col = base_col_len + 5;
-    let matched_image_col = base_col_len + 6;
+    let competitor_price_col = price_col + 1;
+    let break_even_price_col = price_col + 2;
+    let listing_price_col = price_col + 3;
+    let profitable_col = price_col + 4;
+    let premium_col = price_col + 5;
+    let item_url_col = if include_profit_columns {
+        price_col + 6
+    } else {
+        price_col + 1
+    };
+    let status_col = item_url_col + 1;
+    let ai_col = item_url_col + 2;
+    let elapsed_col = item_url_col + 3;
+    let original_image_col = item_url_col + 4;
+    let matched_image_col = item_url_col + 5;
 
     worksheet
         .set_column_width(price_col, 12.0)
         .map_err(|e| format!("set result column width failed: {e}"))?;
+    if include_profit_columns {
+        worksheet
+            .set_column_width(competitor_price_col, 12.0)
+            .map_err(|e| format!("set result column width failed: {e}"))?;
+        worksheet
+            .set_column_width(break_even_price_col, 12.0)
+            .map_err(|e| format!("set result column width failed: {e}"))?;
+        worksheet
+            .set_column_width(listing_price_col, 12.0)
+            .map_err(|e| format!("set result column width failed: {e}"))?;
+        worksheet
+            .set_column_width(profitable_col, 12.0)
+            .map_err(|e| format!("set result column width failed: {e}"))?;
+        worksheet
+            .set_column_width(premium_col, 12.0)
+            .map_err(|e| format!("set result column width failed: {e}"))?;
+    }
     worksheet
         .set_column_width(item_url_col, 44.0)
         .map_err(|e| format!("set result column width failed: {e}"))?;
@@ -1983,6 +2236,23 @@ fn write_result_workbook(
     worksheet
         .write_string_with_format(0, price_col, "1688成本价", &header_format)
         .map_err(|e| format!("write result header failed: {e}"))?;
+    if include_profit_columns {
+        worksheet
+            .write_string_with_format(0, competitor_price_col, "竞品价格", &header_format)
+            .map_err(|e| format!("write result header failed: {e}"))?;
+        worksheet
+            .write_string_with_format(0, break_even_price_col, "保本售价", &header_format)
+            .map_err(|e| format!("write result header failed: {e}"))?;
+        worksheet
+            .write_string_with_format(0, listing_price_col, "产品定价", &header_format)
+            .map_err(|e| format!("write result header failed: {e}"))?;
+        worksheet
+            .write_string_with_format(0, profitable_col, "是否为盈利产品", &header_format)
+            .map_err(|e| format!("write result header failed: {e}"))?;
+        worksheet
+            .write_string_with_format(0, premium_col, "是否为优质产品", &header_format)
+            .map_err(|e| format!("write result header failed: {e}"))?;
+    }
     worksheet
         .write_string_with_format(0, item_url_col, "1688链接", &header_format)
         .map_err(|e| format!("write result header failed: {e}"))?;
@@ -2005,6 +2275,31 @@ fn write_result_workbook(
     let mut image_cache: HashMap<String, Option<Vec<u8>>> = HashMap::new();
     for (idx, row) in rows.iter().enumerate() {
         let write_row = (idx + 1) as u32;
+        let profit_analysis = if include_profit_columns {
+            let competitor_price_text =
+                get_row_cell_by_header_aliases(headers, &row.original_cells, &["竞品价格"])
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(ToOwned::to_owned);
+            let weight_text =
+                get_row_cell_by_header_aliases(headers, &row.original_cells, &["产品重量", "重量"]);
+            profit_ratio
+                .map(|ratio| {
+                    build_profit_analysis(
+                        row.price.as_deref(),
+                        competitor_price_text.as_deref(),
+                        weight_text,
+                        ratio,
+                    )
+                })
+                .transpose()?
+                .unwrap_or_else(|| ProfitAnalysis {
+                    competitor_price_text: competitor_price_text.clone(),
+                    ..ProfitAnalysis::default()
+                })
+        } else {
+            ProfitAnalysis::default()
+        };
 
         for (col_idx, value) in row.original_cells.iter().enumerate() {
             worksheet
@@ -2016,6 +2311,33 @@ fn write_result_workbook(
             worksheet
                 .write_string(write_row, price_col, price)
                 .map_err(|e| format!("write result row failed: {e}"))?;
+        }
+        if include_profit_columns {
+            if let Some(competitor_price) = &profit_analysis.competitor_price_text {
+                worksheet
+                    .write_string(write_row, competitor_price_col, competitor_price)
+                    .map_err(|e| format!("write result row failed: {e}"))?;
+            }
+            if let Some(break_even_price) = &profit_analysis.break_even_price_text {
+                worksheet
+                    .write_string(write_row, break_even_price_col, break_even_price)
+                    .map_err(|e| format!("write result row failed: {e}"))?;
+            }
+            if let Some(listing_price) = &profit_analysis.listing_price_text {
+                worksheet
+                    .write_string(write_row, listing_price_col, listing_price)
+                    .map_err(|e| format!("write result row failed: {e}"))?;
+            }
+            if let Some(is_profitable_text) = &profit_analysis.is_profitable_text {
+                worksheet
+                    .write_string(write_row, profitable_col, is_profitable_text)
+                    .map_err(|e| format!("write result row failed: {e}"))?;
+            }
+            if let Some(is_premium_text) = &profit_analysis.is_premium_text {
+                worksheet
+                    .write_string(write_row, premium_col, is_premium_text)
+                    .map_err(|e| format!("write result row failed: {e}"))?;
+            }
         }
         if let Some(item_url) = &row.item_url {
             worksheet
@@ -2155,6 +2477,48 @@ fn output_row_from_match(
     }
 }
 
+fn hydrate_output_row_1688_detail_pricing(
+    sink: &mut dyn EventSink,
+    client: &Client,
+    output_row: &mut TaskOutputRow,
+) -> Result<(), String> {
+    let Some(item_url) = output_row.item_url.clone() else {
+        return Ok(());
+    };
+    let Some(card_price) = output_row.price.clone() else {
+        return Ok(());
+    };
+
+    let detail_pricing =
+        fetch_1688_detail_pricing_with_session_recovery(sink, client, &item_url, &card_price)?;
+    let merged_price =
+        merge_1688_price_with_freight(&card_price, detail_pricing.freight_value);
+    let freight_label = if detail_pricing.is_free_shipping {
+        "包邮".to_string()
+    } else {
+        detail_pricing
+            .freight_text
+            .clone()
+            .unwrap_or_else(|| "未识别运费".to_string())
+    };
+    output_row.price = Some(merged_price);
+    emit_event(
+        sink,
+        EVENT_LOG,
+        &LogEvent {
+            level: "info".to_string(),
+            message: format!(
+                "{} 详情页运费={}，成本价已更新为 {}",
+                output_row.sku,
+                freight_label,
+                output_row.price.as_deref().unwrap_or(&card_price)
+            ),
+        },
+    )?;
+
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn emit_row_event(
     sink: &mut dyn EventSink,
@@ -2259,6 +2623,7 @@ fn no_match_status(reason: Option<&NoMatchReason>) -> &'static str {
 fn run_task_with_original_source_and_sink_inner<F>(
     excel_path: &str,
     original_source_excel_path: Option<&str>,
+    profit_ratio: Option<f64>,
     sink: &mut dyn EventSink,
     mut ensure_browser_ready: F,
 ) -> Result<RunTaskSummary, String>
@@ -2405,6 +2770,7 @@ where
             let mut original_image_bytes: Option<Vec<u8>> = None;
             let mut pending_diagnostics: Option<PendingDiagnosticsJob> = None;
             let mut row_stage_timings = RowStageTimings::default();
+            let row_started_at = Instant::now();
 
             if resolved_row.image_bytes.is_some() || use_mock_candidates {
                 vlm_client.clear_tile_cache();
@@ -2720,6 +3086,33 @@ where
 
             output_row.original_image_url = original_image_url;
             output_row.original_image_bytes = original_image_bytes;
+            match hydrate_output_row_1688_detail_pricing(sink, &client, &mut output_row) {
+                Ok(()) => {}
+                Err(code) if code == CODE_ANTI_BOT_CHALLENGE => {
+                    GLOBAL_RECOVERY_GATE.pause();
+                    emit_blocking_alert_if_needed(sink, CODE_ANTI_BOT_CHALLENGE)?;
+                    return Err(CODE_ANTI_BOT_CHALLENGE.to_string());
+                }
+                Err(code) if code == CODE_CHROME_NOT_FOUND => {
+                    emit_blocking_alert_if_needed(sink, CODE_CHROME_NOT_FOUND)?;
+                    return Err(CODE_CHROME_NOT_FOUND.to_string());
+                }
+                Err(error) => {
+                    emit_event(
+                        sink,
+                        EVENT_LOG,
+                        &LogEvent {
+                            level: "warn".to_string(),
+                            message: format!(
+                                "{} 详情页运费抓取失败，沿用搜索卡片价格: {error}",
+                                resolved_row.sku
+                            ),
+                        },
+                    )?;
+                }
+            }
+            output_row.compare_elapsed_text =
+                Some(format_elapsed_text(elapsed_millis(row_started_at.elapsed())));
             emit_final_row_result_event(sink, &output_row)?;
             if has_stage_timing_data(&row_stage_timings) {
                 emit_event(
@@ -2770,7 +3163,13 @@ where
             false,
         )?;
         output_rows.sort_by_key(|row| row.row_index);
-        write_result_workbook(&result_path, &task_workbook.headers, &output_rows, &client)?;
+        write_result_workbook(
+            &result_path,
+            &task_workbook.headers,
+            &output_rows,
+            &client,
+            profit_ratio,
+        )?;
 
         for handle in diagnostics_handles {
             match handle.join() {
@@ -2847,6 +3246,7 @@ pub fn run_task_with_original_source_and_sink(
     run_task_with_original_source_and_sink_inner(
         excel_path,
         original_source_excel_path,
+        None,
         sink,
         |_client| Ok(()),
     )
@@ -2863,6 +3263,12 @@ fn resolve_runtime_dashscope_api_key(window: &tauri::Window) -> Result<String, S
     let maybe_settings = load_runtime_settings(window);
 
     resolve_effective_dashscope_api_key(maybe_settings.as_ref())
+}
+
+fn resolve_runtime_profit_ratio(window: &tauri::Window) -> Result<f64, String> {
+    let maybe_settings = load_runtime_settings(window);
+
+    resolve_effective_profit_ratio(maybe_settings.as_ref())
 }
 
 fn load_runtime_settings(window: &tauri::Window) -> Option<AppSettings> {
@@ -3167,6 +3573,7 @@ pub async fn run_task(
 ) -> Result<RunTaskSummary, String> {
     let settings = load_runtime_settings(&window);
     let api_key = resolve_runtime_dashscope_api_key(&window)?;
+    let profit_ratio = resolve_runtime_profit_ratio(&window)?;
     let window_for_worker = window.clone();
     let app_handle = window.app_handle().clone();
 
@@ -3177,6 +3584,7 @@ pub async fn run_task(
         run_task_with_original_source_and_sink_inner(
             &excel_path,
             source_excel_path.as_deref(),
+            Some(profit_ratio),
             &mut sink,
             |client| ensure_sidecar_running(&app_handle, settings.as_ref(), &api_key, client),
         )
@@ -3429,5 +3837,156 @@ mod tests {
             prepared.finalized_rows[0].status,
             "Ozon商品已下架或不可访问"
         );
+    }
+
+    #[test]
+    fn merge_1688_price_with_freight_adds_detail_freight_to_card_price() {
+        assert_eq!(
+            merge_1688_price_with_freight("¥12.5-18.0", Some(6.0)),
+            "¥18.5"
+        );
+        assert_eq!(
+            merge_1688_price_with_freight("2件起批 ¥19.80", Some(3.2)),
+            "¥23"
+        );
+    }
+
+    #[test]
+    fn merge_1688_price_with_freight_preserves_original_when_freight_is_zero_or_missing() {
+        assert_eq!(merge_1688_price_with_freight("¥12.5-18.0", Some(0.0)), "¥12.5-18.0");
+        assert_eq!(merge_1688_price_with_freight("面议", Some(6.0)), "面议");
+        assert_eq!(merge_1688_price_with_freight("¥12.5", None), "¥12.5");
+    }
+
+    #[test]
+    fn parse_weight_grams_supports_g_only() {
+        assert_eq!(parse_weight_grams("100 g"), Some(100.0));
+        assert_eq!(parse_weight_grams("100g"), Some(100.0));
+        assert_eq!(parse_weight_grams("0 g"), Some(0.0));
+        assert_eq!(parse_weight_grams("1 kg"), None);
+    }
+
+    #[test]
+    fn build_profit_analysis_uses_lightweight_formula() {
+        let analysis = build_profit_analysis(Some("¥11.3"), Some("32.98"), Some("100 g"), 20.0)
+            .expect("analysis should parse");
+
+        assert_eq!(analysis.break_even_price_text, Some("23.37".to_string()));
+        assert_eq!(analysis.listing_price_text, Some("29.22".to_string()));
+        assert_eq!(analysis.is_profitable_text, Some("是".to_string()));
+        assert_eq!(analysis.is_premium_text, Some("否".to_string()));
+    }
+
+    #[test]
+    fn build_profit_analysis_uses_heavyweight_formula() {
+        let analysis = build_profit_analysis(Some("¥20"), Some("100"), Some("600 g"), 10.0)
+            .expect("analysis should parse");
+
+        assert_eq!(analysis.break_even_price_text, Some("73.90".to_string()));
+        assert_eq!(analysis.listing_price_text, Some("82.11".to_string()));
+        assert_eq!(analysis.is_profitable_text, Some("是".to_string()));
+        assert_eq!(analysis.is_premium_text, Some("否".to_string()));
+    }
+
+    #[test]
+    fn write_result_workbook_includes_profit_columns_when_ratio_is_available() {
+        let result_path = std::env::temp_dir().join(format!(
+            "desktop-app-profit-columns-{}-{}.xlsx",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time should move forward")
+                .as_nanos()
+        ));
+        let headers = vec![
+            "详情页地址".to_string(),
+            "SKU".to_string(),
+            "重量".to_string(),
+            "竞品价格".to_string(),
+        ];
+        let rows = vec![TaskOutputRow {
+            row_index: 2,
+            sku: "SKU-001".to_string(),
+            original_cells: vec![
+                "https://www.ozon.ru/product/1000001".to_string(),
+                "SKU-001".to_string(),
+                "100 g".to_string(),
+                "32.98".to_string(),
+            ],
+            status: "AI比对成功".to_string(),
+            ai_analysis_conclusion: Some("同款".to_string()),
+            compare_elapsed_text: Some("12.34s".to_string()),
+            price: Some("¥11.3".to_string()),
+            item_url: Some("https://detail.1688.com/offer/1.html".to_string()),
+            original_image_url: None,
+            original_image_bytes: None,
+            matched_image_url: None,
+        }];
+
+        write_result_workbook(&result_path, &headers, &rows, &Client::new(), Some(20.0))
+            .expect("result workbook should be written");
+
+        let mut workbook: Xlsx<_> =
+            open_workbook(&result_path).expect("result workbook should be readable");
+        let range = workbook
+            .worksheet_range_at(0)
+            .expect("worksheet should exist")
+            .expect("worksheet should be readable");
+
+        assert_eq!(
+            range.get_value((0, 4)).map(|value| value.to_string()),
+            Some("1688成本价".to_string())
+        );
+        assert_eq!(
+            range.get_value((0, 5)).map(|value| value.to_string()),
+            Some("竞品价格".to_string())
+        );
+        assert_eq!(
+            range.get_value((0, 6)).map(|value| value.to_string()),
+            Some("保本售价".to_string())
+        );
+        assert_eq!(
+            range.get_value((0, 7)).map(|value| value.to_string()),
+            Some("产品定价".to_string())
+        );
+        assert_eq!(
+            range.get_value((0, 8)).map(|value| value.to_string()),
+            Some("是否为盈利产品".to_string())
+        );
+        assert_eq!(
+            range.get_value((0, 9)).map(|value| value.to_string()),
+            Some("是否为优质产品".to_string())
+        );
+        assert_eq!(
+            range.get_value((0, 10)).map(|value| value.to_string()),
+            Some("1688链接".to_string())
+        );
+
+        assert_eq!(
+            range.get_value((1, 4)).map(|value| value.to_string()),
+            Some("¥11.3".to_string())
+        );
+        assert_eq!(
+            range.get_value((1, 5)).map(|value| value.to_string()),
+            Some("32.98".to_string())
+        );
+        assert_eq!(
+            range.get_value((1, 6)).map(|value| value.to_string()),
+            Some("23.37".to_string())
+        );
+        assert_eq!(
+            range.get_value((1, 7)).map(|value| value.to_string()),
+            Some("29.22".to_string())
+        );
+        assert_eq!(
+            range.get_value((1, 8)).map(|value| value.to_string()),
+            Some("是".to_string())
+        );
+        assert_eq!(
+            range.get_value((1, 9)).map(|value| value.to_string()),
+            Some("否".to_string())
+        );
+
+        let _ = std::fs::remove_file(&result_path);
     }
 }

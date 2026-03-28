@@ -4,7 +4,7 @@ use tauri::Manager;
 
 use crate::config::{
     load_settings_from_disk, save_settings_to_disk, settings_file_path,
-    validate_dashscope_api_key_if_present, AppSettings,
+    validate_dashscope_api_key_if_present, validate_profit_ratio_if_present, AppSettings,
 };
 
 fn settings_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
@@ -27,6 +27,7 @@ pub fn save_settings(app: tauri::AppHandle, settings: AppSettings) -> Result<(),
         // Keep key in current app process only; disk persistence is disabled in config store.
         std::env::set_var("DASHSCOPE_API_KEY", api_key);
     }
+    validate_profit_ratio_if_present(&settings.profit_ratio)?;
 
     let path = settings_path(&app)?;
     save_settings_to_disk(&path, &settings)

@@ -24,6 +24,7 @@ const canRun = computed(
       runner.running.value,
       runner.uploading.value,
       runner.uploadedExcelPath.value,
+      runner.hasValidProfitRatio.value,
     ),
 );
 const selectedFileName = computed(() =>
@@ -49,6 +50,7 @@ const runStatusText = computed(() => {
   if (runner.running.value) return "任务执行中";
   if (runner.uploading.value) return "文件上传中";
   if (canRun.value) return "环境已就绪，可启动任务";
+  if (!runner.hasValidProfitRatio.value) return "请先设置利润比例";
   return "等待 Excel 文件";
 });
 
@@ -230,6 +232,23 @@ onUnmounted(() => {
       <small class="upload-meta">{{ uploadBytesText }}</small>
     </div>
 
+    <label class="field">
+      <span class="field-label">利润比例 %</span>
+      <div class="field-stack">
+        <input
+          :value="runner.profitRatioInput.value"
+          type="text"
+          inputmode="decimal"
+          placeholder="例如 18.25"
+          @input="runner.updateProfitRatioInput(($event.target as HTMLInputElement).value)"
+        />
+        <small class="field-hint">
+          仅支持数字，最多两位小数。修改后自动保存到本机设置。
+          <span v-if="runner.profitRatioSaving.value">正在保存...</span>
+        </small>
+      </div>
+    </label>
+
     <div class="action-row">
       <button type="button" class="secondary-btn" :disabled="runner.uploading.value" @click="handleChooseFileClick">
         选择文件
@@ -257,6 +276,7 @@ onUnmounted(() => {
     <p v-if="dropHint" :class="dropHintType === 'success' ? 'feedback feedback--success' : 'feedback feedback--error'">
       {{ dropHint }}
     </p>
+    <p v-if="runner.profitRatioError.value" class="feedback feedback--error">{{ runner.profitRatioError.value }}</p>
     <p v-if="runner.errorMessage.value" class="feedback feedback--error">{{ runner.errorMessage.value }}</p>
     <p v-if="runner.summary.value" class="feedback feedback--success">
       已完成：{{ runner.summary.value.processed_rows }}/{{ runner.summary.value.total_rows }}
@@ -374,6 +394,45 @@ onUnmounted(() => {
   height: 100%;
   border-radius: inherit;
   background: linear-gradient(90deg, rgba(73, 140, 255, 0.95), rgba(111, 232, 255, 0.95));
+}
+
+.field {
+  display: grid;
+  gap: 0.55rem;
+}
+
+.field-label {
+  color: var(--text-muted);
+  font-size: 0.84rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.field-stack {
+  display: grid;
+  gap: 0.45rem;
+}
+
+.field-stack input {
+  width: 100%;
+  min-height: 3rem;
+  padding: 0.8rem 0.95rem;
+  border-radius: var(--radius-md);
+  border: 1px solid rgba(125, 169, 214, 0.2);
+  background: rgba(4, 11, 18, 0.86);
+  color: var(--text-primary);
+  transition: border-color 0.2s ease, box-shadow 0.2s ease;
+}
+
+.field-stack input:focus {
+  outline: none;
+  border-color: rgba(111, 232, 255, 0.45);
+  box-shadow: 0 0 0 3px rgba(111, 232, 255, 0.12);
+}
+
+.field-hint {
+  color: var(--text-muted);
+  line-height: 1.5;
 }
 
 .action-row {

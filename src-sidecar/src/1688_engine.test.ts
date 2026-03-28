@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   executeResultPageRecall,
+  extract1688DetailFreight,
   extractSalesText,
   isLikelySearchResultsUrl,
   shouldKeepWaitingForSearchConfirm,
@@ -55,6 +56,43 @@ describe("extractSalesText", () => {
   test("returns empty string when no sales signal exists", () => {
     expect(extractSalesText("暂无销量 店铺上新")).toBe("");
     expect(extractSalesText("")).toBe("");
+  });
+});
+
+describe("extract1688DetailFreight", () => {
+  test("treats 包邮 as zero freight", () => {
+    expect(
+      extract1688DetailFreight([
+        "48小时发货 包邮 7天包换",
+        "service-item split-border 包邮",
+      ]),
+    ).toEqual({
+      freightText: "¥0",
+      freightValue: 0,
+      isFreeShipping: true,
+    });
+  });
+
+  test("extracts freight amount from detail service signals", () => {
+    expect(
+      extract1688DetailFreight([
+        "48小时发货 运费 ¥6 起 7天包换",
+        "service-item split-border ¥6起",
+      ]),
+    ).toEqual({
+      freightText: "¥6",
+      freightValue: 6,
+      isFreeShipping: false,
+    });
+  });
+
+  test("ignores unrelated signals when freight is absent", () => {
+    expect(
+      extract1688DetailFreight([
+        "48小时发货 7天包换 破损包赔",
+        "service-item split-border 极速发货",
+      ]),
+    ).toBeNull();
   });
 });
 

@@ -5,7 +5,9 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "dev:tauri": "bun run scripts/run-tauri-pipeline.ts dev",
     "build": "vue-tsc --noEmit && vite build",
+    "build:tauri": "bun run scripts/run-tauri-pipeline.ts build",
     "preview": "vite preview",
     "tauri": "tauri"
   },

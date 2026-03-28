@@ -5,6 +5,7 @@ import {
   TARGETS,
   artifactNameForTarget,
   planBuild,
+  resolveHostTarget,
 } from "./build-sidecar";
 
 describe("sidecar build target mapping", () => {
@@ -45,6 +46,18 @@ describe("sidecar build target mapping", () => {
       "--outfile",
       "/tmp/desktop_app/src-tauri/binaries/engine-x86_64-pc-windows-msvc.exe",
     ]);
+  });
+
+  test("resolves macOS arm host to arm sidecar target", () => {
+    expect(resolveHostTarget("darwin", "arm64")).toBe(TARGETS.macosArm);
+  });
+
+  test("resolves macOS intel host to intel sidecar target", () => {
+    expect(resolveHostTarget("darwin", "x64")).toBe(TARGETS.macosIntel);
+  });
+
+  test("resolves windows x64 host to windows sidecar target", () => {
+    expect(resolveHostTarget("win32", "x64")).toBe(TARGETS.windowsX64);
   });
 
   test("sidecar package avoids compile-incompatible puppeteer extra plugins", () => {

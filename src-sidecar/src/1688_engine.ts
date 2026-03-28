@@ -13,6 +13,12 @@ export interface SearchResult {
   cosScore: number;
 }
 
+export interface DetailFreightResolution {
+  freightText: string;
+  freightValue: number;
+  isFreeShipping: boolean;
+}
+
 interface RectBox {
   left: number;
   top: number;
@@ -450,6 +456,56 @@ export function extractSalesText(cardText: string): string {
   }
 
   return "";
+}
+
+function parseCurrencyAmount(value: string): number | null {
+  const normalized = (value || "").replace(/\s+/g, "");
+  const matched =
+    normalized.match(/[¥￥]([0-9]+(?:\.[0-9]+)?)/) ||
+    normalized.match(/([0-9]+(?:\.[0-9]+)?)元/);
+  if (!matched?.[1]) return null;
+  const amount = Number.parseFloat(matched[1]);
+  return Number.isFinite(amount) ? amount : null;
+}
+
+function formatCurrencyAmount(value: number): string {
+  const normalized = value.toFixed(2).replace(/\.?0+$/, "");
+  return `¥${normalized}`;
+}
+
+export function extract1688DetailFreight(
+  signals: string[],
+): DetailFreightResolution | null {
+  const normalizedSignals = signals
+    .map((signal) => (signal || "").replace(/\s+/g, " ").trim())
+    .filter((signal) => signal.length > 0);
+
+  if (normalizedSignals.length === 0) {
+    return null;
+  }
+
+  if (normalizedSignals.some((signal) => signal.includes("包邮"))) {
+    return {
+      freightText: "¥0",
+      freightValue: 0,
+      isFreeShipping: true,
+    };
+  }
+
+  for (const signal of normalizedSignals) {
+    const amount = parseCurrencyAmount(signal);
+    if (amount === null) {
+      continue;
+    }
+
+    return {
+      freightText: formatCurrencyAmount(amount),
+      freightValue: amount,
+      isFreeShipping: false,
+    };
+  }
+
+  return null;
 }
 
 export type ResultPageRecallOptions = {

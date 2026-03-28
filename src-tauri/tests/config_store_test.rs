@@ -2,8 +2,8 @@ use std::path::PathBuf;
 
 use desktop_app_lib::config::{
     build_sidecar_env, load_settings_from_disk, normalize_chrome_executable_path,
-    resolve_effective_dashscope_api_key, save_settings_to_disk,
-    validate_dashscope_api_key_if_present, AppSettings,
+    resolve_effective_dashscope_api_key, resolve_effective_profit_ratio, save_settings_to_disk,
+    validate_dashscope_api_key_if_present, validate_profit_ratio_if_present, AppSettings,
 };
 
 fn temp_settings_path() -> PathBuf {
@@ -23,6 +23,7 @@ fn default_settings_are_empty() {
     let settings = AppSettings::default();
     assert_eq!(settings.dashscope_api_key, "");
     assert_eq!(settings.chrome_executable_path, "");
+    assert_eq!(settings.profit_ratio, "");
 }
 
 #[test]
@@ -32,6 +33,7 @@ fn settings_can_persist_and_reload() {
         dashscope_api_key: "secret-key".to_string(),
         chrome_executable_path: "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
             .to_string(),
+        profit_ratio: "18.25".to_string(),
     };
 
     save_settings_to_disk(&path, &settings).expect("save should succeed");
@@ -42,6 +44,7 @@ fn settings_can_persist_and_reload() {
         loaded.chrome_executable_path,
         "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
     );
+    assert_eq!(loaded.profit_ratio, "18.25");
 
     let _ = std::fs::remove_file(path);
 }
@@ -58,6 +61,7 @@ fn loading_settings_masks_legacy_persisted_api_key() {
     let loaded = load_settings_from_disk(&path).expect("load should succeed");
     assert_eq!(loaded.dashscope_api_key, "");
     assert_eq!(loaded.chrome_executable_path, "/tmp/chrome");
+    assert_eq!(loaded.profit_ratio, "");
 
     let _ = std::fs::remove_file(path);
 }
@@ -68,6 +72,7 @@ fn sidecar_env_includes_chrome_path_when_provided() {
         dashscope_api_key: "k".to_string(),
         chrome_executable_path: "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"
             .to_string(),
+        profit_ratio: String::new(),
     };
 
     let env = build_sidecar_env(&settings);
@@ -100,6 +105,7 @@ fn build_sidecar_env_normalizes_macos_app_bundle_paths() {
     let settings = AppSettings {
         dashscope_api_key: String::new(),
         chrome_executable_path: "/Applications/Google Chrome.app".to_string(),
+        profit_ratio: String::new(),
     };
 
     let env = build_sidecar_env(&settings);
@@ -140,6 +146,7 @@ fn effective_key_prefers_env_over_settings() {
     let settings = AppSettings {
         dashscope_api_key: "sk-settings-fallback-1234567890".to_string(),
         chrome_executable_path: String::new(),
+        profit_ratio: String::new(),
     };
     let resolved =
         resolve_effective_dashscope_api_key(Some(&settings)).expect("should resolve from env");
@@ -150,4 +157,29 @@ fn effective_key_prefers_env_over_settings() {
     } else {
         std::env::remove_var("DASHSCOPE_API_KEY");
     }
+}
+
+#[test]
+fn profit_ratio_validation_rejects_invalid_values() {
+    assert!(validate_profit_ratio_if_present("").is_ok());
+    assert!(validate_profit_ratio_if_present("0").is_err());
+    assert!(validate_profit_ratio_if_present("100").is_err());
+    assert!(validate_profit_ratio_if_present("18.256").is_err());
+    assert_eq!(
+        validate_profit_ratio_if_present("18.25").expect("valid profit ratio should parse"),
+        Some("18.25".to_string())
+    );
+}
+
+#[test]
+fn effective_profit_ratio_reads_from_settings() {
+    let settings = AppSettings {
+        dashscope_api_key: String::new(),
+        chrome_executable_path: String::new(),
+        profit_ratio: "18.25".to_string(),
+    };
+
+    let resolved =
+        resolve_effective_profit_ratio(Some(&settings)).expect("profit ratio should resolve");
+    assert!((resolved - 18.25).abs() < f64::EPSILON);
 }

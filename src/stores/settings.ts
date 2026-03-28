@@ -6,11 +6,13 @@ export type RuntimePlatform = "windows" | "macos" | "linux" | "unknown";
 export interface AppSettings {
   dashscopeApiKey: string;
   chromeExecutablePath: string;
+  profitRatio: string;
 }
 
 interface AppSettingsWire {
   dashscope_api_key: string;
   chrome_executable_path: string;
+  profit_ratio?: string;
 }
 
 export interface ChromeDialogFilter {
@@ -22,7 +24,33 @@ export function createDefaultSettings(): AppSettings {
   return {
     dashscopeApiKey: "",
     chromeExecutablePath: "",
+    profitRatio: "",
   };
+}
+
+export function sanitizeProfitRatioInput(value: string): string {
+  const filtered = value.replace(/[^\d.]/g, "");
+  const firstDot = filtered.indexOf(".");
+  if (firstDot < 0) {
+    return filtered;
+  }
+
+  const integerPart = filtered.slice(0, firstDot) || "0";
+  const decimalPart = filtered
+    .slice(firstDot + 1)
+    .replace(/\./g, "")
+    .slice(0, 2);
+  return `${integerPart}.${decimalPart}`;
+}
+
+export function isValidProfitRatioInput(value: string): boolean {
+  const normalized = value.trim();
+  if (!/^\d+(?:\.\d{1,2})?$/.test(normalized)) {
+    return false;
+  }
+
+  const parsed = Number.parseFloat(normalized);
+  return Number.isFinite(parsed) && parsed > 0 && parsed < 100;
 }
 
 export function normalizeChromeExecutablePath(value: string): string {
@@ -52,6 +80,7 @@ export function coerceSettings(input: Partial<AppSettings> | undefined): AppSett
     chromeExecutablePath: normalizeChromeExecutablePath(
       input?.chromeExecutablePath ?? "",
     ),
+    profitRatio: sanitizeProfitRatioInput(input?.profitRatio ?? ""),
   };
 }
 
@@ -60,6 +89,7 @@ function fromWire(wire: AppSettingsWire | null | undefined): AppSettings {
   return coerceSettings({
     dashscopeApiKey: wire.dashscope_api_key,
     chromeExecutablePath: wire.chrome_executable_path,
+    profitRatio: wire.profit_ratio ?? "",
   });
 }
 
@@ -69,6 +99,7 @@ function toWire(settings: AppSettings): AppSettingsWire {
     chrome_executable_path: normalizeChromeExecutablePath(
       settings.chromeExecutablePath,
     ),
+    profit_ratio: sanitizeProfitRatioInput(settings.profitRatio),
   };
 }
 

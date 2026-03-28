@@ -1,7 +1,15 @@
-import { onMounted, onUnmounted, ref } from "vue";
+import { computed, onMounted, onUnmounted, ref } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
+import {
+  createDefaultSettings,
+  isValidProfitRatioInput,
+  loadSettings,
+  sanitizeProfitRatioInput,
+  saveSettings,
+  type AppSettings,
+} from "../stores/settings";
 
 interface RunTaskSummary {
   excel_path: string;
@@ -88,8 +96,9 @@ export function shouldEnableRun(
   running: boolean,
   uploading: boolean,
   uploadedExcelPath: string,
+  hasValidProfitRatio: boolean,
 ): boolean {
-  return !running && !uploading && isAbsoluteXlsxPath(uploadedExcelPath);
+  return !running && !uploading && isAbsoluteXlsxPath(uploadedExcelPath) && hasValidProfitRatio;
 }
 
 export function formatFileSize(bytes: number): string {
@@ -113,6 +122,88 @@ export function useTaskRunner() {
   const errorMessage = ref("");
   const summary = ref<RunTaskSummary | null>(null);
   const uploadUnlisten = ref<UnlistenFn | null>(null);
+  const settings = ref<AppSettings>(createDefaultSettings());
+  const profitRatioInput = ref("");
+  const profitRatioLoading = ref(true);
+  const profitRatioSaving = ref(false);
+  const profitRatioError = ref("");
+  const hasLoadedProfitRatio = ref(false);
+  let profitRatioSaveTimer: ReturnType<typeof setTimeout> | null = null;
+
+  const hasValidProfitRatio = computed(() =>
+    isValidProfitRatioInput(profitRatioInput.value),
+  );
+
+  function clearProfitRatioSaveTimer() {
+    if (profitRatioSaveTimer) {
+      clearTimeout(profitRatioSaveTimer);
+      profitRatioSaveTimer = null;
+    }
+  }
+
+  async function persistProfitRatio(): Promise<boolean> {
+    clearProfitRatioSaveTimer();
+    const sanitized = sanitizeProfitRatioInput(profitRatioInput.value);
+    if (sanitized !== profitRatioInput.value) {
+      profitRatioInput.value = sanitized;
+    }
+
+    if (sanitized && !isValidProfitRatioInput(sanitized)) {
+      profitRatioError.value = "利润比例必须大于 0 且小于 100，并最多保留两位小数";
+      return false;
+    }
+
+    profitRatioSaving.value = true;
+    try {
+      settings.value = {
+        ...settings.value,
+        profitRatio: sanitized,
+      };
+      await saveSettings(settings.value);
+      profitRatioError.value = "";
+      return true;
+    } catch (error) {
+      profitRatioError.value = error instanceof Error ? error.message : String(error);
+      return false;
+    } finally {
+      profitRatioSaving.value = false;
+    }
+  }
+
+  async function loadRunnerSettings() {
+    profitRatioLoading.value = true;
+    try {
+      const loaded = await loadSettings();
+      settings.value = loaded;
+      profitRatioInput.value = sanitizeProfitRatioInput(loaded.profitRatio);
+      profitRatioError.value = "";
+    } catch (error) {
+      profitRatioError.value = error instanceof Error ? error.message : String(error);
+    } finally {
+      profitRatioLoading.value = false;
+      hasLoadedProfitRatio.value = true;
+    }
+  }
+
+  function queueProfitRatioSave() {
+    if (!hasLoadedProfitRatio.value) return;
+    clearProfitRatioSaveTimer();
+    profitRatioSaveTimer = setTimeout(() => {
+      void persistProfitRatio();
+    }, 300);
+  }
+
+  function updateProfitRatioInput(value: string) {
+    profitRatioInput.value = sanitizeProfitRatioInput(value);
+    if (!profitRatioInput.value) {
+      profitRatioError.value = "请输入利润比例";
+    } else if (!isValidProfitRatioInput(profitRatioInput.value)) {
+      profitRatioError.value = "利润比例必须大于 0 且小于 100，并最多保留两位小数";
+    } else {
+      profitRatioError.value = "";
+    }
+    queueProfitRatioSave();
+  }
 
   async function browseExcelFile(): Promise<"uploaded" | "cancelled" | "failed"> {
     errorMessage.value = "";
@@ -200,6 +291,15 @@ export function useTaskRunner() {
       errorMessage.value = "请先上传有效的 .xlsx 文件";
       return;
     }
+    if (!hasValidProfitRatio.value) {
+      profitRatioError.value = "请输入有效利润比例后再执行任务";
+      return;
+    }
+    const profitRatioPersisted = await persistProfitRatio();
+    if (!profitRatioPersisted) {
+      errorMessage.value = "利润比例保存失败，请修正后重试";
+      return;
+    }
 
     running.value = true;
     try {
@@ -216,10 +316,12 @@ export function useTaskRunner() {
 
   onMounted(() => {
     void startUploadProgressListening();
+    void loadRunnerSettings();
   });
 
   onUnmounted(() => {
     stopUploadProgressListening();
+    clearProfitRatioSaveTimer();
   });
 
   return {
@@ -230,8 +332,14 @@ export function useTaskRunner() {
     uploadProgress,
     errorMessage,
     summary,
+    profitRatioInput,
+    profitRatioLoading,
+    profitRatioSaving,
+    profitRatioError,
+    hasValidProfitRatio,
     browseExcelFile,
     setDroppedPath,
+    updateProfitRatioInput,
     runTask,
   };
 }

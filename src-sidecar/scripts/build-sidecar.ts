@@ -19,6 +19,25 @@ export function artifactNameForTarget(target: SidecarTarget): string {
   return ARTIFACT_NAME_BY_TARGET[target];
 }
 
+export function resolveHostTarget(
+  platform: NodeJS.Platform = process.platform,
+  arch: string = process.arch,
+): SidecarTarget {
+  if (platform === "darwin" && arch === "arm64") {
+    return TARGETS.macosArm;
+  }
+
+  if (platform === "darwin" && arch === "x64") {
+    return TARGETS.macosIntel;
+  }
+
+  if (platform === "win32" && arch === "x64") {
+    return TARGETS.windowsX64;
+  }
+
+  throw new Error(`unsupported host platform for sidecar build: ${platform}-${arch}`);
+}
+
 export interface BuildPlan {
   command: string[];
   cwd: string;
@@ -67,6 +86,10 @@ async function runPlan(plan: BuildPlan): Promise<void> {
 function parseTargets(args: string[]): SidecarTarget[] {
   if (args.includes("--all")) {
     return [TARGETS.macosIntel, TARGETS.macosArm, TARGETS.windowsX64];
+  }
+
+  if (args.includes("--host")) {
+    return [resolveHostTarget()];
   }
 
   const targetArgIndex = args.findIndex((arg) => arg === "--target");

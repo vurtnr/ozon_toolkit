@@ -5,9 +5,11 @@ use std::path::{Path, PathBuf};
 const MIN_DASHSCOPE_KEY_LEN: usize = 16;
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)]
 pub struct AppSettings {
     pub dashscope_api_key: String,
     pub chrome_executable_path: String,
+    pub profit_ratio: String,
 }
 
 pub fn settings_file_path(base_dir: &Path) -> PathBuf {
@@ -62,6 +64,7 @@ pub fn save_settings_to_disk(path: &Path, settings: &AppSettings) -> Result<(), 
     let persisted = AppSettings {
         dashscope_api_key: String::new(),
         chrome_executable_path: normalize_chrome_executable_path(&settings.chrome_executable_path),
+        profit_ratio: settings.profit_ratio.trim().to_string(),
     };
     let content = serde_json::to_string_pretty(&persisted)
         .map_err(|e| format!("serialize settings failed: {e}"))?;
@@ -94,6 +97,40 @@ pub fn validate_dashscope_api_key_if_present(value: &str) -> Result<Option<Strin
     Ok(Some(trimmed))
 }
 
+pub fn validate_profit_ratio_if_present(value: &str) -> Result<Option<String>, String> {
+    let Some(trimmed) = normalize_non_empty(value) else {
+        return Ok(None);
+    };
+
+    if trimmed.chars().any(|ch| ch.is_whitespace()) {
+        return Err("利润比例不能包含空白字符".to_string());
+    }
+    if !trimmed.chars().all(|ch| ch.is_ascii_digit() || ch == '.') {
+        return Err("利润比例只能包含数字，且最多保留两位小数".to_string());
+    }
+
+    let mut parts = trimmed.split('.');
+    let integer_part = parts.next().unwrap_or_default();
+    let fractional_part = parts.next();
+    if integer_part.is_empty() || parts.next().is_some() {
+        return Err("利润比例格式无效".to_string());
+    }
+    if let Some(fraction) = fractional_part {
+        if fraction.is_empty() || fraction.len() > 2 {
+            return Err("利润比例最多保留两位小数".to_string());
+        }
+    }
+
+    let parsed = trimmed
+        .parse::<f64>()
+        .map_err(|_| "利润比例格式无效".to_string())?;
+    if !parsed.is_finite() || parsed <= 0.0 || parsed >= 100.0 {
+        return Err("利润比例必须大于 0 且小于 100".to_string());
+    }
+
+    Ok(Some(trimmed))
+}
+
 pub fn resolve_effective_dashscope_api_key(
     settings: Option<&AppSettings>,
 ) -> Result<String, String> {
@@ -113,6 +150,18 @@ pub fn resolve_effective_dashscope_api_key(
         "未检测到有效 DASHSCOPE_API_KEY。请在系统环境变量中设置，或在设置页输入后保存。"
             .to_string(),
     )
+}
+
+pub fn resolve_effective_profit_ratio(settings: Option<&AppSettings>) -> Result<f64, String> {
+    if let Some(settings) = settings {
+        if let Some(valid) = validate_profit_ratio_if_present(&settings.profit_ratio)? {
+            return valid
+                .parse::<f64>()
+                .map_err(|_| "利润比例格式无效".to_string());
+        }
+    }
+
+    Err("未设置有效利润比例，请在首页输入大于 0 且小于 100 的利润比例。".to_string())
 }
 
 pub fn build_sidecar_env(settings: &AppSettings) -> Vec<(String, String)> {
