@@ -2149,7 +2149,7 @@ fn build_profit_analysis(
     };
     let listing_price = break_even_price / (1.0 - profit_ratio / 100.0);
     let is_profitable = competitor_price_value - break_even_price > 0.0;
-    let is_premium = listing_price > competitor_price_value;
+    let is_premium = listing_price < competitor_price_value;
 
     Ok(ProfitAnalysis {
         competitor_price_text,
@@ -3874,7 +3874,7 @@ mod tests {
         assert_eq!(analysis.break_even_price_text, Some("23.37".to_string()));
         assert_eq!(analysis.listing_price_text, Some("29.22".to_string()));
         assert_eq!(analysis.is_profitable_text, Some("是".to_string()));
-        assert_eq!(analysis.is_premium_text, Some("否".to_string()));
+        assert_eq!(analysis.is_premium_text, Some("是".to_string()));
     }
 
     #[test]
@@ -3885,7 +3885,7 @@ mod tests {
         assert_eq!(analysis.break_even_price_text, Some("73.90".to_string()));
         assert_eq!(analysis.listing_price_text, Some("82.11".to_string()));
         assert_eq!(analysis.is_profitable_text, Some("是".to_string()));
-        assert_eq!(analysis.is_premium_text, Some("否".to_string()));
+        assert_eq!(analysis.is_premium_text, Some("是".to_string()));
     }
 
     #[test]
@@ -3984,7 +3984,7 @@ mod tests {
         );
         assert_eq!(
             range.get_value((1, 9)).map(|value| value.to_string()),
-            Some("否".to_string())
+            Some("是".to_string())
         );
 
         let _ = std::fs::remove_file(&result_path);
