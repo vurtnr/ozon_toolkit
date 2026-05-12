@@ -7,6 +7,7 @@ import { createServer } from "node:net";
 import express, { type Request, type Response } from "express";
 import puppeteer, { type Browser, type Page } from "puppeteer";
 import {
+  resolve1688DetailPricing,
   search1688ByImage,
   shouldEnsureHomePageBeforeSessionCheck,
 } from "./1688_engine";
@@ -24,6 +25,18 @@ interface SearchRequestBody {
   forceFullCrop?: boolean;
 }
 
+interface CaptureImageRequestBody {
+  imageUrl?: string;
+}
+
+interface DetailPricingRequestBody {
+  itemUrl?: string;
+  cardPrice?: string;
+  matchedImageUrl?: string;
+  ozonTitle?: string;
+  ozonSpecProfile?: unknown;
+}
+
 interface OzonResolveRequestBody {
   productUrl?: string;
 }
@@ -36,6 +49,7 @@ interface SidecarErrorPayload {
   success: false;
   code: SidecarErrorCode;
   error: string;
+  diagnostics?: unknown;
 }
 
 export interface SessionSnapshot {
@@ -793,6 +807,35 @@ async function ensureBrowserAndPageAliveInner(): Promise<Page> {
   return ensurePageReadyForSessionCheck(globalHomePage);
 }
 
+async function captureImageViaBrowser(imageUrl: string): Promise<string> {
+  await ensureBrowserAliveInner();
+  const browser = globalBrowser;
+  if (!browser) {
+    throw new Error("1688 browser unavailable");
+  }
+
+  const page = await browser.newPage();
+  try {
+    await applyBrowserEvasions(page);
+    await page.goto(imageUrl, {
+      waitUntil: "networkidle2",
+      timeout: 30_000,
+    });
+    await page.setViewport({ width: 1200, height: 1200 });
+
+    const imageHandle = await page.$("img");
+    if (imageHandle) {
+      const screenshot = await imageHandle.screenshot({ type: "png" });
+      return Buffer.from(screenshot).toString("base64");
+    }
+
+    const screenshot = await page.screenshot({ type: "png" });
+    return Buffer.from(screenshot).toString("base64");
+  } finally {
+    await page.close().catch(() => undefined);
+  }
+}
+
 const ensureBrowserAlive = createSharedAsyncRunner(
   ensureBrowserAliveInner,
 );
@@ -883,12 +926,14 @@ function buildErrorPayload(error: unknown): SidecarErrorPayload {
   }
 
   const message = error instanceof Error ? error.message : String(error);
+  const diagnostics = extractDetailPricingDiagnostics(message);
 
   if (message.includes("[LOGIN_REQUIRED]")) {
     return {
       success: false,
       code: ERROR_CODES.LOGIN_REQUIRED,
       error: message,
+      diagnostics,
     };
   }
 
@@ -897,6 +942,7 @@ function buildErrorPayload(error: unknown): SidecarErrorPayload {
       success: false,
       code: ERROR_CODES.ANTI_BOT_CHALLENGE,
       error: message,
+      diagnostics,
     };
   }
 
@@ -905,6 +951,7 @@ function buildErrorPayload(error: unknown): SidecarErrorPayload {
       success: false,
       code: ERROR_CODES.OZON_SKU_NOT_FOUND,
       error: message,
+      diagnostics,
     };
   }
 
@@ -913,6 +960,7 @@ function buildErrorPayload(error: unknown): SidecarErrorPayload {
       success: false,
       code: ERROR_CODES.FULL_CROP_NOT_APPLIED,
       error: message,
+      diagnostics,
     };
   }
 
@@ -924,6 +972,7 @@ function buildErrorPayload(error: unknown): SidecarErrorPayload {
       success: false,
       code: ERROR_CODES.IMAGE_SEARCH_NOT_ENTERED_RESULT_PAGE,
       error: message,
+      diagnostics,
     };
   }
 
@@ -931,7 +980,21 @@ function buildErrorPayload(error: unknown): SidecarErrorPayload {
     success: false,
     code: ERROR_CODES.UNKNOWN,
     error: message,
+    diagnostics,
   };
+}
+
+function extractDetailPricingDiagnostics(message: string): unknown {
+  const marker = "diag=";
+  const index = message.indexOf(marker);
+  if (index < 0) return undefined;
+  const raw = message.slice(index + marker.length).trim();
+  if (!raw) return undefined;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return undefined;
+  }
 }
 
 export function createHealthHandler() {
@@ -1002,9 +1065,9 @@ app.post("/search", async (req: Request<unknown, unknown, SearchRequestBody>, re
   };
 
   try {
-    let candidates;
+    let recallResult;
     try {
-      candidates = await runSearch();
+      recallResult = await runSearch();
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       const shouldRetry = /Session closed|Target closed|Protocol error/i.test(message);
@@ -1013,16 +1076,84 @@ app.post("/search", async (req: Request<unknown, unknown, SearchRequestBody>, re
       }
 
       globalHomePage = null;
-      candidates = await runSearch();
+      recallResult = await runSearch();
     }
 
-    return res.json({ success: true, data: candidates });
+    return res.json({
+      success: true,
+      data: {
+        candidates: recallResult.results,
+        usedSecondPassFullCrop: recallResult.usedSecondPassFullCrop,
+      },
+    });
   } catch (error) {
     const payload = buildErrorPayload(error);
     const statusCode = payload.code === ERROR_CODES.UNKNOWN ? 500 : 200;
     return res.status(statusCode).json(payload);
   }
 });
+
+app.post(
+  "/capture-image",
+  async (req: Request<unknown, unknown, CaptureImageRequestBody>, res: Response) => {
+    const imageUrl = (req.body?.imageUrl || "").trim();
+    if (!imageUrl) {
+      return res.status(400).json({
+        success: false,
+        code: ERROR_CODES.UNKNOWN,
+        error: "missing imageUrl",
+      });
+    }
+
+    try {
+      const imageBase64 = await captureImageViaBrowser(imageUrl);
+      return res.json({
+        success: true,
+        data: { imageBase64 },
+      });
+    } catch (error) {
+      const payload = buildErrorPayload(error);
+      const statusCode = payload.code === ERROR_CODES.UNKNOWN ? 500 : 200;
+      return res.status(statusCode).json(payload);
+    }
+  },
+);
+
+app.post(
+  "/resolve-1688-detail-pricing",
+  async (req: Request<unknown, unknown, DetailPricingRequestBody>, res: Response) => {
+    const itemUrl = (req.body?.itemUrl || "").trim();
+    const cardPrice = (req.body?.cardPrice || "").trim();
+    const matchedImageUrl = (req.body?.matchedImageUrl || "").trim();
+    const ozonTitle = (req.body?.ozonTitle || "").trim();
+
+    if (!itemUrl) {
+      return res.status(400).json({
+        success: false,
+        code: ERROR_CODES.UNKNOWN,
+        error: "missing itemUrl",
+      });
+    }
+
+    try {
+      const activeHomePage = await ensureBrowserAndPageAlive();
+      await ensure1688SessionReady(activeHomePage);
+      const data = await resolve1688DetailPricing(
+        globalBrowser as Browser,
+        itemUrl,
+        cardPrice,
+        matchedImageUrl,
+        ozonTitle,
+        (req.body?.ozonSpecProfile as never) ?? null,
+      );
+      return res.json({ success: true, data });
+    } catch (error) {
+      const payload = buildErrorPayload(error);
+      const statusCode = payload.code === ERROR_CODES.UNKNOWN ? 500 : 200;
+      return res.status(statusCode).json(payload);
+    }
+  },
+);
 
 app.post(
   "/resolve-ozon-product",

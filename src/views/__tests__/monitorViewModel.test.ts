@@ -13,6 +13,7 @@ function buildRow(overrides: Partial<MonitorRow> = {}): MonitorRow {
     sku: "SKU-1",
     stage: "queued",
     status: "排队中",
+    recallMode: null,
     imageUrl: null,
     originalImageUrl: null,
     matchedImageUrl: null,
@@ -131,6 +132,19 @@ describe("monitorViewModel", () => {
     expect(presentation.emphasis).toBe("live");
   });
 
+  test("shows a dedicated live stage while source-image recall is running", () => {
+    const presentation = getStagePresentation(
+      buildRow({
+        stage: "searching_1688_source_image",
+        status: "源图搜索中",
+      }),
+    );
+
+    expect(presentation.label).toBe("源图搜索中");
+    expect(presentation.tone).toBe("info");
+    expect(presentation.emphasis).toBe("live");
+  });
+
   test("uses a blocking summary card instead of unlocked-result summary while task is paused", () => {
     const summaryCard = resolveOutcomeSummaryCard(
       0,
@@ -163,7 +177,8 @@ describe("monitorViewModel", () => {
         rowIndex: 2,
         sku: "SKU-2",
         stage: "screening_candidates",
-        status: "候选已召回，AI 初筛中",
+        status: "源图首搜已召回 12 个候选，AI复核中",
+        recallMode: "source_first_pass",
       }),
       buildRow({
         rowIndex: 3,

@@ -4,6 +4,22 @@ export interface OzonResolvePayload {
   title: string;
   imageUrl: string;
   imageBase64?: string;
+  specProfile?: OzonSpecProfile;
+}
+
+export interface OzonAttributeEntry {
+  key: string;
+  value: string;
+}
+
+export interface OzonSpecProfile {
+  color?: string;
+  sizeTokens: string[];
+  countTokens: string[];
+  material?: string;
+  modelTokens: string[];
+  featureTokens: string[];
+  rawAttributes: OzonAttributeEntry[];
 }
 
 export type OzonTitleSource = "json_ld" | "meta_og" | "h1" | "document_title";
@@ -17,6 +33,8 @@ export interface OzonSnapshot {
   imageUrl: string | null;
   imageSource?: OzonImageSource;
   bodyText: string;
+  rawAttributes?: OzonAttributeEntry[];
+  specProfile?: OzonSpecProfile;
   hasAntiBotChallenge: boolean;
   isUnavailable: boolean;
 }
@@ -127,6 +145,82 @@ const OZON_SEARCH_INPUT_SELECTORS = [
   'input[aria-label*="поиск" i]',
   'input[aria-label*="искать" i]',
 ];
+
+function dedupeTokens(values: string[]): string[] {
+  const seen = new Set<string>();
+  return values
+    .map((value) => value.trim())
+    .filter((value) => value.length > 0)
+    .filter((value) => {
+      const normalized = value.toLowerCase();
+      if (seen.has(normalized)) return false;
+      seen.add(normalized);
+      return true;
+    });
+}
+
+export function extractOzonNumericTokens(value: string): string[] {
+  return dedupeTokens(
+    (value.match(/\d+(?:\.\d+)?(?:\s?(?:cm|см|mm|мм|ml|мл|l|л|pcs|шт|件|pack|уп|г|kg|кг))?/gi) ||
+      [])
+      .map((token) => token.replace(/\s+/g, "")),
+  );
+}
+
+export function buildOzonSpecProfile(rawAttributes: OzonAttributeEntry[]): OzonSpecProfile {
+  let color: string | undefined;
+  let material: string | undefined;
+  const sizeTokens: string[] = [];
+  const countTokens: string[] = [];
+  const modelTokens: string[] = [];
+  const featureTokens: string[] = [];
+
+  for (const attribute of rawAttributes) {
+    const key = attribute.key.trim().toLowerCase();
+    const value = attribute.value.trim();
+    const normalizedValue = value.toLowerCase();
+    if (!key || !value) continue;
+
+    if (!color && /цвет|расцветка|оттенок/.test(key)) {
+      color = value;
+      continue;
+    }
+
+    if (!material && /материал/.test(key)) {
+      material = value;
+      continue;
+    }
+
+    if (/длина|ширина|высота|размер|габарит|объем|объём|диаметр|вес/.test(key)) {
+      sizeTokens.push(...extractOzonNumericTokens(value));
+      featureTokens.push(value);
+      continue;
+    }
+
+    if (/количество|комплект|набор|единиц|штук|шт|втоваре/.test(key.replace(/\s+/g, ""))) {
+      countTokens.push(...extractOzonNumericTokens(value));
+      featureTokens.push(value);
+      continue;
+    }
+
+    if (/модель|артикул|тип|вид|серия|стиль|форма/.test(key)) {
+      modelTokens.push(value);
+      continue;
+    }
+
+    featureTokens.push(value);
+  }
+
+  return {
+    color,
+    sizeTokens: dedupeTokens(sizeTokens),
+    countTokens: dedupeTokens(countTokens),
+    material,
+    modelTokens: dedupeTokens(modelTokens),
+    featureTokens: dedupeTokens(featureTokens),
+    rawAttributes: rawAttributes.filter((entry) => entry.key.trim() && entry.value.trim()),
+  };
+}
 
 type ReusableBootstrapPageLike = {
   url: () => string;
@@ -394,7 +488,7 @@ export function selectFirstRecommendedProductHref(
 }
 
 export async function collectOzonSnapshot(page: Page): Promise<OzonSnapshot> {
-  return page.evaluate(
+  const snapshot = await page.evaluate(
     (antiBotUrlHints: string[], antiBotTextHints: string[], unavailableTextHints: string[]) => {
       const readJsonLdProduct = (): {
         title: string | null;
@@ -488,6 +582,21 @@ export async function collectOzonSnapshot(page: Page): Promise<OzonSnapshot> {
         (ogImageUrl ? "meta_og" : null) ||
         (domImageUrl ? "dom_img" : null);
       const bodyText = (document.body?.innerText || "").slice(0, 20_000);
+      const rawAttributes = Array.from(document.querySelectorAll("dt, th, div, span"))
+        .map((node) => node as HTMLElement)
+        .flatMap((node) => {
+          const key = (node.innerText || node.textContent || "").trim();
+          if (!key || key.length > 80) return [];
+          if (!/(цвет|расцветка|оттенок|длина|ширина|высота|размер|габарит|объем|объём|диаметр|вес|количество|комплект|набор|единиц|штук|материал|модель|артикул|тип|вид|серия|стиль|форма)/i.test(key)) {
+            return [];
+          }
+
+          const next = node.nextElementSibling as HTMLElement | null;
+          const value = (next?.innerText || next?.textContent || "").trim();
+          if (!value || value.length > 120) return [];
+          return [{ key, value }];
+        })
+        .slice(0, 30);
       const normalizedBody = bodyText.toLowerCase();
       const normalizedTitle = (document.title || "").toLowerCase();
       const normalizedUrl = window.location.href.toLowerCase();
@@ -500,6 +609,7 @@ export async function collectOzonSnapshot(page: Page): Promise<OzonSnapshot> {
         imageUrl: rawImageUrl ? rawImageUrl.trim() : null,
         imageSource: imageSource ?? undefined,
         bodyText,
+        rawAttributes,
         hasAntiBotChallenge:
           document.querySelector("#captcha-input") !== null ||
           antiBotUrlHints.some((hint) => normalizedUrl.includes(hint)) ||
@@ -513,6 +623,11 @@ export async function collectOzonSnapshot(page: Page): Promise<OzonSnapshot> {
     OZON_BLOCKED_TEXT_HINTS,
     OZON_UNAVAILABLE_TEXT_HINTS,
   );
+
+  return {
+    ...snapshot,
+    specProfile: buildOzonSpecProfile(snapshot.rawAttributes || []),
+  };
 }
 
 export function isTransientPageNavigationError(error: unknown): boolean {
@@ -657,7 +772,11 @@ export function shouldHopFromResolvedSnapshot(snapshot: OzonSnapshot): boolean {
     return false;
   }
 
-  return !snapshotHasExplicitNotFoundSignal(snapshot) && snapshotLooksLikeIntermediateListing(snapshot);
+  return (
+    !snapshotHasExplicitNotFoundSignal(snapshot) &&
+    snapshotLooksLikeIntermediateListing(snapshot) &&
+    snapshotHasIntermediateBodySignal(snapshot)
+  );
 }
 
 export function shouldHopFromIncompleteSnapshot(snapshot: OzonSnapshot): boolean {
@@ -1500,7 +1619,9 @@ export async function resolveOzonProductViaSession(
         imageUrl,
         dependencies.delay,
       );
-      return imageBase64 ? { title, imageUrl, imageBase64 } : { title, imageUrl };
+      return imageBase64
+        ? { title, imageUrl, imageBase64, specProfile: snapshot.specProfile }
+        : { title, imageUrl, specProfile: snapshot.specProfile };
     }
 
     if (
@@ -1586,7 +1707,9 @@ export async function resolveOzonSkuViaSession(
           imageUrl,
           dependencies.delay,
         );
-        return imageBase64 ? { title, imageUrl, imageBase64 } : { title, imageUrl };
+      return imageBase64
+        ? { title, imageUrl, imageBase64, specProfile: snapshot.specProfile }
+        : { title, imageUrl, specProfile: snapshot.specProfile };
       }
 
       await dependencies.delay(dependencies.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS);

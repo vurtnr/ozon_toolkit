@@ -1,10 +1,12 @@
 import { describe, expect, test } from "bun:test";
 import * as ozonSession from "./ozon_session";
 import {
+  buildOzonSpecProfile,
   buildCanonicalOzonProductUrl,
   classifyOzonSkuSearchSnapshot,
   classifyOzonLandingSnapshot,
   classifyOzonSnapshot,
+  extractOzonNumericTokens,
   shouldHopFromIncompleteSnapshot,
   shouldHopFromResolvedSnapshot,
   isTransientPageNavigationError,
@@ -227,6 +229,28 @@ describe("classifyOzonSnapshot", () => {
   });
 });
 
+describe("buildOzonSpecProfile", () => {
+  test("promotes color, size and count fields from raw attributes", () => {
+    const profile = buildOzonSpecProfile([
+      { key: "Цвет товара", value: "Белый" },
+      { key: "Длина, см", value: "89 см" },
+      { key: "Количество предметов в упаковке", value: "2 шт" },
+      { key: "Материал", value: "ABS пластик" },
+    ]);
+
+    expect(profile.color).toBe("Белый");
+    expect(profile.sizeTokens).toContain("89см");
+    expect(profile.countTokens).toContain("2шт");
+    expect(profile.material).toBe("ABS пластик");
+  });
+});
+
+describe("extractOzonNumericTokens", () => {
+  test("keeps normalized numeric spec fragments", () => {
+    expect(extractOzonNumericTokens("89 см / 2 шт")).toEqual(["89см", "2шт"]);
+  });
+});
+
 describe("shouldAttemptRecommendedProductHop", () => {
   test("disables recommended-product hop on explicit not-found detail pages", () => {
     const snapshot: OzonSnapshot = {
@@ -313,6 +337,22 @@ describe("shouldHopFromResolvedSnapshot", () => {
       hasAntiBotChallenge: false,
       isUnavailable: false,
       titleSource: "json_ld",
+    };
+
+    expect(shouldHopFromResolvedSnapshot(snapshot)).toBe(false);
+  });
+
+  test("does not hop on a direct detail page when generic metadata exists but body lacks listing signals", () => {
+    const snapshot: OzonSnapshot = {
+      url: "https://www.ozon.ru/product/3560192694/",
+      documentTitle: "Чехол для планшета - купить на OZON",
+      title: "Чехол для планшета - купить на OZON",
+      titleSource: "meta_og",
+      imageUrl: "https://ir.ozone.ru/s3/cms/logo/og_ozon_ru.png",
+      imageSource: "meta_og",
+      bodyText: "Описание товара Характеристики Отзывы",
+      hasAntiBotChallenge: false,
+      isUnavailable: false,
     };
 
     expect(shouldHopFromResolvedSnapshot(snapshot)).toBe(false);

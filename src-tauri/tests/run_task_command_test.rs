@@ -382,6 +382,8 @@ fn clear_sidecar_fixture_env() {
     std::env::remove_var("SIDECAR_SEARCH_URL");
     std::env::remove_var("SIDECAR_OZON_RESOLVE_URL");
     std::env::remove_var("SIDECAR_OZON_CLOSE_URL");
+    std::env::remove_var("SIDECAR_CAPTURE_IMAGE_URL");
+    std::env::remove_var("SIDECAR_DETAIL_PRICING_URL");
 }
 
 fn spawn_sidecar_health_server() -> (String, thread::JoinHandle<()>) {
@@ -652,6 +654,154 @@ fn spawn_sidecar_ozon_resolve_server(
     (format!("http://{address}/resolve-ozon-product"), handle)
 }
 
+fn spawn_sidecar_capture_image_server(
+    image_bytes: Vec<u8>,
+    max_requests: usize,
+) -> (String, thread::JoinHandle<()>) {
+    let encoded_png = BASE64_STANDARD.encode(image_bytes);
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind capture image listener");
+    listener
+        .set_nonblocking(true)
+        .expect("set capture image listener nonblocking");
+    let address = listener
+        .local_addr()
+        .expect("resolve capture image listener address");
+
+    let handle = thread::spawn(move || {
+        let started_at = Instant::now();
+        let mut served = 0usize;
+
+        loop {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let mut buffer = [0u8; 4096];
+                    let _ = stream.read(&mut buffer);
+                    let body = format!(
+                        r#"{{"success":true,"data":{{"imageBase64":"{encoded_png}"}}}}"#
+                    );
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(response.as_bytes());
+                    served += 1;
+                    if served >= max_requests {
+                        return;
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if started_at.elapsed() >= Duration::from_secs(30) {
+                        return;
+                    }
+                    thread::sleep(Duration::from_millis(20));
+                }
+                Err(_) => return,
+            }
+        }
+    });
+
+    (format!("http://{address}/capture-image"), handle)
+}
+
+fn spawn_sidecar_detail_pricing_server(
+    response_body: String,
+    max_requests: usize,
+) -> (String, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind detail pricing listener");
+    listener
+        .set_nonblocking(true)
+        .expect("set detail pricing listener nonblocking");
+    let address = listener
+        .local_addr()
+        .expect("resolve detail pricing listener address");
+
+    let handle = thread::spawn(move || {
+        let started_at = Instant::now();
+        let mut served = 0usize;
+
+        loop {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let mut buffer = [0u8; 4096];
+                    let _ = stream.read(&mut buffer);
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        response_body.len(),
+                        response_body
+                    );
+                    let _ = stream.write_all(response.as_bytes());
+                    served += 1;
+                    if served >= max_requests {
+                        return;
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if started_at.elapsed() >= Duration::from_secs(30) {
+                        return;
+                    }
+                    thread::sleep(Duration::from_millis(20));
+                }
+                Err(_) => return,
+            }
+        }
+    });
+
+    (format!("http://{address}/resolve-1688-detail-pricing"), handle)
+}
+
+fn spawn_sidecar_recording_detail_pricing_server(
+    response_body: String,
+    max_requests: usize,
+    recorded_bodies: Arc<Mutex<Vec<String>>>,
+) -> (String, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind detail pricing listener");
+    listener
+        .set_nonblocking(true)
+        .expect("set detail pricing listener nonblocking");
+    let address = listener
+        .local_addr()
+        .expect("resolve detail pricing listener address");
+
+    let handle = thread::spawn(move || {
+        let started_at = Instant::now();
+        let mut served = 0usize;
+
+        loop {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let mut buffer = [0u8; 8192];
+                    let read = stream.read(&mut buffer).unwrap_or(0);
+                    let request = String::from_utf8_lossy(&buffer[..read]).to_string();
+                    recorded_bodies
+                        .lock()
+                        .expect("recorded bodies lock")
+                        .push(request);
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        response_body.len(),
+                        response_body
+                    );
+                    let _ = stream.write_all(response.as_bytes());
+                    served += 1;
+                    if served >= max_requests {
+                        return;
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if started_at.elapsed() >= Duration::from_secs(30) {
+                        return;
+                    }
+                    thread::sleep(Duration::from_millis(20));
+                }
+                Err(_) => return,
+            }
+        }
+    });
+
+    (format!("http://{address}/resolve-1688-detail-pricing"), handle)
+}
+
 fn spawn_sidecar_ozon_resolve_sequence_server(
     response_bodies: Vec<String>,
 ) -> (String, thread::JoinHandle<()>) {
@@ -792,13 +942,14 @@ fn run_task_accepts_absolute_excel_path_and_emits_all_events() {
     assert!(
         row_events
             .iter()
-            .any(|payload| payload["stage"] == "planning_search_image"),
-        "row event stream should eventually enter planning_search_image"
+            .any(|payload| payload["stage"] == "searching_1688_source_image"),
+        "row event stream should eventually enter source-image recall"
     );
     assert_eq!(final_row_events.len(), 2);
     assert_eq!(final_row_events[0]["sku"], "SKU-001");
     assert_eq!(final_row_events[1]["sku"], "SKU-002");
-    assert_eq!(final_row_events[0]["status"], "AI比对成功(主搜索图召回)");
+    assert_eq!(final_row_events[0]["status"], "AI比对成功(源图首搜命中)");
+    assert_eq!(final_row_events[0]["recall_mode"], "source_first_pass");
     assert_eq!(final_row_events[0]["price"], "¥12.34");
     assert_eq!(
         final_row_events[0]["item_url"],
@@ -828,8 +979,49 @@ fn run_task_accepts_absolute_excel_path_and_emits_all_events() {
     assert_eq!(progress_events[2]["processed"], 2);
 
     let logs = log_messages(&sink);
-    assert!(logs.iter().any(|line| line.contains("正在生成搜索图")));
-    assert!(logs.iter().any(|line| line.contains("主搜索图搜索中")));
+    assert!(logs.iter().any(|line| line.contains("正在使用源图执行 1688 搜索")));
+    assert!(logs.iter().any(|line| line.contains("源图搜索中")));
+
+    clear_mock_pipeline_env();
+    remove_if_exists(&excel_path);
+    remove_if_exists(&excel_path.with_file_name("result.xlsx"));
+}
+
+#[test]
+fn run_task_uses_ozon_source_image_without_search_image_plan() {
+    let _guard = lock_env();
+    GLOBAL_RECOVERY_GATE.resume();
+    let excel_path = make_temp_excel_path();
+    create_sample_workbook(&excel_path);
+    set_mock_pipeline_env(
+        r#"[
+          [{"title":"sample","price":"¥12.34","itemUrl":"https://detail.1688.com/offer/1.html","imageUrl":"https://img.1688.com/1.jpg"}],
+          [{"title":"sample","price":"¥12.34","itemUrl":"https://detail.1688.com/offer/1.html","imageUrl":"https://img.1688.com/1.jpg"}]
+        ]"#,
+        r#"[
+          [1],
+          [1]
+        ]"#,
+    );
+
+    let mut sink = CollectingSink::default();
+    let summary: RunTaskSummary =
+        run_task_with_sink(excel_path.to_string_lossy().as_ref(), &mut sink)
+            .expect("run task should succeed without a search-image plan");
+
+    assert_eq!(summary.status, "completed");
+    assert_eq!(summary.processed_rows, 2);
+
+    let final_row_events = final_row_event_payloads(&sink);
+    assert_eq!(final_row_events.len(), 2);
+    assert_eq!(final_row_events[0]["status"], "AI比对成功(源图首搜命中)");
+
+    let logs = log_messages(&sink);
+    assert!(logs.iter().any(|line| line.contains("源图")));
+    assert!(
+        !logs.iter().any(|line| line.contains("正在生成搜索图")),
+        "default path should no longer generate search images"
+    );
 
     clear_mock_pipeline_env();
     remove_if_exists(&excel_path);
@@ -876,7 +1068,7 @@ fn run_task_exports_directly_when_all_ozon_rows_fail_preflight() {
     assert!(
         row_event_payloads(&sink)
             .iter()
-            .all(|payload| payload["stage"] != "planning_search_image"),
+            .all(|payload| payload["stage"] != "searching_1688_source_image"),
         "preflight-only failure rows must not enter 1688 search stages"
     );
 
@@ -1015,7 +1207,7 @@ fn run_task_waits_for_login_before_search_stages() {
         .payloads
         .iter()
         .position(|(name, payload)| {
-            name == EVENT_ROW_RESULT && payload["stage"] == "planning_search_image"
+            name == EVENT_ROW_RESULT && payload["stage"] == "searching_1688_source_image"
         })
         .expect("search stages should start after login is ready");
     assert!(
@@ -1101,7 +1293,7 @@ fn run_task_batches_ozon_resolution_for_all_skus_before_1688_login_gate() {
         .payloads
         .iter()
         .position(|(name, payload)| {
-            name == EVENT_ROW_RESULT && payload["stage"] == "planning_search_image"
+            name == EVENT_ROW_RESULT && payload["stage"] == "searching_1688_source_image"
         })
         .expect("1688 search stage should eventually start");
 
@@ -1111,7 +1303,7 @@ fn run_task_batches_ozon_resolution_for_all_skus_before_1688_login_gate() {
     );
     assert!(
         waiting_login_index < first_search_stage_index,
-        "1688 login wait must happen before any search-image planning starts",
+        "1688 login wait must happen before any source-image recall starts",
     );
 
     clear_mock_pipeline_env();
@@ -1233,7 +1425,7 @@ fn run_task_finalizes_ozon_not_found_rows_without_entering_1688() {
     assert!(
         row_event_payloads(&sink)
             .iter()
-            .all(|payload| payload["stage"] != "planning_search_image"),
+            .all(|payload| payload["stage"] != "searching_1688_source_image"),
         "rows unresolved on Ozon must not enter the 1688 image-search stages"
     );
 
@@ -1409,7 +1601,7 @@ fn run_task_uses_browser_fallback_when_ozon_http_prefetch_hits_antibot() {
     assert_eq!(summary.status, "completed");
     let final_rows = final_row_event_payloads(&sink);
     assert_eq!(final_rows.len(), 1);
-    assert_eq!(final_rows[0]["status"], "AI比对成功(主搜索图召回)");
+    assert_eq!(final_rows[0]["status"], "AI比对成功(源图首搜命中)");
 
     clear_mock_pipeline_env();
     clear_sidecar_fixture_env();
@@ -1481,7 +1673,7 @@ fn run_task_uses_browser_fallback_for_503_ozon_challenge_pages() {
     assert_eq!(summary.status, "completed");
     let final_rows = final_row_event_payloads(&sink);
     assert_eq!(final_rows.len(), 1);
-    assert_eq!(final_rows[0]["status"], "AI比对成功(主搜索图召回)");
+    assert_eq!(final_rows[0]["status"], "AI比对成功(源图首搜命中)");
 
     clear_mock_pipeline_env();
     clear_sidecar_fixture_env();
@@ -1550,7 +1742,7 @@ fn run_task_does_not_depend_on_rust_ozon_prefetch_unavailable_result() {
     assert_eq!(summary.status, "completed");
     let final_rows = final_row_event_payloads(&sink);
     assert_eq!(final_rows.len(), 1);
-    assert_eq!(final_rows[0]["status"], "AI比对成功(主搜索图召回)");
+    assert_eq!(final_rows[0]["status"], "AI比对成功(源图首搜命中)");
 
     clear_mock_pipeline_env();
     clear_sidecar_fixture_env();
@@ -1620,7 +1812,7 @@ fn run_task_prefers_sidecar_returned_ozon_image_bytes_over_rust_redownload() {
     assert_eq!(summary.status, "completed");
     let final_rows = final_row_event_payloads(&sink);
     assert_eq!(final_rows.len(), 1);
-    assert_eq!(final_rows[0]["status"], "AI比对成功(主搜索图召回)");
+    assert_eq!(final_rows[0]["status"], "AI比对成功(源图首搜命中)");
 
     clear_mock_pipeline_env();
     clear_sidecar_fixture_env();
@@ -1690,7 +1882,7 @@ fn run_task_falls_back_to_redownload_when_sidecar_returns_tiny_ozon_image_bytes(
     assert_eq!(summary.status, "completed");
     let final_rows = final_row_event_payloads(&sink);
     assert_eq!(final_rows.len(), 1);
-    assert_eq!(final_rows[0]["status"], "AI比对成功(主搜索图召回)");
+    assert_eq!(final_rows[0]["status"], "AI比对成功(源图首搜命中)");
 
     clear_mock_pipeline_env();
     clear_sidecar_fixture_env();
@@ -1863,7 +2055,7 @@ fn run_task_sku_mode_successfully_resolves_ozon_source_before_1688() {
     let final_rows = final_row_event_payloads(&sink);
     assert_eq!(final_rows.len(), 1);
     assert_eq!(final_rows[0]["sku"], "SKU-URL-001");
-    assert_eq!(final_rows[0]["status"], "AI比对成功(主搜索图召回)");
+    assert_eq!(final_rows[0]["status"], "AI比对成功(源图首搜命中)");
 
     clear_mock_pipeline_env();
     clear_sidecar_fixture_env();
@@ -2111,7 +2303,7 @@ fn run_task_accepts_sku_only_workbook_without_embedded_images() {
     assert_eq!(summary.status, "completed");
     let final_rows = final_row_event_payloads(&sink);
     assert_eq!(final_rows.len(), 1);
-    assert_eq!(final_rows[0]["status"], "AI比对成功(主搜索图召回)");
+    assert_eq!(final_rows[0]["status"], "AI比对成功(源图首搜命中)");
 
     clear_mock_pipeline_env();
     clear_sidecar_fixture_env();
@@ -2172,7 +2364,7 @@ fn sidecar_profile_dir_lives_under_dedicated_state_folder() {
 }
 
 #[test]
-fn run_task_uses_fallback_search_image_when_primary_has_no_match() {
+fn run_task_uses_source_image_recall_result_without_fallback_search_image() {
     let _guard = lock_env();
     GLOBAL_RECOVERY_GATE.resume();
 
@@ -2181,15 +2373,9 @@ fn run_task_uses_fallback_search_image_when_primary_has_no_match() {
     set_mock_pipeline_env(
         r#"[
           [{"title":"first-pass","price":"¥99.99","itemUrl":"https://detail.1688.com/offer/first.html","imageUrl":"https://img.1688.com/first.jpg"}],
-          [{"title":"second-pass","price":"¥8.88","itemUrl":"https://detail.1688.com/offer/second.html","imageUrl":"https://img.1688.com/second.jpg"}],
-          [{"title":"first-pass","price":"¥99.99","itemUrl":"https://detail.1688.com/offer/first.html","imageUrl":"https://img.1688.com/first.jpg"}],
-          [{"title":"second-pass","price":"¥8.88","itemUrl":"https://detail.1688.com/offer/second.html","imageUrl":"https://img.1688.com/second.jpg"}]
+          [{"title":"first-pass","price":"¥99.99","itemUrl":"https://detail.1688.com/offer/first.html","imageUrl":"https://img.1688.com/first.jpg"}]
         ]"#,
         r#"[
-          [],
-          [1],
-          [1],
-          [],
           [1],
           [1]
         ]"#,
@@ -2203,18 +2389,720 @@ fn run_task_uses_fallback_search_image_when_primary_has_no_match() {
     let row_events = final_row_event_payloads(&sink);
 
     assert_eq!(summary.status, "completed");
-    assert_eq!(row_events[0]["status"], "AI比对成功(备用搜索图召回)");
-    assert_eq!(row_events[0]["price"], "¥8.88");
+    assert_eq!(row_events[0]["status"], "AI比对成功(源图首搜命中)");
+    assert_eq!(row_events[0]["price"], "¥99.99");
     assert_eq!(
         row_events[0]["item_url"],
-        "https://detail.1688.com/offer/second.html"
+        "https://detail.1688.com/offer/first.html"
     );
     let logs = log_messages(&sink);
-    assert!(logs.iter().any(|line| line.contains("备用搜索图搜索中")));
+    assert!(logs.iter().any(|line| line.contains("源图搜索中")));
 
     clear_mock_pipeline_env();
     remove_if_exists(&excel_path);
     remove_if_exists(&excel_path.with_file_name("result.xlsx"));
+}
+
+#[test]
+fn run_task_marks_status_when_sidecar_reports_second_pass_full_crop() {
+    let _guard = lock_env();
+    GLOBAL_RECOVERY_GATE.resume();
+    clear_mock_pipeline_env();
+    clear_sidecar_fixture_env();
+
+    let excel_path = make_temp_excel_path();
+    create_single_row_workbook(&excel_path);
+
+    let (candidate_image_url, image_server_handle) = spawn_image_server();
+    let (session_url, session_handle) =
+        spawn_sidecar_session_server(vec![r#"{"success":true,"status":"ready"}"#]);
+    let (resolve_url, resolve_handle) = spawn_sidecar_ozon_resolve_server(
+        format!(
+            r#"{{"success":true,"data":{{"title":"Recovered title","imageUrl":"{candidate_image_url}"}}}}"#
+        ),
+        1,
+    );
+    let (search_url, search_handle) = spawn_sidecar_search_server(
+        format!(
+            r#"{{"success":true,"data":{{"candidates":[{{"title":"candidate","price":"¥12.34","itemUrl":"https://detail.1688.com/offer/1.html","imageUrl":"{candidate_image_url}"}}],"usedSecondPassFullCrop":true}}}}"#
+        ),
+        1,
+    );
+
+    std::env::set_var("SIDECAR_SESSION_URL", &session_url);
+    std::env::set_var("SIDECAR_OZON_RESOLVE_URL", &resolve_url);
+    std::env::set_var("SIDECAR_SEARCH_URL", &search_url);
+    set_mock_vlm_env(r#"[[1],[1]]"#);
+
+    let mut sink = CollectingSink::default();
+    let summary = run_task_with_sink(excel_path.to_string_lossy().as_ref(), &mut sink)
+        .expect("run task should succeed");
+
+    let final_rows = final_row_event_payloads(&sink);
+    let row_events = row_event_payloads(&sink);
+    assert_eq!(summary.status, "completed");
+    assert_eq!(final_rows.len(), 1);
+    assert_eq!(final_rows[0]["status"], "AI比对成功(整图纠偏后命中)");
+    assert_eq!(final_rows[0]["recall_mode"], "full_crop_second_pass");
+    assert!(row_events.iter().any(|payload| {
+        payload["stage"] == "screening_candidates"
+            && payload["recall_mode"] == "full_crop_second_pass"
+            && payload["status"]
+                == "整图纠偏后已召回 1 个候选，AI复核中"
+    }));
+
+    clear_mock_pipeline_env();
+    clear_sidecar_fixture_env();
+    image_server_handle.join().expect("join image server");
+    session_handle.join().expect("join session server");
+    resolve_handle.join().expect("join ozon resolve server");
+    search_handle.join().expect("join search server");
+    remove_if_exists(&excel_path);
+    remove_if_exists(&excel_path.with_file_name("result.xlsx"));
+}
+
+#[test]
+fn run_task_overrides_card_price_with_1688_detail_payable_total() {
+    let _guard = lock_env();
+    GLOBAL_RECOVERY_GATE.resume();
+    clear_mock_pipeline_env();
+    clear_sidecar_fixture_env();
+
+    let excel_path = make_temp_excel_path();
+    create_single_row_workbook(&excel_path);
+
+    let (candidate_image_url, image_server_handle) = spawn_image_server();
+    let (session_url, session_handle) =
+        spawn_sidecar_session_server(vec![r#"{"success":true,"status":"ready"}"#]);
+    let (resolve_url, resolve_handle) = spawn_sidecar_ozon_resolve_server(
+        format!(
+            r#"{{"success":true,"data":{{"title":"Brush holder 40cm","imageUrl":"{candidate_image_url}"}}}}"#
+        ),
+        1,
+    );
+    let (search_url, search_handle) = spawn_sidecar_search_server(
+        format!(
+            r#"{{"success":true,"data":{{"candidates":[{{"title":"candidate","price":"¥12.34","itemUrl":"https://detail.1688.com/offer/1.html","imageUrl":"{candidate_image_url}"}}],"usedSecondPassFullCrop":false}}}}"#
+        ),
+        1,
+    );
+    let (detail_url, detail_handle) = spawn_sidecar_detail_pricing_server(
+        r#"{"success":true,"data":{"resolutionMode":"variant_image_payable_total","price":"¥18.80","matchedVariantLabel":"40cm 蓝色"}}"#.to_string(),
+        1,
+    );
+
+    std::env::set_var("SIDECAR_SESSION_URL", &session_url);
+    std::env::set_var("SIDECAR_OZON_RESOLVE_URL", &resolve_url);
+    std::env::set_var("SIDECAR_SEARCH_URL", &search_url);
+    std::env::set_var("SIDECAR_DETAIL_PRICING_URL", &detail_url);
+    set_mock_vlm_env(r#"[[1],[1]]"#);
+
+    let mut sink = CollectingSink::default();
+    let summary = run_task_with_sink(excel_path.to_string_lossy().as_ref(), &mut sink)
+        .expect("run task should succeed");
+
+    let final_rows = final_row_event_payloads(&sink);
+    assert_eq!(summary.status, "completed");
+    assert_eq!(final_rows.len(), 1);
+    assert_eq!(final_rows[0]["status"], "AI比对成功(源图首搜命中)");
+    assert_eq!(final_rows[0]["price"], "¥18.80");
+
+    clear_mock_pipeline_env();
+    clear_sidecar_fixture_env();
+    image_server_handle.join().expect("join image server");
+    session_handle.join().expect("join session server");
+    resolve_handle.join().expect("join resolve server");
+    search_handle.join().expect("join search server");
+    detail_handle.join().expect("join detail server");
+    remove_if_exists(&excel_path);
+    remove_if_exists(&excel_path.with_file_name("result.xlsx"));
+}
+
+#[test]
+fn run_task_forwards_ozon_spec_profile_into_detail_pricing_request() {
+    let _guard = lock_env();
+    GLOBAL_RECOVERY_GATE.resume();
+    clear_mock_pipeline_env();
+    clear_sidecar_fixture_env();
+
+    let excel_path = make_temp_excel_path();
+    create_single_row_workbook(&excel_path);
+
+    let recorded_bodies = Arc::new(Mutex::new(Vec::new()));
+    let (candidate_image_url, image_server_handle) = spawn_image_server();
+    let (session_url, session_handle) =
+        spawn_sidecar_session_server(vec![r#"{"success":true,"status":"ready"}"#]);
+    let (resolve_url, resolve_handle) = spawn_sidecar_ozon_resolve_server(
+        format!(
+            r#"{{"success":true,"data":{{"title":"Household broom set","imageUrl":"{candidate_image_url}","specProfile":{{"color":"Белый","sizeTokens":["89см"],"countTokens":["1шт"],"material":"ABS пластик","modelTokens":[],"featureTokens":["Белый","89см"],"rawAttributes":[{{"key":"Цвет товара","value":"Белый"}},{{"key":"Длина, см","value":"89 см"}}]}}}}}}"#
+        ),
+        1,
+    );
+    let (search_url, search_handle) = spawn_sidecar_search_server(
+        format!(
+            r#"{{"success":true,"data":{{"candidates":[{{"title":"candidate","price":"¥12.34","itemUrl":"https://detail.1688.com/offer/1.html","imageUrl":"{candidate_image_url}"}}],"usedSecondPassFullCrop":false}}}}"#
+        ),
+        1,
+    );
+    let (detail_url, detail_handle) = spawn_sidecar_recording_detail_pricing_server(
+        r#"{"success":true,"data":{"resolutionMode":"variant_label_payable_total","price":"¥18.80","matchedVariantLabel":"白色 89cm"}}"#.to_string(),
+        1,
+        recorded_bodies.clone(),
+    );
+
+    std::env::set_var("SIDECAR_SESSION_URL", &session_url);
+    std::env::set_var("SIDECAR_OZON_RESOLVE_URL", &resolve_url);
+    std::env::set_var("SIDECAR_SEARCH_URL", &search_url);
+    std::env::set_var("SIDECAR_DETAIL_PRICING_URL", &detail_url);
+    set_mock_vlm_env(r#"[[1],[1]]"#);
+
+    let mut sink = CollectingSink::default();
+    let summary = run_task_with_sink(excel_path.to_string_lossy().as_ref(), &mut sink)
+        .expect("run task should succeed");
+
+    assert_eq!(summary.status, "completed");
+    let requests = recorded_bodies.lock().expect("recorded bodies lock");
+    let request = requests.first().expect("detail pricing request should exist");
+    let body = request
+        .split("\r\n\r\n")
+        .nth(1)
+        .expect("http request should contain a body");
+    let payload: Value = serde_json::from_str(body).expect("detail pricing body should be json");
+    assert_eq!(
+        payload["ozonSpecProfile"]["color"].as_str(),
+        Some("Белый")
+    );
+    assert_eq!(
+        payload["ozonSpecProfile"]["sizeTokens"][0].as_str(),
+        Some("89см")
+    );
+
+    drop(requests);
+    clear_mock_pipeline_env();
+    clear_sidecar_fixture_env();
+    image_server_handle.join().expect("join image server");
+    session_handle.join().expect("join session server");
+    resolve_handle.join().expect("join resolve server");
+    search_handle.join().expect("join search server");
+    detail_handle.join().expect("join detail server");
+    remove_if_exists(&excel_path);
+    remove_if_exists(&excel_path.with_file_name("result.xlsx"));
+}
+
+#[test]
+fn run_task_marks_manual_review_when_1688_detail_pricing_cannot_determine_spec() {
+    let _guard = lock_env();
+    GLOBAL_RECOVERY_GATE.resume();
+    clear_mock_pipeline_env();
+    clear_sidecar_fixture_env();
+
+    let excel_path = make_temp_excel_path();
+    create_single_row_workbook(&excel_path);
+
+    let (candidate_image_url, image_server_handle) = spawn_image_server();
+    let (session_url, session_handle) =
+        spawn_sidecar_session_server(vec![r#"{"success":true,"status":"ready"}"#]);
+    let (resolve_url, resolve_handle) = spawn_sidecar_ozon_resolve_server(
+        format!(
+            r#"{{"success":true,"data":{{"title":"Storage box","imageUrl":"{candidate_image_url}"}}}}"#
+        ),
+        1,
+    );
+    let (search_url, search_handle) = spawn_sidecar_search_server(
+        format!(
+            r#"{{"success":true,"data":{{"candidates":[{{"title":"candidate","price":"¥12.34","itemUrl":"https://detail.1688.com/offer/1.html","imageUrl":"{candidate_image_url}"}}],"usedSecondPassFullCrop":false}}}}"#
+        ),
+        1,
+    );
+    let (detail_url, detail_handle) = spawn_sidecar_detail_pricing_server(
+        r#"{"success":true,"data":{"resolutionMode":"manual_review_required_unknown_spec","price":null,"matchedVariantLabel":null}}"#.to_string(),
+        1,
+    );
+
+    std::env::set_var("SIDECAR_SESSION_URL", &session_url);
+    std::env::set_var("SIDECAR_OZON_RESOLVE_URL", &resolve_url);
+    std::env::set_var("SIDECAR_SEARCH_URL", &search_url);
+    std::env::set_var("SIDECAR_DETAIL_PRICING_URL", &detail_url);
+    set_mock_vlm_env(r#"[[1],[1]]"#);
+
+    let mut sink = CollectingSink::default();
+    let summary = run_task_with_sink(excel_path.to_string_lossy().as_ref(), &mut sink)
+        .expect("run task should succeed");
+
+    let final_rows = final_row_event_payloads(&sink);
+    assert_eq!(summary.status, "completed");
+    assert_eq!(final_rows.len(), 1);
+    assert_eq!(final_rows[0]["status"], "无法判断商品规格，需人工介入");
+    assert!(final_rows[0]["price"].is_null());
+
+    clear_mock_pipeline_env();
+    clear_sidecar_fixture_env();
+    image_server_handle.join().expect("join image server");
+    session_handle.join().expect("join session server");
+    resolve_handle.join().expect("join resolve server");
+    search_handle.join().expect("join search server");
+    detail_handle.join().expect("join detail server");
+    remove_if_exists(&excel_path);
+    remove_if_exists(&excel_path.with_file_name("result.xlsx"));
+}
+
+#[test]
+fn run_task_persists_detail_pricing_diagnostics_in_row_bundle() {
+    let _guard = lock_env();
+    GLOBAL_RECOVERY_GATE.resume();
+    clear_mock_pipeline_env();
+    clear_sidecar_fixture_env();
+
+    let excel_path = make_temp_excel_path();
+    create_single_row_workbook(&excel_path);
+    let diagnostics_root = std::env::temp_dir().join(format!(
+        "desktop-app-detail-pricing-diag-test-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time should be monotonic")
+            .as_nanos()
+    ));
+    let diagnostic_png = BASE64_STANDARD.encode(build_png_bytes(240, 240));
+
+    let (candidate_image_url, image_server_handle) = spawn_image_server();
+    let (session_url, session_handle) =
+        spawn_sidecar_session_server(vec![r#"{"success":true,"status":"ready"}"#]);
+    let (resolve_url, resolve_handle) = spawn_sidecar_ozon_resolve_server(
+        format!(
+            r#"{{"success":true,"data":{{"title":"Brush holder 40cm","imageUrl":"{candidate_image_url}"}}}}"#
+        ),
+        1,
+    );
+    let (search_url, search_handle) = spawn_sidecar_search_server(
+        format!(
+            r#"{{"success":true,"data":{{"candidates":[{{"title":"candidate","price":"¥12.34","itemUrl":"https://detail.1688.com/offer/1.html","imageUrl":"{candidate_image_url}"}}],"usedSecondPassFullCrop":false}}}}"#
+        ),
+        1,
+    );
+    let (detail_url, detail_handle) = spawn_sidecar_detail_pricing_server(
+        format!(
+            r#"{{"success":true,"data":{{"resolutionMode":"variant_image_payable_total","price":"¥18.80","matchedVariantLabel":"40cm 蓝色","basePrice":"¥12.80","freightPrice":"¥6.00","quantityPlusClicked":true,"submitOrderText":"商品金额 ¥12.80 运费 ¥6.00","diagnostics":{{"failureCode":null,"priceSource":"submit_order_text","priceSourceRefreshed":true,"hasSkuSelection":true,"variantRowCount":2,"selectedRowIndex":0,"selectionAttempted":true,"selectionApplied":true,"quantityBefore":"1","quantityAfter":"2","submitOrderBeforeText":"商品金额 ¥10.00 运费 ¥5.00","submitOrderAfterText":"商品金额 ¥12.80 运费 ¥6.00","pageScreenshotBase64":"{diagnostic_png}","skuSelectionScreenshotBase64":"{diagnostic_png}","skuSelectionSnapshot":{{"hasSkuSelection":true,"rows":[{{"rowIndex":0,"label":"40cm 蓝色","imageUrls":["https://img.example.com/blue.jpg"]}},{{"rowIndex":1,"label":"55cm 白色","imageUrls":["https://img.example.com/white.jpg"]}}]}},"selectionStateBefore":{{"selectedRowIndexes":[],"rows":[{{"rowIndex":0,"label":"40cm 蓝色","isSelected":false,"isDisabled":false,"className":"expand-view-item v-flex","ariaSelected":null}}]}},"selectionStateAfter":{{"selectedRowIndexes":[0],"rows":[{{"rowIndex":0,"label":"40cm 蓝色","isSelected":true,"isDisabled":false,"className":"expand-view-item v-flex selected","ariaSelected":"true"}}]}},"quantitySnapshotBefore":{{"quantityText":"1","submitOrderText":"商品金额 ¥10.00 运费 ¥5.00","plusCandidateCount":1}},"quantitySnapshotAfter":{{"quantityText":"2","submitOrderText":"商品金额 ¥12.80 运费 ¥6.00","plusCandidateCount":1}}}}}}}}"#
+        ),
+        1,
+    );
+
+    std::env::set_var("SIDECAR_SESSION_URL", &session_url);
+    std::env::set_var("SIDECAR_OZON_RESOLVE_URL", &resolve_url);
+    std::env::set_var("SIDECAR_SEARCH_URL", &search_url);
+    std::env::set_var("SIDECAR_DETAIL_PRICING_URL", &detail_url);
+    std::env::set_var("RUN_TASK_DIAGNOSTICS_ROOT", &diagnostics_root);
+    std::env::set_var("RUN_TASK_ALWAYS_WRITE_DIAGNOSTICS", "true");
+    set_mock_vlm_env(r#"[[1],[1]]"#);
+
+    let mut sink = CollectingSink::default();
+    let summary = run_task_with_sink(excel_path.to_string_lossy().as_ref(), &mut sink)
+        .expect("run task should succeed");
+
+    assert_eq!(summary.status, "completed");
+
+    let session_dirs = std::fs::read_dir(&diagnostics_root)
+        .expect("read diagnostics root")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .collect::<Vec<_>>();
+    assert_eq!(session_dirs.len(), 1, "expected one diagnostics session");
+
+    let row_dirs = std::fs::read_dir(&session_dirs[0])
+        .expect("read diagnostics session")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .collect::<Vec<_>>();
+    assert_eq!(row_dirs.len(), 1, "expected one row diagnostics directory");
+
+    let detail_pricing_path = row_dirs[0].join("detail_pricing.json");
+    assert!(detail_pricing_path.exists(), "detail_pricing.json should exist");
+    let detail_pricing = std::fs::read_to_string(&detail_pricing_path).expect("read detail pricing");
+    assert!(detail_pricing.contains("\"priceSource\": \"submit_order_text\""));
+    assert!(detail_pricing.contains("\"selectionApplied\": true"));
+    assert!(detail_pricing.contains("\"quantityAfter\": \"2\""));
+    assert!(detail_pricing.contains("\"skuSelectionSnapshot\""));
+    assert!(detail_pricing.contains("\"selectionStateBefore\""));
+    assert!(detail_pricing.contains("\"selectionStateAfter\""));
+    assert!(detail_pricing.contains("\"quantitySnapshotBefore\""));
+    assert!(detail_pricing.contains("\"quantitySnapshotAfter\""));
+    assert!(row_dirs[0].join("detail_page.png").exists());
+    assert!(row_dirs[0].join("sku_selection.png").exists());
+
+    std::env::remove_var("RUN_TASK_DIAGNOSTICS_ROOT");
+    std::env::remove_var("RUN_TASK_ALWAYS_WRITE_DIAGNOSTICS");
+    clear_mock_pipeline_env();
+    clear_sidecar_fixture_env();
+    image_server_handle.join().expect("join image server");
+    session_handle.join().expect("join session server");
+    resolve_handle.join().expect("join resolve server");
+    search_handle.join().expect("join search server");
+    detail_handle.join().expect("join detail server");
+    remove_if_exists(&excel_path);
+    remove_if_exists(&excel_path.with_file_name("result.xlsx"));
+    remove_dir_if_exists(&diagnostics_root);
+}
+
+#[test]
+fn run_task_logs_detail_pricing_diagnostics_when_detail_pricing_fails() {
+    let _guard = lock_env();
+    GLOBAL_RECOVERY_GATE.resume();
+    clear_mock_pipeline_env();
+    clear_sidecar_fixture_env();
+
+    let excel_path = make_temp_excel_path();
+    create_single_row_workbook(&excel_path);
+
+    let (candidate_image_url, image_server_handle) = spawn_image_server();
+    let (session_url, session_handle) =
+        spawn_sidecar_session_server(vec![r#"{"success":true,"status":"ready"}"#]);
+    let (resolve_url, resolve_handle) = spawn_sidecar_ozon_resolve_server(
+        format!(
+            r#"{{"success":true,"data":{{"title":"Brush holder 40cm","imageUrl":"{candidate_image_url}"}}}}"#
+        ),
+        1,
+    );
+    let (search_url, search_handle) = spawn_sidecar_search_server(
+        format!(
+            r#"{{"success":true,"data":{{"candidates":[{{"title":"candidate","price":"¥12.34","itemUrl":"https://detail.1688.com/offer/1.html","imageUrl":"{candidate_image_url}"}}],"usedSecondPassFullCrop":false}}}}"#
+        ),
+        1,
+    );
+    let (detail_url, detail_handle) = spawn_sidecar_detail_pricing_server(
+        r#"{"success":false,"code":"UNKNOWN_SIDECAR_DETAIL_PRICING_ERROR","error":"[DETAIL_PRICE_TOTAL_UNAVAILABLE] total missing","diagnostics":{"failureCode":"price_source_missing","priceSource":"submit_order_text","priceSourceRefreshed":false,"hasSkuSelection":true,"variantRowCount":2,"selectedRowIndex":0,"selectionAttempted":true,"selectionApplied":true,"quantityBefore":"1","quantityAfter":"2","submitOrderBeforeText":"商品金额 ¥10.00 运费 ¥5.00","submitOrderAfterText":"商品金额 ¥10.00 运费 ¥5.00"}}"#.to_string(),
+        1,
+    );
+
+    std::env::set_var("SIDECAR_SESSION_URL", &session_url);
+    std::env::set_var("SIDECAR_OZON_RESOLVE_URL", &resolve_url);
+    std::env::set_var("SIDECAR_SEARCH_URL", &search_url);
+    std::env::set_var("SIDECAR_DETAIL_PRICING_URL", &detail_url);
+    set_mock_vlm_env(r#"[[1],[1]]"#);
+
+    let mut sink = CollectingSink::default();
+    let summary = run_task_with_sink(excel_path.to_string_lossy().as_ref(), &mut sink)
+        .expect("run task should succeed");
+
+    assert_eq!(summary.status, "completed");
+    let logs = log_messages(&sink).join("\n");
+    assert!(logs.contains("price_source_missing"));
+    assert!(logs.contains("priceSourceRefreshed"));
+
+    clear_mock_pipeline_env();
+    clear_sidecar_fixture_env();
+    image_server_handle.join().expect("join image server");
+    session_handle.join().expect("join session server");
+    resolve_handle.join().expect("join resolve server");
+    search_handle.join().expect("join search server");
+    detail_handle.join().expect("join detail server");
+    remove_if_exists(&excel_path);
+    remove_if_exists(&excel_path.with_file_name("result.xlsx"));
+}
+
+#[test]
+fn run_task_maps_detail_pricing_selection_failure_to_explicit_status() {
+    let _guard = lock_env();
+    GLOBAL_RECOVERY_GATE.resume();
+    clear_mock_pipeline_env();
+    clear_sidecar_fixture_env();
+
+    let excel_path = make_temp_excel_path();
+    create_single_row_workbook(&excel_path);
+
+    let (candidate_image_url, image_server_handle) = spawn_image_server();
+    let (session_url, session_handle) =
+        spawn_sidecar_session_server(vec![r#"{"success":true,"status":"ready"}"#]);
+    let (resolve_url, resolve_handle) = spawn_sidecar_ozon_resolve_server(
+        format!(
+            r#"{{"success":true,"data":{{"title":"Brush holder 40cm","imageUrl":"{candidate_image_url}"}}}}"#
+        ),
+        1,
+    );
+    let (search_url, search_handle) = spawn_sidecar_search_server(
+        format!(
+            r#"{{"success":true,"data":{{"candidates":[{{"title":"candidate","price":"¥12.34","itemUrl":"https://detail.1688.com/offer/1.html","imageUrl":"{candidate_image_url}"}}],"usedSecondPassFullCrop":false}}}}"#
+        ),
+        1,
+    );
+    let (detail_url, detail_handle) = spawn_sidecar_detail_pricing_server(
+        r#"{"success":false,"code":"UNKNOWN_SIDECAR_DETAIL_PRICING_ERROR","error":"[DETAIL_VARIANT_SELECTION_NOT_APPLIED] selection missing","diagnostics":{"failureCode":"detail_variant_selection_not_applied","priceSource":"submit_order_text","priceSourceRefreshed":false}}"#.to_string(),
+        1,
+    );
+
+    std::env::set_var("SIDECAR_SESSION_URL", &session_url);
+    std::env::set_var("SIDECAR_OZON_RESOLVE_URL", &resolve_url);
+    std::env::set_var("SIDECAR_SEARCH_URL", &search_url);
+    std::env::set_var("SIDECAR_DETAIL_PRICING_URL", &detail_url);
+    set_mock_vlm_env(r#"[[1],[1]]"#);
+
+    let mut sink = CollectingSink::default();
+    let summary = run_task_with_sink(excel_path.to_string_lossy().as_ref(), &mut sink)
+        .expect("run task should succeed");
+
+    assert_eq!(summary.status, "completed");
+    let final_rows = final_row_event_payloads(&sink);
+    assert_eq!(final_rows[0]["status"], "1688详情页规格选择失败");
+    assert!(final_rows[0]["price"].is_null());
+
+    clear_mock_pipeline_env();
+    clear_sidecar_fixture_env();
+    image_server_handle.join().expect("join image server");
+    session_handle.join().expect("join session server");
+    resolve_handle.join().expect("join resolve server");
+    search_handle.join().expect("join search server");
+    detail_handle.join().expect("join detail server");
+    remove_if_exists(&excel_path);
+    remove_if_exists(&excel_path.with_file_name("result.xlsx"));
+}
+
+#[test]
+fn run_task_maps_detail_pricing_quantity_failure_to_explicit_status() {
+    let _guard = lock_env();
+    GLOBAL_RECOVERY_GATE.resume();
+    clear_mock_pipeline_env();
+    clear_sidecar_fixture_env();
+
+    let excel_path = make_temp_excel_path();
+    create_single_row_workbook(&excel_path);
+
+    let (candidate_image_url, image_server_handle) = spawn_image_server();
+    let (session_url, session_handle) =
+        spawn_sidecar_session_server(vec![r#"{"success":true,"status":"ready"}"#]);
+    let (resolve_url, resolve_handle) = spawn_sidecar_ozon_resolve_server(
+        format!(
+            r#"{{"success":true,"data":{{"title":"Brush holder 40cm","imageUrl":"{candidate_image_url}"}}}}"#
+        ),
+        1,
+    );
+    let (search_url, search_handle) = spawn_sidecar_search_server(
+        format!(
+            r#"{{"success":true,"data":{{"candidates":[{{"title":"candidate","price":"¥12.34","itemUrl":"https://detail.1688.com/offer/1.html","imageUrl":"{candidate_image_url}"}}],"usedSecondPassFullCrop":false}}}}"#
+        ),
+        1,
+    );
+    let (detail_url, detail_handle) = spawn_sidecar_detail_pricing_server(
+        r#"{"success":false,"code":"UNKNOWN_SIDECAR_DETAIL_PRICING_ERROR","error":"[DETAIL_QUANTITY_NOT_APPLIED] quantity missing","diagnostics":{"failureCode":"detail_quantity_not_applied","priceSource":"submit_order_text","priceSourceRefreshed":false}}"#.to_string(),
+        1,
+    );
+
+    std::env::set_var("SIDECAR_SESSION_URL", &session_url);
+    std::env::set_var("SIDECAR_OZON_RESOLVE_URL", &resolve_url);
+    std::env::set_var("SIDECAR_SEARCH_URL", &search_url);
+    std::env::set_var("SIDECAR_DETAIL_PRICING_URL", &detail_url);
+    set_mock_vlm_env(r#"[[1],[1]]"#);
+
+    let mut sink = CollectingSink::default();
+    let summary = run_task_with_sink(excel_path.to_string_lossy().as_ref(), &mut sink)
+        .expect("run task should succeed");
+
+    assert_eq!(summary.status, "completed");
+    let final_rows = final_row_event_payloads(&sink);
+    assert_eq!(final_rows[0]["status"], "1688详情页数量未生效");
+    assert!(final_rows[0]["price"].is_null());
+
+    clear_mock_pipeline_env();
+    clear_sidecar_fixture_env();
+    image_server_handle.join().expect("join image server");
+    session_handle.join().expect("join session server");
+    resolve_handle.join().expect("join resolve server");
+    search_handle.join().expect("join search server");
+    detail_handle.join().expect("join detail server");
+    remove_if_exists(&excel_path);
+    remove_if_exists(&excel_path.with_file_name("result.xlsx"));
+}
+
+#[test]
+fn run_task_maps_detail_pricing_refresh_failure_to_explicit_status() {
+    let _guard = lock_env();
+    GLOBAL_RECOVERY_GATE.resume();
+    clear_mock_pipeline_env();
+    clear_sidecar_fixture_env();
+
+    let excel_path = make_temp_excel_path();
+    create_single_row_workbook(&excel_path);
+
+    let (candidate_image_url, image_server_handle) = spawn_image_server();
+    let (session_url, session_handle) =
+        spawn_sidecar_session_server(vec![r#"{"success":true,"status":"ready"}"#]);
+    let (resolve_url, resolve_handle) = spawn_sidecar_ozon_resolve_server(
+        format!(
+            r#"{{"success":true,"data":{{"title":"Brush holder 40cm","imageUrl":"{candidate_image_url}"}}}}"#
+        ),
+        1,
+    );
+    let (search_url, search_handle) = spawn_sidecar_search_server(
+        format!(
+            r#"{{"success":true,"data":{{"candidates":[{{"title":"candidate","price":"¥12.34","itemUrl":"https://detail.1688.com/offer/1.html","imageUrl":"{candidate_image_url}"}}],"usedSecondPassFullCrop":false}}}}"#
+        ),
+        1,
+    );
+    let (detail_url, detail_handle) = spawn_sidecar_detail_pricing_server(
+        r#"{"success":false,"code":"UNKNOWN_SIDECAR_DETAIL_PRICING_ERROR","error":"[DETAIL_PRICE_NOT_REFRESHED] price stale","diagnostics":{"failureCode":"detail_price_not_refreshed","priceSource":"submit_order_text","priceSourceRefreshed":false}}"#.to_string(),
+        1,
+    );
+
+    std::env::set_var("SIDECAR_SESSION_URL", &session_url);
+    std::env::set_var("SIDECAR_OZON_RESOLVE_URL", &resolve_url);
+    std::env::set_var("SIDECAR_SEARCH_URL", &search_url);
+    std::env::set_var("SIDECAR_DETAIL_PRICING_URL", &detail_url);
+    set_mock_vlm_env(r#"[[1],[1]]"#);
+
+    let mut sink = CollectingSink::default();
+    let summary = run_task_with_sink(excel_path.to_string_lossy().as_ref(), &mut sink)
+        .expect("run task should succeed");
+
+    assert_eq!(summary.status, "completed");
+    let final_rows = final_row_event_payloads(&sink);
+    assert_eq!(final_rows[0]["status"], "1688详情页价格未刷新");
+    assert!(final_rows[0]["price"].is_null());
+
+    clear_mock_pipeline_env();
+    clear_sidecar_fixture_env();
+    image_server_handle.join().expect("join image server");
+    session_handle.join().expect("join session server");
+    resolve_handle.join().expect("join resolve server");
+    search_handle.join().expect("join search server");
+    detail_handle.join().expect("join detail server");
+    remove_if_exists(&excel_path);
+    remove_if_exists(&excel_path.with_file_name("result.xlsx"));
+}
+
+#[test]
+fn run_task_writes_matched_image_into_workbook_via_sidecar_capture_fallback() {
+    let _guard = lock_env();
+    GLOBAL_RECOVERY_GATE.resume();
+    clear_mock_pipeline_env();
+    clear_sidecar_fixture_env();
+
+    let excel_path = make_temp_excel_path();
+    create_single_row_workbook(&excel_path);
+    let result_path = excel_path.with_file_name("result.xlsx");
+    let (ozon_image_url, image_server_handle) = spawn_image_server();
+    let (session_url, session_handle) =
+        spawn_sidecar_session_server(vec![r#"{"success":true,"status":"ready"}"#]);
+    let (resolve_url, resolve_handle) = spawn_sidecar_ozon_resolve_server(
+        format!(
+            r#"{{"success":true,"data":{{"title":"Recovered title","imageUrl":"{ozon_image_url}"}}}}"#
+        ),
+        1,
+    );
+    let unreachable_candidate_image_url = "http://127.0.0.1:9/matched.png";
+    let (search_url, search_handle) = spawn_sidecar_search_server(
+        format!(
+            r#"{{"success":true,"data":{{"candidates":[{{"title":"candidate","price":"¥12.34","itemUrl":"https://detail.1688.com/offer/1.html","imageUrl":"{unreachable_candidate_image_url}"}}],"usedSecondPassFullCrop":false}}}}"#
+        ),
+        1,
+    );
+    let (capture_url, capture_handle) =
+        spawn_sidecar_capture_image_server(build_png_bytes(240, 240), 1);
+
+    std::env::set_var("SIDECAR_SESSION_URL", &session_url);
+    std::env::set_var("SIDECAR_OZON_RESOLVE_URL", &resolve_url);
+    std::env::set_var("SIDECAR_SEARCH_URL", &search_url);
+    std::env::set_var("SIDECAR_CAPTURE_IMAGE_URL", &capture_url);
+    set_mock_vlm_env(r#"[[1],[1]]"#);
+
+    let mut sink = CollectingSink::default();
+    let summary = run_task_with_sink(excel_path.to_string_lossy().as_ref(), &mut sink)
+        .expect("run task should succeed");
+
+    assert_eq!(
+        summary.result_path.as_deref(),
+        Some(result_path.to_string_lossy().as_ref())
+    );
+
+    let file = std::fs::File::open(&result_path).expect("result workbook should exist on disk");
+    let mut archive = ZipArchive::new(file).expect("result workbook should be a zip archive");
+    let drawing_names: Vec<String> = (0..archive.len())
+        .filter_map(|index| {
+            archive
+                .by_index(index)
+                .ok()
+                .map(|entry| entry.name().to_string())
+        })
+        .filter(|name| name.starts_with("xl/drawings/drawing") && name.ends_with(".xml"))
+        .collect();
+
+    let mut picture_count = 0usize;
+    for name in drawing_names {
+        let mut xml = String::new();
+        archive
+            .by_name(&name)
+            .expect("drawing xml should exist")
+            .read_to_string(&mut xml)
+            .expect("drawing xml should be readable");
+        picture_count += xml.matches("<xdr:pic>").count();
+    }
+
+    assert_eq!(picture_count, 2);
+
+    clear_mock_pipeline_env();
+    clear_sidecar_fixture_env();
+    image_server_handle.join().expect("join image server");
+    session_handle.join().expect("join session server");
+    resolve_handle.join().expect("join ozon resolve server");
+    search_handle.join().expect("join search server");
+    capture_handle.join().expect("join capture image server");
+    remove_if_exists(&excel_path);
+    remove_if_exists(&result_path);
+}
+
+#[test]
+fn run_task_logs_warning_when_result_export_still_cannot_fetch_matched_image() {
+    let _guard = lock_env();
+    GLOBAL_RECOVERY_GATE.resume();
+    clear_mock_pipeline_env();
+    clear_sidecar_fixture_env();
+
+    let excel_path = make_temp_excel_path();
+    create_single_row_workbook(&excel_path);
+    let result_path = excel_path.with_file_name("result.xlsx");
+    let (ozon_image_url, image_server_handle) = spawn_image_server();
+    let (session_url, session_handle) =
+        spawn_sidecar_session_server(vec![r#"{"success":true,"status":"ready"}"#]);
+    let (resolve_url, resolve_handle) = spawn_sidecar_ozon_resolve_server(
+        format!(
+            r#"{{"success":true,"data":{{"title":"Recovered title","imageUrl":"{ozon_image_url}"}}}}"#
+        ),
+        1,
+    );
+    let unreachable_candidate_image_url = "http://127.0.0.1:9/matched.png";
+    let (search_url, search_handle) = spawn_sidecar_search_server(
+        format!(
+            r#"{{"success":true,"data":{{"candidates":[{{"title":"candidate","price":"¥12.34","itemUrl":"https://detail.1688.com/offer/1.html","imageUrl":"{unreachable_candidate_image_url}"}}],"usedSecondPassFullCrop":false}}}}"#
+        ),
+        1,
+    );
+
+    std::env::set_var("SIDECAR_SESSION_URL", &session_url);
+    std::env::set_var("SIDECAR_OZON_RESOLVE_URL", &resolve_url);
+    std::env::set_var("SIDECAR_SEARCH_URL", &search_url);
+    set_mock_vlm_env(r#"[[1],[1]]"#);
+
+    let mut sink = CollectingSink::default();
+    let summary = run_task_with_sink(excel_path.to_string_lossy().as_ref(), &mut sink)
+        .expect("run task should succeed");
+
+    assert_eq!(
+        summary.result_path.as_deref(),
+        Some(result_path.to_string_lossy().as_ref())
+    );
+    assert!(log_messages(&sink).iter().any(|line| {
+        line.contains("结果导出缺少匹配图")
+            && line.contains("row=2")
+            && line.contains("sku=SKU-001")
+    }));
+
+    clear_mock_pipeline_env();
+    clear_sidecar_fixture_env();
+    image_server_handle.join().expect("join image server");
+    session_handle.join().expect("join session server");
+    resolve_handle.join().expect("join ozon resolve server");
+    search_handle.join().expect("join search server");
+    remove_if_exists(&excel_path);
+    remove_if_exists(&result_path);
 }
 
 #[test]
@@ -2313,7 +3201,7 @@ fn run_task_writes_result_workbook_with_brain_core_columns_and_images() {
     );
     assert_eq!(
         range.get_value((1, 4)).map(|v| v.to_string()),
-        Some("AI比对成功(主搜索图召回)".to_string())
+        Some("AI比对成功(源图首搜命中)".to_string())
     );
     assert!(
         range
@@ -2390,7 +3278,7 @@ fn run_task_reports_when_both_search_images_return_no_candidates() {
     assert_eq!(summary.status, "completed");
     assert_eq!(
         row_events[0]["status"],
-        "无可比对候选(双搜索图未召回有效1688结果)"
+        "无可比对候选(源图搜索未召回有效1688结果)"
     );
 
     clear_mock_pipeline_env();
@@ -2552,9 +3440,71 @@ fn run_task_persists_diagnostics_for_initial_screen_no_match() {
         row_dirs[0].join("source_image.png").exists()
             || row_dirs[0].join("source_image.jpg").exists()
     );
-    assert!(row_dirs[0].join("search_primary.png").exists());
-    assert!(row_dirs[0].join("search_fallback.png").exists());
     assert!(row_dirs[0].join("primary_candidates.json").exists());
+
+    std::env::remove_var("RUN_TASK_DIAGNOSTICS_ROOT");
+    clear_mock_pipeline_env();
+    remove_if_exists(&excel_path);
+    remove_if_exists(&excel_path.with_file_name("result.xlsx"));
+    remove_dir_if_exists(&diagnostics_root);
+}
+
+#[test]
+fn run_task_persists_diagnostics_for_vlm_api_failures() {
+    let _guard = lock_env();
+    GLOBAL_RECOVERY_GATE.resume();
+
+    let excel_path = make_temp_excel_path();
+    create_single_row_workbook(&excel_path);
+    let diagnostics_root = std::env::temp_dir().join(format!(
+        "desktop-app-vlm-error-diagnostics-test-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time should be monotonic")
+            .as_nanos()
+    ));
+
+    std::env::set_var("RUN_TASK_DIAGNOSTICS_ROOT", &diagnostics_root);
+    set_mock_pipeline_env(
+        r#"[
+          [{"title":"first-pass","price":"¥19.99","itemUrl":"https://detail.1688.com/offer/first.html","imageUrl":"https://img.1688.com/first.jpg","cosScore":0.91}]
+        ]"#,
+        r#"[
+          {"err":"mock vlm timeout"}
+        ]"#,
+    );
+    set_mock_search_image_plan_env(default_mock_search_image_plan_json());
+
+    let mut sink = CollectingSink::default();
+    let summary = run_task_with_sink(excel_path.to_string_lossy().as_ref(), &mut sink)
+        .expect("run task should succeed");
+
+    assert_eq!(summary.status, "completed");
+
+    let session_dirs = std::fs::read_dir(&diagnostics_root)
+        .expect("read diagnostics root")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .collect::<Vec<_>>();
+    assert_eq!(session_dirs.len(), 1, "expected one diagnostics session");
+
+    let row_dirs = std::fs::read_dir(&session_dirs[0])
+        .expect("read diagnostics session")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .collect::<Vec<_>>();
+    assert_eq!(row_dirs.len(), 1, "expected one row diagnostics directory");
+
+    let manifest =
+        std::fs::read_to_string(row_dirs[0].join("manifest.json")).expect("read manifest");
+    assert!(manifest.contains("大模型API异常"));
+    let vlm_error =
+        std::fs::read_to_string(row_dirs[0].join("vlm_errors/01-source-screening-1/error.txt"))
+            .expect("read vlm error");
+    assert!(vlm_error.contains("mock vlm timeout"));
 
     std::env::remove_var("RUN_TASK_DIAGNOSTICS_ROOT");
     clear_mock_pipeline_env();
@@ -2591,8 +3541,6 @@ fn run_task_logs_stage_timing_breakdown_for_each_row() {
         .iter()
         .find(|message| message.contains("阶段耗时"))
         .expect("timing summary log should exist");
-    assert!(timing_log.contains("搜索图规划="));
-    assert!(timing_log.contains("搜索图生成="));
     assert!(timing_log.contains("主搜="));
     assert!(timing_log.contains("AI初筛="));
     assert!(timing_log.contains("终审="));

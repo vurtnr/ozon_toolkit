@@ -59,6 +59,7 @@ pub struct RowResultEvent {
     pub sku: String,
     pub stage: String,
     pub status: String,
+    pub recall_mode: Option<String>,
     pub image_url: Option<String>,
     pub original_image_url: Option<String>,
     pub matched_image_url: Option<String>,

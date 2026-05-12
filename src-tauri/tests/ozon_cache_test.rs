@@ -1,7 +1,7 @@
 use desktop_app_lib::core::ozon_cache::{
     cache_root_for_output_anchor, OzonSourceCache, OzonSourceCacheLookup,
 };
-use desktop_app_lib::core::ozon_product::OzonProductResolution;
+use desktop_app_lib::core::ozon_product::{OzonProductResolution, OzonSpecProfile};
 use image::{DynamicImage, ImageFormat, Rgba, RgbaImage};
 use std::path::PathBuf;
 
@@ -34,6 +34,7 @@ fn sample_resolution() -> OzonProductResolution {
         title: "Морская верёвочная лестница".to_string(),
         image_url: "https://cdn.ozon.ru/images/main.jpeg".to_string(),
         image_bytes: cursor.into_inner(),
+        spec_profile: OzonSpecProfile::default(),
     }
 }
 

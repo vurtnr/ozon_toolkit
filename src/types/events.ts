@@ -13,6 +13,7 @@ export interface RowResultEventPayload {
   sku: string;
   stage: string;
   status: string;
+  recall_mode: string | null;
   image_url: string | null;
   original_image_url: string | null;
   matched_image_url: string | null;
@@ -49,6 +50,7 @@ export interface MonitorRow {
   sku: string;
   stage: string;
   status: string;
+  recallMode: string | null;
   imageUrl: string | null;
   originalImageUrl: string | null;
   matchedImageUrl: string | null;

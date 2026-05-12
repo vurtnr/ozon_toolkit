@@ -28,6 +28,8 @@ struct OzonCacheMetadata {
     source_key: String,
     title: String,
     image_url: String,
+    #[serde(default)]
+    spec_profile: crate::core::ozon_product::OzonSpecProfile,
 }
 
 pub fn validate_ozon_source_metadata(title: &str, image_url: &str) -> Result<(), String> {
@@ -129,6 +131,7 @@ impl OzonSourceCache {
             title: metadata.title,
             image_url: metadata.image_url,
             image_bytes,
+            spec_profile: metadata.spec_profile,
         }))
     }
 
@@ -145,6 +148,7 @@ impl OzonSourceCache {
             source_key: normalize_cache_source_key(source_key)?,
             title: resolution.title.clone(),
             image_url: resolution.image_url.clone(),
+            spec_profile: resolution.spec_profile.clone(),
         };
         validate_ozon_cache_metadata(&metadata)?;
         let metadata_bytes = serde_json::to_vec_pretty(&metadata)
@@ -270,6 +274,7 @@ mod tests {
                 title: "Tiny QR".to_string(),
                 image_url: "https://ir.ozone.ru/s3/multimedia-1-7/wc800/8908721791.jpg"
                     .to_string(),
+                spec_profile: crate::core::ozon_product::OzonSpecProfile::default(),
             })
             .expect("metadata should serialize"),
         )
@@ -309,6 +314,7 @@ mod tests {
                     .expect("source key should normalize"),
                 title: "Чехол для планшета - купить на OZON".to_string(),
                 image_url: "https://ir.ozone.ru/s3/cms/logo/og_ozon_ru.png".to_string(),
+                spec_profile: crate::core::ozon_product::OzonSpecProfile::default(),
             })
             .expect("metadata should serialize"),
         )

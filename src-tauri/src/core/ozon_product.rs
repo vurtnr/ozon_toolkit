@@ -1,7 +1,26 @@
+use serde::{Deserialize, Serialize};
 use regex::Regex;
 use reqwest::blocking::Client;
 use reqwest::Url;
 use serde_json::Value;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Default)]
+pub struct OzonAttributeEntry {
+    pub key: String,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct OzonSpecProfile {
+    pub color: Option<String>,
+    pub size_tokens: Vec<String>,
+    pub count_tokens: Vec<String>,
+    pub material: Option<String>,
+    pub model_tokens: Vec<String>,
+    pub feature_tokens: Vec<String>,
+    pub raw_attributes: Vec<OzonAttributeEntry>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OzonResolutionFailure {
@@ -18,6 +37,7 @@ pub struct OzonProductResolution {
     pub title: String,
     pub image_url: String,
     pub image_bytes: Vec<u8>,
+    pub spec_profile: OzonSpecProfile,
 }
 
 pub fn classify_ozon_url_mode(value: &str) -> bool {
@@ -67,6 +87,7 @@ pub fn resolve_ozon_product(
         title,
         image_url,
         image_bytes,
+        spec_profile: OzonSpecProfile::default(),
     })
 }
 

@@ -32,6 +32,7 @@ export function appendRowResult(
     sku: payload.sku,
     stage: payload.stage,
     status: payload.status,
+    recallMode: payload.recall_mode ?? existingRow?.recallMode ?? null,
     imageUrl: payload.matched_image_url ?? payload.image_url ?? existingRow?.imageUrl ?? null,
     originalImageUrl:
       payload.original_image_url ?? existingRow?.originalImageUrl ?? null,

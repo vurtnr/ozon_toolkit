@@ -1,4 +1,3 @@
-use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -21,21 +20,18 @@ use crate::config::{
 };
 use crate::core::excel::extract_wps_images;
 use crate::core::orchestrator::{
-    orchestrate_match, CandidateFetcher, NoMatchReason, OrchestrationDiagnostics, SearchPass,
-    VlmCallStage,
+    process_candidates_with_diagnostics, NoMatchReason, OrchestrationDiagnostics, VlmCallStage,
 };
 use crate::core::ozon_cache::{
     validate_ozon_source_image_bytes, validate_ozon_source_metadata, OzonSourceCache,
     OzonSourceCacheLookup,
 };
 use crate::core::ozon_product::{OzonProductResolution, OzonResolutionFailure};
-use crate::core::search_image::{
-    generate_search_images, parse_search_image_plan, GeneratedSearchImages, SearchImagePlan,
-};
+use crate::core::ozon_product::{OzonAttributeEntry, OzonSpecProfile};
+use crate::core::search_image::{GeneratedSearchImages, SearchImagePlan};
 use crate::core::types::{Candidate, MatchSummary};
 use crate::core::vlm::{
-    DashScopeVlmClient, ReferenceImages, SearchImagePlanner, VlmBatchRequest, VlmCallTrace,
-    VlmClient, VlmMatchResult,
+    DashScopeVlmClient, ReferenceImages, VlmBatchRequest, VlmCallTrace, VlmClient, VlmMatchResult,
 };
 use crate::events::{
     emit_event, EventSink, LogEvent, ProgressEvent, RowResultEvent, TaskDoneEvent, TaskPhaseEvent,
@@ -53,10 +49,11 @@ const DEFAULT_SIDECAR_HEALTH_URL: &str = "http://127.0.0.1:8266/health";
 const DEFAULT_SIDECAR_SESSION_URL: &str = "http://127.0.0.1:8266/session-state";
 const DEFAULT_SIDECAR_OZON_RESOLVE_URL: &str = "http://127.0.0.1:8266/resolve-ozon-product";
 const DEFAULT_SIDECAR_OZON_CLOSE_URL: &str = "http://127.0.0.1:8266/close-ozon-session";
+const DEFAULT_SIDECAR_CAPTURE_IMAGE_URL: &str = "http://127.0.0.1:8266/capture-image";
+const DEFAULT_SIDECAR_DETAIL_PRICING_URL: &str = "http://127.0.0.1:8266/resolve-1688-detail-pricing";
 const DEFAULT_SIDECAR_SHUTDOWN_URL: &str = "http://127.0.0.1:8266/shutdown";
 const MOCK_CANDIDATES_ENV: &str = "RUN_TASK_MOCK_CANDIDATES_JSON";
 const MOCK_CANDIDATE_RESPONSES_ENV: &str = "RUN_TASK_MOCK_CANDIDATE_RESPONSES_JSON";
-const MOCK_SEARCH_IMAGE_PLAN_ENV: &str = "RUN_TASK_MOCK_SEARCH_IMAGE_PLAN_JSON";
 const MOCK_VLM_REPLIES_ENV: &str = "RUN_TASK_MOCK_VLM_REPLIES_JSON";
 const SIDECAR_HEALTH_URL_ENV: &str = "SIDECAR_HEALTH_URL";
 const DIAGNOSTICS_ROOT_ENV: &str = "RUN_TASK_DIAGNOSTICS_ROOT";
@@ -67,6 +64,8 @@ const SIDECAR_URL_ENV: &str = "SIDECAR_SEARCH_URL";
 const SIDECAR_SESSION_URL_ENV: &str = "SIDECAR_SESSION_URL";
 const SIDECAR_OZON_RESOLVE_URL_ENV: &str = "SIDECAR_OZON_RESOLVE_URL";
 const SIDECAR_OZON_CLOSE_URL_ENV: &str = "SIDECAR_OZON_CLOSE_URL";
+const SIDECAR_CAPTURE_IMAGE_URL_ENV: &str = "SIDECAR_CAPTURE_IMAGE_URL";
+const SIDECAR_DETAIL_PRICING_URL_ENV: &str = "SIDECAR_DETAIL_PRICING_URL";
 const SIDECAR_EXECUTABLE_PATH_ENV: &str = "SIDECAR_EXECUTABLE_PATH";
 const SIDECAR_PROFILE_DIR_ENV: &str = "SIDECAR_PROFILE_DIR";
 const SIDECAR_WAIT_TIMEOUT_SECS: u64 = 15;
@@ -94,6 +93,7 @@ struct TaskRow {
     excel_row_index: u32,
     ozon_url: String,
     ozon_name: String,
+    ozon_spec_profile: OzonSpecProfile,
     sku: String,
     original_cells: Vec<String>,
     image_bytes: Option<Vec<u8>>,
@@ -112,12 +112,16 @@ struct TaskOutputRow {
     original_image_url: Option<String>,
     original_image_bytes: Option<Vec<u8>>,
     matched_image_url: Option<String>,
+    matched_image_bytes: Option<Vec<u8>>,
+    recall_mode: Option<String>,
+    matched_variant_label: Option<String>,
 }
 
 #[derive(Debug, Default)]
 struct PreparedTaskRows {
     executable_rows: Vec<TaskRow>,
     finalized_rows: Vec<TaskOutputRow>,
+    finalized_diagnostics_jobs: Vec<PendingDiagnosticsJob>,
     processed_rows: u32,
 }
 
@@ -144,13 +148,15 @@ struct RowStageTimings {
 struct PendingDiagnosticsJob {
     row: TaskRow,
     status: String,
-    search_plan: SearchImagePlan,
-    search_images: GeneratedSearchImages,
-    source_image_path: PathBuf,
+    search_plan: Option<SearchImagePlan>,
+    search_images: Option<GeneratedSearchImages>,
+    source_image_path: Option<PathBuf>,
     diagnostics: OrchestrationDiagnostics,
     used_fallback_image: bool,
     no_match_reason: Option<NoMatchReason>,
     row_stage_timings: RowStageTimings,
+    detail_pricing_diagnostics: Option<SidecarDetailPricingDiagnostics>,
+    preflight_error: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -169,8 +175,10 @@ struct DiagnosticManifest<'a> {
     status: &'a str,
     used_fallback_image: bool,
     no_match_reason: Option<&'a str>,
-    search_plan: &'a SearchImagePlan,
+    search_plan: Option<&'a SearchImagePlan>,
     row_stage_timings: &'a RowStageTimings,
+    detail_pricing_diagnostics: Option<&'a SidecarDetailPricingDiagnostics>,
+    preflight_error: Option<&'a str>,
 }
 
 #[derive(Debug, Serialize)]
@@ -179,6 +187,15 @@ struct DiagnosticVlmCallMetadata<'a> {
     stage: &'a str,
     chunk_index: usize,
     match_ids: &'a [usize],
+    candidates: &'a [Candidate],
+}
+
+#[derive(Debug, Serialize)]
+struct DiagnosticVlmErrorMetadata<'a> {
+    pass_label: &'a str,
+    stage: &'a str,
+    chunk_index: usize,
+    error_message: &'a str,
     candidates: &'a [Candidate],
 }
 
@@ -199,9 +216,66 @@ struct SidecarOzonResolveRequest {
 #[derive(Debug, Deserialize)]
 struct SidecarSearchResponse {
     success: bool,
-    data: Option<Vec<Candidate>>,
+    data: Option<SidecarSearchResponseData>,
     code: Option<String>,
     error: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum SidecarSearchResponseData {
+    LegacyCandidates(Vec<Candidate>),
+    RecallResult {
+        candidates: Vec<Candidate>,
+        #[serde(rename = "usedSecondPassFullCrop")]
+        used_second_pass_full_crop: Option<bool>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct SidecarRecallMetadata {
+    used_second_pass_full_crop: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecallMode {
+    SourceFirstPass,
+    FullCropSecondPass,
+}
+
+impl RecallMode {
+    fn as_event_value(self) -> String {
+        match self {
+            Self::SourceFirstPass => "source_first_pass".to_string(),
+            Self::FullCropSecondPass => "full_crop_second_pass".to_string(),
+        }
+    }
+
+    fn from_sidecar_metadata(metadata: SidecarRecallMetadata) -> Self {
+        if metadata.used_second_pass_full_crop {
+            Self::FullCropSecondPass
+        } else {
+            Self::SourceFirstPass
+        }
+    }
+
+    fn screening_status(self, candidate_count: usize) -> String {
+        match self {
+            Self::SourceFirstPass => {
+                format!("源图首搜已召回 {} 个候选，AI复核中", candidate_count)
+            }
+            Self::FullCropSecondPass => {
+                format!("整图纠偏后已召回 {} 个候选，AI复核中", candidate_count)
+            }
+        }
+    }
+
+    fn success_status(self) -> String {
+        match self {
+            Self::SourceFirstPass => "AI比对成功(源图首搜命中)".to_string(),
+            Self::FullCropSecondPass => "AI比对成功(整图纠偏后命中)".to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -211,6 +285,30 @@ struct SidecarOzonResolvePayload {
     image_url: String,
     #[serde(rename = "imageBase64")]
     image_base64: Option<String>,
+    #[serde(rename = "specProfile", default)]
+    spec_profile: SidecarOzonSpecProfile,
+}
+
+#[derive(Debug, Deserialize, Default, Clone)]
+struct SidecarOzonAttributeEntry {
+    key: String,
+    value: String,
+}
+
+#[derive(Debug, Deserialize, Default, Clone)]
+struct SidecarOzonSpecProfile {
+    color: Option<String>,
+    #[serde(rename = "sizeTokens", default)]
+    size_tokens: Vec<String>,
+    #[serde(rename = "countTokens", default)]
+    count_tokens: Vec<String>,
+    material: Option<String>,
+    #[serde(rename = "modelTokens", default)]
+    model_tokens: Vec<String>,
+    #[serde(rename = "featureTokens", default)]
+    feature_tokens: Vec<String>,
+    #[serde(rename = "rawAttributes", default)]
+    raw_attributes: Vec<SidecarOzonAttributeEntry>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -219,6 +317,175 @@ struct SidecarOzonResolveResponse {
     data: Option<SidecarOzonResolvePayload>,
     code: Option<String>,
     error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct SidecarCaptureImageRequest {
+    #[serde(rename = "imageUrl")]
+    image_url: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SidecarCaptureImagePayload {
+    #[serde(rename = "imageBase64")]
+    image_base64: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SidecarCaptureImageResponse {
+    success: bool,
+    data: Option<SidecarCaptureImagePayload>,
+}
+
+#[derive(Debug, Serialize)]
+struct SidecarDetailPricingRequest {
+    #[serde(rename = "itemUrl")]
+    item_url: String,
+    #[serde(rename = "cardPrice")]
+    card_price: String,
+    #[serde(rename = "matchedImageUrl")]
+    matched_image_url: String,
+    #[serde(rename = "ozonTitle")]
+    ozon_title: String,
+    #[serde(rename = "ozonSpecProfile")]
+    ozon_spec_profile: SidecarDetailPricingSpecProfile,
+}
+
+#[derive(Debug, Serialize, Default, Clone)]
+struct SidecarDetailPricingAttributeEntry {
+    key: String,
+    value: String,
+}
+
+#[derive(Debug, Serialize, Default, Clone)]
+struct SidecarDetailPricingSpecProfile {
+    color: Option<String>,
+    #[serde(rename = "sizeTokens")]
+    size_tokens: Vec<String>,
+    #[serde(rename = "countTokens")]
+    count_tokens: Vec<String>,
+    material: Option<String>,
+    #[serde(rename = "modelTokens")]
+    model_tokens: Vec<String>,
+    #[serde(rename = "featureTokens")]
+    feature_tokens: Vec<String>,
+    #[serde(rename = "rawAttributes")]
+    raw_attributes: Vec<SidecarDetailPricingAttributeEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SidecarDetailPricingPayload {
+    #[serde(rename = "resolutionMode")]
+    resolution_mode: String,
+    price: Option<String>,
+    #[serde(rename = "matchedVariantLabel")]
+    matched_variant_label: Option<String>,
+    #[serde(rename = "basePrice")]
+    base_price: Option<String>,
+    #[serde(rename = "freightPrice")]
+    freight_price: Option<String>,
+    #[serde(rename = "quantityPlusClicked")]
+    quantity_plus_clicked: Option<bool>,
+    #[serde(rename = "submitOrderText")]
+    submit_order_text: Option<String>,
+    #[serde(default)]
+    diagnostics: Option<SidecarDetailPricingDiagnostics>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SidecarDetailPricingResponse {
+    success: bool,
+    data: Option<SidecarDetailPricingPayload>,
+    code: Option<String>,
+    error: Option<String>,
+    #[serde(default)]
+    diagnostics: Option<SidecarDetailPricingDiagnostics>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+struct SidecarDetailPricingDiagnostics {
+    #[serde(rename = "failureCode")]
+    failure_code: Option<String>,
+    #[serde(rename = "priceSource")]
+    price_source: Option<String>,
+    #[serde(rename = "priceSourceRefreshed")]
+    price_source_refreshed: Option<bool>,
+    #[serde(rename = "hasSkuSelection")]
+    has_sku_selection: Option<bool>,
+    #[serde(rename = "variantRowCount")]
+    variant_row_count: Option<usize>,
+    #[serde(rename = "selectedRowIndex")]
+    selected_row_index: Option<usize>,
+    #[serde(rename = "selectionAttempted")]
+    selection_attempted: Option<bool>,
+    #[serde(rename = "selectionApplied")]
+    selection_applied: Option<bool>,
+    #[serde(rename = "quantityBefore")]
+    quantity_before: Option<String>,
+    #[serde(rename = "quantityAfter")]
+    quantity_after: Option<String>,
+    #[serde(rename = "submitOrderBeforeText")]
+    submit_order_before_text: Option<String>,
+    #[serde(rename = "submitOrderAfterText")]
+    submit_order_after_text: Option<String>,
+    #[serde(rename = "pageScreenshotBase64")]
+    page_screenshot_base64: Option<String>,
+    #[serde(rename = "skuSelectionScreenshotBase64")]
+    sku_selection_screenshot_base64: Option<String>,
+    #[serde(rename = "skuSelectionSnapshot")]
+    sku_selection_snapshot: Option<serde_json::Value>,
+    #[serde(rename = "selectionStateBefore")]
+    selection_state_before: Option<serde_json::Value>,
+    #[serde(rename = "selectionStateAfter")]
+    selection_state_after: Option<serde_json::Value>,
+    #[serde(rename = "quantitySnapshotBefore")]
+    quantity_snapshot_before: Option<serde_json::Value>,
+    #[serde(rename = "quantitySnapshotAfter")]
+    quantity_snapshot_after: Option<serde_json::Value>,
+    #[serde(rename = "structuredDataProbe")]
+    structured_data_probe: Option<serde_json::Value>,
+}
+
+#[derive(Debug)]
+struct SidecarDetailPricingError {
+    message: String,
+    diagnostics: Option<SidecarDetailPricingDiagnostics>,
+}
+
+struct Apply1688DetailPricingOutcome {
+    log_message: String,
+    diagnostics: Option<SidecarDetailPricingDiagnostics>,
+}
+
+fn choose_sidecar_detail_pricing_error_message(
+    error: Option<String>,
+    code: Option<String>,
+    fallback: impl FnOnce() -> String,
+) -> String {
+    match (error, code) {
+        (Some(error), Some(code)) if error != code => format!("{error} ({code})"),
+        (Some(error), _) => error,
+        (_, Some(code)) => code,
+        _ => fallback(),
+    }
+}
+
+fn map_detail_pricing_failure_status(
+    diagnostics: Option<&SidecarDetailPricingDiagnostics>,
+) -> String {
+    match diagnostics.and_then(|value| value.failure_code.as_deref()) {
+        Some("manual_review_required_unknown_spec") => {
+            "无法判断商品规格，需人工介入".to_string()
+        }
+        Some("detail_variant_selection_not_applied") => {
+            "1688详情页规格选择失败".to_string()
+        }
+        Some("detail_quantity_not_applied") => "1688详情页数量未生效".to_string(),
+        Some("detail_price_not_refreshed") => "1688详情页价格未刷新".to_string(),
+        Some("price_source_missing") => "1688详情页价格来源缺失".to_string(),
+        Some("price_source_conflict") => "1688详情页价格来源冲突".to_string(),
+        _ => "1688详情页定价失败".to_string(),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -248,12 +515,6 @@ enum MockCandidateResponseEntry {
 enum MockVlmReplyEntry {
     MatchIds(Vec<usize>),
     Error { err: String },
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-struct SearchPassTimings {
-    primary_search_ms: Option<u64>,
-    fallback_search_ms: Option<u64>,
 }
 
 struct MockVlmClient {
@@ -318,16 +579,6 @@ impl VlmClient for MockVlmClient {
     }
 }
 
-impl SearchImagePlanner for MockVlmClient {
-    fn plan_search_images(
-        &self,
-        _ozon_image_base64: &str,
-        _ozon_name: &str,
-    ) -> Result<SearchImagePlan, String> {
-        Err("mock search image planner not configured".to_string())
-    }
-}
-
 enum RuntimeVlmClient {
     DashScope(DashScopeVlmClient),
     Mock(MockVlmClient),
@@ -362,19 +613,6 @@ impl VlmClient for RuntimeVlmClient {
     }
 }
 
-impl SearchImagePlanner for RuntimeVlmClient {
-    fn plan_search_images(
-        &self,
-        ozon_image_base64: &str,
-        ozon_name: &str,
-    ) -> Result<SearchImagePlan, String> {
-        match self {
-            Self::DashScope(client) => client.plan_search_images(ozon_image_base64, ozon_name),
-            Self::Mock(client) => client.plan_search_images(ozon_image_base64, ozon_name),
-        }
-    }
-}
-
 impl RuntimeVlmClient {
     fn clear_tile_cache(&self) {
         if let Self::DashScope(client) = self {
@@ -383,147 +621,41 @@ impl RuntimeVlmClient {
     }
 }
 
-struct SidecarCandidateFetcher<'a> {
-    sink: RefCell<&'a mut dyn EventSink>,
-    client: &'a Client,
-    call_count: Cell<usize>,
-    mock_sequence: RefCell<Option<VecDeque<Result<Vec<Candidate>, String>>>>,
-    timings: RefCell<SearchPassTimings>,
-    row_index: u32,
-    sku: String,
-}
-
-impl<'a> SidecarCandidateFetcher<'a> {
-    fn new(
-        sink: &'a mut dyn EventSink,
-        client: &'a Client,
-        mock_sequence: Option<VecDeque<Result<Vec<Candidate>, String>>>,
-        row_index: u32,
-        sku: impl Into<String>,
-    ) -> Self {
-        Self {
-            sink: RefCell::new(sink),
-            client,
-            call_count: Cell::new(0),
-            mock_sequence: RefCell::new(mock_sequence),
-            timings: RefCell::new(SearchPassTimings::default()),
-            row_index,
-            sku: sku.into(),
-        }
-    }
-
-    fn into_mock_sequence(self) -> Option<VecDeque<Result<Vec<Candidate>, String>>> {
-        self.mock_sequence.into_inner()
-    }
-
-    fn timings(&self) -> SearchPassTimings {
-        *self.timings.borrow()
+fn map_sidecar_ozon_spec_profile(profile: SidecarOzonSpecProfile) -> OzonSpecProfile {
+    OzonSpecProfile {
+        color: profile.color,
+        size_tokens: profile.size_tokens,
+        count_tokens: profile.count_tokens,
+        material: profile.material,
+        model_tokens: profile.model_tokens,
+        feature_tokens: profile.feature_tokens,
+        raw_attributes: profile
+            .raw_attributes
+            .into_iter()
+            .map(|entry| OzonAttributeEntry {
+                key: entry.key,
+                value: entry.value,
+            })
+            .collect(),
     }
 }
 
-impl CandidateFetcher for SidecarCandidateFetcher<'_> {
-    fn fetch_candidates(&self, image_path: &Path) -> Result<Vec<Candidate>, String> {
-        let mut sink = self.sink.borrow_mut();
-        let mut mock_sequence = self.mock_sequence.borrow_mut();
-        let call_count = self.call_count.get();
-        self.call_count.set(call_count + 1);
-        let (stage_key, stage_message) = if call_count == 0 {
-            ("searching_1688_primary", "主搜索图搜索中")
-        } else {
-            ("searching_1688_fallback", "备用搜索图搜索中")
-        };
-        emit_row_event(
-            &mut **sink,
-            self.row_index,
-            &self.sku,
-            stage_key,
-            stage_message.to_string(),
-            None,
-            None,
-            None,
-            None,
-            None,
-            false,
-        )?;
-        emit_event(
-            &mut **sink,
-            EVENT_LOG,
-            &LogEvent {
-                level: "info".to_string(),
-                message: stage_message.to_string(),
-            },
-        )?;
-        let search_started_at = Instant::now();
-        let result = fetch_candidates_with_session_recovery(
-            &mut **sink,
-            self.client,
-            image_path,
-            false,
-            &mut *mock_sequence,
-        );
-        let search_elapsed_ms = elapsed_millis(search_started_at.elapsed());
-        let elapsed_text = format_elapsed_text(search_elapsed_ms);
-        {
-            let mut timings = self.timings.borrow_mut();
-            if call_count == 0 {
-                timings.primary_search_ms = Some(search_elapsed_ms);
-            } else {
-                timings.fallback_search_ms = Some(search_elapsed_ms);
-            }
-        }
-        if let Ok(candidates) = &result {
-            let (next_stage, next_status) = if candidates.is_empty() {
-                if call_count == 0 {
-                    (
-                        "searching_1688_fallback",
-                        "主搜索图未召回有效候选，准备备用搜索图".to_string(),
-                    )
-                } else {
-                    ("screening_candidates", "双搜索图未召回有效候选".to_string())
-                }
-            } else {
-                (
-                    "screening_candidates",
-                    format!("已召回 {} 个候选，AI复核中", candidates.len()),
-                )
-            };
-            emit_row_event(
-                &mut **sink,
-                self.row_index,
-                &self.sku,
-                next_stage,
-                next_status,
-                None,
-                None,
-                None,
-                None,
-                Some(elapsed_text.clone()),
-                false,
-            )?;
-            emit_event(
-                &mut **sink,
-                EVENT_LOG,
-                &LogEvent {
-                    level: "info".to_string(),
-                    message: format!(
-                        "{}完成: {} 个候选, {}",
-                        stage_message,
-                        candidates.len(),
-                        elapsed_text
-                    ),
-                },
-            )?;
-        } else if let Err(error) = &result {
-            emit_event(
-                &mut **sink,
-                EVENT_LOG,
-                &LogEvent {
-                    level: "warn".to_string(),
-                    message: format!("{}失败: {} ({})", stage_message, error, elapsed_text),
-                },
-            )?;
-        }
-        result
+fn map_detail_pricing_spec_profile(profile: &OzonSpecProfile) -> SidecarDetailPricingSpecProfile {
+    SidecarDetailPricingSpecProfile {
+        color: profile.color.clone(),
+        size_tokens: profile.size_tokens.clone(),
+        count_tokens: profile.count_tokens.clone(),
+        material: profile.material.clone(),
+        model_tokens: profile.model_tokens.clone(),
+        feature_tokens: profile.feature_tokens.clone(),
+        raw_attributes: profile
+            .raw_attributes
+            .iter()
+            .map(|entry| SidecarDetailPricingAttributeEntry {
+                key: entry.key.clone(),
+                value: entry.value.clone(),
+            })
+            .collect(),
     }
 }
 
@@ -617,6 +749,7 @@ fn load_task_rows(excel_path: &Path) -> Result<TaskWorkbook, String> {
             excel_row_index: (idx + 1) as u32,
             ozon_url,
             ozon_name,
+            ozon_spec_profile: OzonSpecProfile::default(),
             sku,
             original_cells,
             image_bytes,
@@ -715,13 +848,15 @@ impl TaskDiagnosticsSession {
         &self,
         row: &TaskRow,
         status: &str,
-        search_plan: &SearchImagePlan,
-        search_images: &GeneratedSearchImages,
-        source_image_path: &Path,
+        search_plan: Option<&SearchImagePlan>,
+        search_images: Option<&GeneratedSearchImages>,
+        source_image_path: Option<&Path>,
         diagnostics: &OrchestrationDiagnostics,
         used_fallback_image: bool,
         no_match_reason: Option<&NoMatchReason>,
         row_stage_timings: &RowStageTimings,
+        detail_pricing_diagnostics: Option<&SidecarDetailPricingDiagnostics>,
+        preflight_error: Option<&str>,
     ) -> Result<PathBuf, String> {
         maybe_delay_diagnostics_write_for_tests();
         let row_dir = self.root_dir.join(format!(
@@ -732,18 +867,22 @@ impl TaskDiagnosticsSession {
         std::fs::create_dir_all(&row_dir)
             .map_err(|e| format!("create row diagnostics dir failed: {e}"))?;
 
-        copy_file_to(
-            source_image_path,
-            &row_dir.join(source_image_output_name(source_image_path)),
-        )?;
-        copy_file_to(
-            &search_images.primary_path,
-            &row_dir.join("search_primary.png"),
-        )?;
-        copy_file_to(
-            &search_images.fallback_path,
-            &row_dir.join("search_fallback.png"),
-        )?;
+        if let Some(source_image_path) = source_image_path {
+            copy_file_to(
+                source_image_path,
+                &row_dir.join(source_image_output_name(source_image_path)),
+            )?;
+        }
+        if let Some(search_images) = search_images {
+            copy_file_to(
+                &search_images.primary_path,
+                &row_dir.join("search_primary.png"),
+            )?;
+            copy_file_to(
+                &search_images.fallback_path,
+                &row_dir.join("search_fallback.png"),
+            )?;
+        }
 
         write_json_pretty(
             &row_dir.join("manifest.json"),
@@ -756,6 +895,8 @@ impl TaskDiagnosticsSession {
                 no_match_reason: no_match_reason.map(no_match_reason_label),
                 search_plan,
                 row_stage_timings,
+                detail_pricing_diagnostics,
+                preflight_error,
             },
         )?;
         write_json_pretty(
@@ -807,6 +948,58 @@ impl TaskDiagnosticsSession {
             if !call.trace.grid_jpeg_bytes.is_empty() {
                 std::fs::write(call_dir.join("grid.jpg"), &call.trace.grid_jpeg_bytes)
                     .map_err(|e| format!("write vlm grid failed: {e}"))?;
+            }
+        }
+        if !diagnostics.vlm_errors.is_empty() {
+            let vlm_errors_dir = row_dir.join("vlm_errors");
+            std::fs::create_dir_all(&vlm_errors_dir)
+                .map_err(|e| format!("create vlm errors dir failed: {e}"))?;
+            for (error_index, error) in diagnostics.vlm_errors.iter().enumerate() {
+                let error_dir = vlm_errors_dir.join(format!(
+                    "{:02}-{}-{}-{}",
+                    error_index + 1,
+                    error.pass_label,
+                    vlm_stage_label(&error.stage),
+                    error.chunk_index
+                ));
+                std::fs::create_dir_all(&error_dir)
+                    .map_err(|e| format!("create vlm error dir failed: {e}"))?;
+                write_json_pretty(
+                    &error_dir.join("metadata.json"),
+                    &DiagnosticVlmErrorMetadata {
+                        pass_label: &error.pass_label,
+                        stage: vlm_stage_label(&error.stage),
+                        chunk_index: error.chunk_index,
+                        error_message: &error.error_message,
+                        candidates: &error.candidates,
+                    },
+                )?;
+                std::fs::write(error_dir.join("error.txt"), &error.error_message)
+                    .map_err(|e| format!("write vlm error failed: {e}"))?;
+            }
+        }
+
+        if let Some(detail_pricing_diagnostics) = detail_pricing_diagnostics {
+            write_json_pretty(
+                &row_dir.join("detail_pricing.json"),
+                detail_pricing_diagnostics,
+            )?;
+            if let Some(base64) = detail_pricing_diagnostics.page_screenshot_base64.as_deref() {
+                write_base64_png(
+                    &row_dir.join("detail_page.png"),
+                    base64,
+                    "detail page screenshot",
+                )?;
+            }
+            if let Some(base64) = detail_pricing_diagnostics
+                .sku_selection_screenshot_base64
+                .as_deref()
+            {
+                write_base64_png(
+                    &row_dir.join("sku_selection.png"),
+                    base64,
+                    "sku selection screenshot",
+                )?;
             }
         }
 
@@ -896,6 +1089,45 @@ fn write_json_pretty<T: Serialize>(path: &Path, value: &T) -> Result<(), String>
     let bytes = serde_json::to_vec_pretty(value)
         .map_err(|e| format!("serialize diagnostics json failed: {e}"))?;
     std::fs::write(path, bytes).map_err(|e| format!("write diagnostics json failed: {e}"))
+}
+
+fn write_base64_png(path: &Path, base64: &str, label: &str) -> Result<(), String> {
+    let bytes = BASE64_STANDARD
+        .decode(base64.trim())
+        .map_err(|e| format!("decode {label} base64 failed: {e}"))?;
+    std::fs::write(path, bytes).map_err(|e| format!("write {label} failed: {e}"))
+}
+
+fn serialize_detail_pricing_diagnostics(
+    diagnostics: Option<&SidecarDetailPricingDiagnostics>,
+) -> String {
+    diagnostics
+        .map(|value| {
+            serde_json::json!({
+                "failureCode": value.failure_code,
+                "priceSource": value.price_source,
+                "priceSourceRefreshed": value.price_source_refreshed,
+                "hasSkuSelection": value.has_sku_selection,
+                "variantRowCount": value.variant_row_count,
+                "selectedRowIndex": value.selected_row_index,
+                "selectionAttempted": value.selection_attempted,
+                "selectionApplied": value.selection_applied,
+                "quantityBefore": value.quantity_before,
+                "quantityAfter": value.quantity_after,
+                "submitOrderBeforeText": value.submit_order_before_text,
+                "submitOrderAfterText": value.submit_order_after_text,
+                "hasPageScreenshot": value.page_screenshot_base64.is_some(),
+                "hasSkuSelectionScreenshot": value.sku_selection_screenshot_base64.is_some(),
+                "hasSkuSelectionSnapshot": value.sku_selection_snapshot.is_some(),
+                "hasSelectionStateBefore": value.selection_state_before.is_some(),
+                "hasSelectionStateAfter": value.selection_state_after.is_some(),
+                "hasQuantitySnapshotBefore": value.quantity_snapshot_before.is_some(),
+                "hasQuantitySnapshotAfter": value.quantity_snapshot_after.is_some(),
+                "hasStructuredDataProbe": value.structured_data_probe.is_some(),
+            })
+            .to_string()
+        })
+        .unwrap_or_else(|| "null".to_string())
 }
 
 fn maybe_delay_diagnostics_write_for_tests() {
@@ -1003,6 +1235,22 @@ fn sidecar_ozon_close_url() -> String {
         .unwrap_or_else(|| DEFAULT_SIDECAR_OZON_CLOSE_URL.to_string())
 }
 
+fn sidecar_capture_image_url() -> String {
+    std::env::var(SIDECAR_CAPTURE_IMAGE_URL_ENV)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| DEFAULT_SIDECAR_CAPTURE_IMAGE_URL.to_string())
+}
+
+fn sidecar_detail_pricing_url() -> String {
+    std::env::var(SIDECAR_DETAIL_PRICING_URL_ENV)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| DEFAULT_SIDECAR_DETAIL_PRICING_URL.to_string())
+}
+
 fn sidecar_shutdown_url() -> String {
     std::env::var(SIDECAR_SHUTDOWN_URL_ENV)
         .ok()
@@ -1052,31 +1300,6 @@ fn build_runtime_vlm_client() -> Result<RuntimeVlmClient, String> {
     }
 
     DashScopeVlmClient::from_env().map(RuntimeVlmClient::DashScope)
-}
-
-fn load_mock_search_image_plan() -> Result<Option<SearchImagePlan>, String> {
-    let Ok(raw) = std::env::var(MOCK_SEARCH_IMAGE_PLAN_ENV) else {
-        return Ok(None);
-    };
-
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return Ok(None);
-    }
-
-    parse_search_image_plan(trimmed).map(Some)
-}
-
-fn resolve_search_image_plan(
-    vlm_client: &RuntimeVlmClient,
-    ozon_image_base64: &str,
-    ozon_name: &str,
-) -> Result<SearchImagePlan, String> {
-    if let Some(plan) = load_mock_search_image_plan()? {
-        return Ok(plan);
-    }
-
-    vlm_client.plan_search_images(ozon_image_base64, ozon_name)
 }
 
 pub fn build_match_hint(ozon_name: &str, target_product: &str) -> String {
@@ -1201,27 +1424,6 @@ fn write_source_image_or_mock_png(
         preview_data_url,
         workbook_image_bytes,
     })
-}
-
-fn encode_image_file_as_data_url(image_path: &Path) -> Result<String, String> {
-    let bytes =
-        std::fs::read(image_path).map_err(|e| format!("read image file for base64 failed: {e}"))?;
-    let mime_type = match image_path
-        .extension()
-        .and_then(|value| value.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "png" => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
-        _ => "application/octet-stream",
-    };
-
-    Ok(format!(
-        "data:{mime_type};base64,{}",
-        BASE64_STANDARD.encode(bytes)
-    ))
 }
 
 fn ping_sidecar(client: &Client) -> Result<(), String> {
@@ -1518,16 +1720,32 @@ fn resolve_ozon_product_via_sidecar(
         title: payload.title,
         image_url: payload.image_url,
         image_bytes,
+        spec_profile: map_sidecar_ozon_spec_profile(payload.spec_profile),
     })
 }
 
 fn finalize_preflight_row(
     sink: &mut dyn EventSink,
     prepared: &mut PreparedTaskRows,
+    row: &TaskRow,
     output_row: TaskOutputRow,
+    preflight_error: Option<String>,
     total_rows: u32,
 ) -> Result<(), String> {
     emit_final_row_result_event(sink, &output_row)?;
+    prepared.finalized_diagnostics_jobs.push(PendingDiagnosticsJob {
+        row: row.clone(),
+        status: output_row.status.clone(),
+        search_plan: None,
+        search_images: None,
+        source_image_path: None,
+        diagnostics: OrchestrationDiagnostics::default(),
+        used_fallback_image: false,
+        no_match_reason: None,
+        row_stage_timings: RowStageTimings::default(),
+        detail_pricing_diagnostics: None,
+        preflight_error,
+    });
     prepared.finalized_rows.push(output_row);
     prepared.processed_rows += 1;
     emit_event(
@@ -1613,7 +1831,9 @@ where
                 finalize_preflight_row(
                     sink,
                     &mut prepared,
+                    row,
                     empty_output_row(row, map_ozon_resolution_failure_to_status(&error).as_str()),
+                    Some(format!("{error:?}")),
                     total_rows,
                 )?;
                 continue;
@@ -1703,6 +1923,7 @@ where
                 Ok(resolution) => {
                     let mut hydrated = validated_row.clone();
                     hydrated.ozon_name = resolution.title;
+                    hydrated.ozon_spec_profile = resolution.spec_profile;
                     hydrated.image_bytes = Some(resolution.image_bytes);
                     hydrated
                 }
@@ -1778,6 +1999,7 @@ where
                                     );
                                     let mut hydrated = validated_row.clone();
                                     hydrated.ozon_name = resolution.title;
+                                    hydrated.ozon_spec_profile = resolution.spec_profile;
                                     hydrated.image_bytes = Some(resolution.image_bytes);
                                     if hydrated.image_bytes.is_some() || use_mock_candidates {
                                         prepared.executable_rows.push(hydrated);
@@ -1785,7 +2007,12 @@ where
                                         finalize_preflight_row(
                                             sink,
                                             &mut prepared,
+                                            &hydrated,
                                             empty_output_row(&hydrated, "Ozon主图抓取失败"),
+                                            Some(
+                                                "resolved ozon source missing image bytes after browser hydrate"
+                                                    .to_string(),
+                                            ),
                                             total_rows,
                                         )?;
                                     }
@@ -1812,20 +2039,24 @@ where
                             finalize_preflight_row(
                                 sink,
                                 &mut prepared,
+                                &validated_row,
                                 empty_output_row(
                                     &validated_row,
                                     "Ozon 验证失败，已跳过",
                                 ),
+                                Some(format!("{last_error:?}")),
                                 total_rows,
                             )?;
                         } else if last_error != OzonResolutionFailure::InvalidUrl {
                             finalize_preflight_row(
                                 sink,
                                 &mut prepared,
+                                &validated_row,
                                 empty_output_row(
                                     &validated_row,
                                     map_ozon_resolution_failure_to_status(&last_error).as_str(),
                                 ),
+                                Some(format!("{last_error:?}")),
                                 total_rows,
                             )?;
                         }
@@ -1834,10 +2065,12 @@ where
                     finalize_preflight_row(
                         sink,
                         &mut prepared,
+                        &validated_row,
                         empty_output_row(
                             &validated_row,
                             map_ozon_resolution_failure_to_status(&error).as_str(),
                         ),
+                        Some(format!("{error:?}")),
                         total_rows,
                     )?;
                     continue;
@@ -1855,7 +2088,9 @@ where
         finalize_preflight_row(
             sink,
             &mut prepared,
+            &resolved_row,
             empty_output_row(&resolved_row, "Excel中无图"),
+            Some("row has no workbook image bytes after preflight".to_string()),
             total_rows,
         )?;
     }
@@ -1868,15 +2103,19 @@ fn fetch_candidates_from_sidecar(
     image_path: &Path,
     force_full_crop: bool,
     mock_sequence: &mut Option<VecDeque<Result<Vec<Candidate>, String>>>,
-) -> Result<Vec<Candidate>, String> {
+) -> Result<(Vec<Candidate>, SidecarRecallMetadata), String> {
     if let Some(sequence) = mock_sequence.as_mut() {
-        return sequence.pop_front().unwrap_or_else(|| Ok(Vec::new()));
+        return sequence
+            .pop_front()
+            .unwrap_or_else(|| Ok(Vec::new()))
+            .map(|candidates| (candidates, SidecarRecallMetadata::default()));
     }
 
     if let Ok(mock_json) = std::env::var(MOCK_CANDIDATES_ENV) {
         let trimmed = mock_json.trim();
         if !trimmed.is_empty() {
             return serde_json::from_str::<Vec<Candidate>>(trimmed)
+                .map(|candidates| (candidates, SidecarRecallMetadata::default()))
                 .map_err(|e| format!("parse {MOCK_CANDIDATES_ENV} failed: {e}"));
         }
     }
@@ -1908,7 +2147,23 @@ fn fetch_candidates_from_sidecar(
     }
 
     if parsed.success {
-        return Ok(parsed.data.unwrap_or_default());
+        let data = parsed.data.unwrap_or(SidecarSearchResponseData::LegacyCandidates(
+            Vec::new(),
+        ));
+        return Ok(match data {
+            SidecarSearchResponseData::LegacyCandidates(candidates) => {
+                (candidates, SidecarRecallMetadata::default())
+            }
+            SidecarSearchResponseData::RecallResult {
+                candidates,
+                used_second_pass_full_crop,
+            } => (
+                candidates,
+                SidecarRecallMetadata {
+                    used_second_pass_full_crop: used_second_pass_full_crop.unwrap_or(false),
+                },
+            ),
+        });
     }
 
     Err(parsed
@@ -1923,10 +2178,10 @@ fn fetch_candidates_with_session_recovery(
     image_path: &Path,
     force_full_crop: bool,
     mock_sequence: &mut Option<VecDeque<Result<Vec<Candidate>, String>>>,
-) -> Result<Vec<Candidate>, String> {
+) -> Result<(Vec<Candidate>, SidecarRecallMetadata), String> {
     loop {
         match fetch_candidates_from_sidecar(client, image_path, force_full_crop, mock_sequence) {
-            Ok(candidates) => return Ok(candidates),
+            Ok(result) => return Ok(result),
             Err(code) if code == CODE_LOGIN_REQUIRED => {
                 wait_for_sidecar_ready_session(sink, client)?;
             }
@@ -1935,15 +2190,140 @@ fn fetch_candidates_with_session_recovery(
     }
 }
 
+fn fetch_1688_detail_pricing(
+    client: &Client,
+    item_url: &str,
+    card_price: &str,
+    matched_image_url: &str,
+    ozon_title: &str,
+    ozon_spec_profile: &OzonSpecProfile,
+) -> Result<SidecarDetailPricingPayload, SidecarDetailPricingError> {
+    let response = client
+        .post(sidecar_detail_pricing_url())
+        .json(&SidecarDetailPricingRequest {
+            item_url: item_url.to_string(),
+            card_price: card_price.to_string(),
+            matched_image_url: matched_image_url.to_string(),
+            ozon_title: ozon_title.to_string(),
+            ozon_spec_profile: map_detail_pricing_spec_profile(ozon_spec_profile),
+        })
+        .send()
+        .map_err(|e| SidecarDetailPricingError {
+            message: format!("request sidecar detail pricing failed: {e}"),
+            diagnostics: None,
+        })?;
+
+    let status = response.status();
+    let text = response
+        .text()
+        .map_err(|e| SidecarDetailPricingError {
+            message: format!("read sidecar detail pricing response failed: {e}"),
+            diagnostics: None,
+        })?;
+
+    let parsed = serde_json::from_str::<SidecarDetailPricingResponse>(&text).map_err(|e| {
+        SidecarDetailPricingError {
+            message: format!("parse sidecar detail pricing response failed: {e}; body={text}"),
+            diagnostics: None,
+        }
+    })?;
+
+    if !status.is_success() {
+        return Err(SidecarDetailPricingError {
+            message: choose_sidecar_detail_pricing_error_message(
+                parsed.error,
+                parsed.code,
+                || format!("sidecar detail pricing http error {status}"),
+            ),
+            diagnostics: parsed.diagnostics,
+        });
+    }
+
+    if !parsed.success {
+        return Err(SidecarDetailPricingError {
+            message: choose_sidecar_detail_pricing_error_message(
+                parsed.error,
+                parsed.code,
+                || "UNKNOWN_SIDECAR_DETAIL_PRICING_ERROR".to_string(),
+            ),
+            diagnostics: parsed.diagnostics,
+        });
+    }
+
+    parsed
+        .data
+        .ok_or_else(|| SidecarDetailPricingError {
+            message: "sidecar detail pricing response missing data".to_string(),
+            diagnostics: None,
+        })
+}
+
+fn apply_1688_detail_pricing(
+    client: &Client,
+    row: &TaskRow,
+    output_row: &mut TaskOutputRow,
+) -> Result<Option<Apply1688DetailPricingOutcome>, SidecarDetailPricingError> {
+    let Some(item_url) = output_row.item_url.as_deref() else {
+        return Ok(None);
+    };
+    let Some(card_price) = output_row.price.as_deref() else {
+        return Ok(None);
+    };
+    let Some(matched_image_url) = output_row.matched_image_url.as_deref() else {
+        return Ok(None);
+    };
+
+    let payload = fetch_1688_detail_pricing(
+        client,
+        item_url,
+        card_price,
+        matched_image_url,
+        &row.ozon_name,
+        &row.ozon_spec_profile,
+    )?;
+
+    output_row.matched_variant_label = payload.matched_variant_label.clone();
+    match payload.resolution_mode.as_str() {
+        "legacy_no_sku_selection" | "variant_image_payable_total" | "variant_label_payable_total" => {
+            if payload.price.is_some() {
+                output_row.price = payload.price;
+            }
+        }
+        "manual_review_required_unknown_spec" => {
+            output_row.price = None;
+            output_row.status = "无法判断商品规格，需人工介入".to_string();
+            output_row.ai_analysis_conclusion = Some(output_row.status.clone());
+        }
+        _ => {}
+    }
+
+    Ok(Some(Apply1688DetailPricingOutcome {
+        log_message: format!(
+            "1688 详情页定价诊断: sku={} mode={} variant={:?} plus_clicked={:?} 商品金额={:?} 运费={:?} submitOrder={:?} 最终价格={:?} detail_diag={}",
+            row.sku,
+            payload.resolution_mode,
+            payload.matched_variant_label,
+            payload.quantity_plus_clicked,
+            payload.base_price,
+            payload.freight_price,
+            payload.submit_order_text,
+            output_row.price,
+            serialize_detail_pricing_diagnostics(payload.diagnostics.as_ref()),
+        ),
+        diagnostics: payload.diagnostics,
+    }))
+}
+
 fn write_result_workbook(
     result_path: &Path,
     headers: &[String],
     rows: &[TaskOutputRow],
     client: &Client,
-) -> Result<(), String> {
+) -> Result<Vec<String>, String> {
     let mut workbook = Workbook::new();
     let worksheet = workbook.add_worksheet();
     let header_format = Format::new().set_bold().set_background_color(Color::Silver);
+    let mut warnings = Vec::new();
     let base_col_len = headers.len() as u16;
     let price_col = base_col_len;
     let item_url_col = base_col_len + 1;
@@ -2036,7 +2416,10 @@ fn write_result_workbook(
                 .map_err(|e| format!("write result row failed: {e}"))?;
         }
 
-        if row.original_image_bytes.is_some() || row.matched_image_url.is_some() {
+        if row.original_image_bytes.is_some()
+            || row.matched_image_bytes.is_some()
+            || row.matched_image_url.is_some()
+        {
             worksheet
                 .set_row_height_pixels(write_row, 92)
                 .map_err(|e| format!("set result row height failed: {e}"))?;
@@ -2051,18 +2434,28 @@ fn write_result_workbook(
             );
         }
 
-        if let Some(matched_image_url) = &row.matched_image_url {
+        if let Some(matched_image_bytes) = &row.matched_image_bytes {
+            let _ =
+                insert_result_image(worksheet, write_row, matched_image_col, matched_image_bytes);
+        } else if let Some(matched_image_url) = &row.matched_image_url {
             if let Some(image_bytes) =
-                fetch_result_image_bytes(client, matched_image_url, &mut image_cache)
+                resolve_matched_image_bytes(client, matched_image_url, &mut image_cache)
             {
                 let _ = insert_result_image(worksheet, write_row, matched_image_col, &image_bytes);
+            } else {
+                warnings.push(format!(
+                    "结果导出缺少匹配图: row={} sku={} url={}",
+                    row.row_index, row.sku, matched_image_url
+                ));
             }
         }
     }
 
     workbook
         .save(result_path)
-        .map_err(|e| format!("save result workbook failed: {e}"))
+        .map_err(|e| format!("save result workbook failed: {e}"))?;
+
+    Ok(warnings)
 }
 
 fn fetch_result_image_bytes(
@@ -2087,6 +2480,44 @@ fn fetch_result_image_bytes(
     let normalized = normalize_image_bytes_for_workbook(&fetched).unwrap_or(fetched);
     cache.insert(image_url.to_string(), Some(normalized.clone()));
     Some(normalized)
+}
+
+fn capture_sidecar_image_bytes(client: &Client, image_url: &str) -> Option<Vec<u8>> {
+    let response = client
+        .post(sidecar_capture_image_url())
+        .json(&SidecarCaptureImageRequest {
+            image_url: image_url.to_string(),
+        })
+        .send()
+        .ok()?;
+
+    let parsed = response
+        .error_for_status()
+        .ok()?
+        .json::<SidecarCaptureImageResponse>()
+        .ok()?;
+    if !parsed.success {
+        return None;
+    }
+
+    let payload = parsed.data?;
+    let decoded = BASE64_STANDARD.decode(payload.image_base64.trim()).ok()?;
+    normalize_image_bytes_for_workbook(&decoded).ok().or(Some(decoded))
+}
+
+fn resolve_matched_image_bytes(
+    client: &Client,
+    image_url: &str,
+    cache: &mut HashMap<String, Option<Vec<u8>>>,
+) -> Option<Vec<u8>> {
+    if let Some(cached) = cache.get(image_url) {
+        return cached.clone();
+    }
+
+    let resolved = fetch_result_image_bytes(client, image_url, cache)
+        .or_else(|| capture_sidecar_image_bytes(client, image_url));
+    cache.insert(image_url.to_string(), resolved.clone());
+    resolved
 }
 
 fn insert_result_image(
@@ -2116,6 +2547,9 @@ fn empty_output_row(row: &TaskRow, status: &str) -> TaskOutputRow {
         original_image_url: None,
         original_image_bytes: None,
         matched_image_url: None,
+        matched_image_bytes: None,
+        recall_mode: None,
+        matched_variant_label: None,
     }
 }
 
@@ -2138,6 +2572,9 @@ fn output_row_from_match(
             original_image_url: None,
             original_image_bytes: None,
             matched_image_url: Some(cheapest.image_url),
+            matched_image_bytes: None,
+            recall_mode: None,
+            matched_variant_label: None,
         },
         MatchSummary::MatchedButPriceUnavailable { .. } | MatchSummary::NoMatch => TaskOutputRow {
             row_index: row.excel_row_index,
@@ -2151,6 +2588,9 @@ fn output_row_from_match(
             original_image_url: None,
             original_image_bytes: None,
             matched_image_url: None,
+            matched_image_bytes: None,
+            recall_mode: None,
+            matched_variant_label: None,
         },
     }
 }
@@ -2162,6 +2602,7 @@ fn emit_row_event(
     sku: &str,
     stage: &str,
     status: String,
+    recall_mode: Option<String>,
     original_image_url: Option<String>,
     matched_image_url: Option<String>,
     item_url: Option<String>,
@@ -2177,6 +2618,7 @@ fn emit_row_event(
             sku: sku.to_string(),
             stage: stage.to_string(),
             status,
+            recall_mode,
             image_url: matched_image_url.clone(),
             original_image_url,
             matched_image_url,
@@ -2205,6 +2647,7 @@ fn emit_row_stage_event(
         None,
         None,
         None,
+        None,
         false,
     )
 }
@@ -2219,6 +2662,7 @@ fn emit_final_row_result_event(
         &row.sku,
         "completed",
         row.status.clone(),
+        row.recall_mode.clone(),
         row.original_image_url.clone(),
         row.matched_image_url.clone(),
         row.item_url.clone(),
@@ -2249,7 +2693,7 @@ fn emit_task_phase_event(
 
 fn no_match_status(reason: Option<&NoMatchReason>) -> &'static str {
     match reason {
-        Some(NoMatchReason::NoCandidates) => "无可比对候选(双搜索图未召回有效1688结果)",
+        Some(NoMatchReason::NoCandidates) => "无可比对候选(源图搜索未召回有效1688结果)",
         Some(NoMatchReason::InitialScreenNoMatch) => "候选已召回，但AI初筛未判定为高相似候选",
         Some(NoMatchReason::FinalReviewRejected) => "候选已召回，但终选复核未通过",
         None => "无真实同款",
@@ -2371,6 +2815,28 @@ where
         let executable_rows = prepared_rows.executable_rows;
         let mut output_rows = prepared_rows.finalized_rows;
         let mut diagnostics_handles = Vec::new();
+        for job in prepared_rows.finalized_diagnostics_jobs {
+            if let Some(session) = diagnostics_session.clone() {
+                diagnostics_handles.push(std::thread::spawn(move || {
+                    let diagnostics_started_at = Instant::now();
+                    let result = session.save_row_bundle(
+                        &job.row,
+                        &job.status,
+                        job.search_plan.as_ref(),
+                        job.search_images.as_ref(),
+                        job.source_image_path.as_deref(),
+                        &job.diagnostics,
+                        job.used_fallback_image,
+                        job.no_match_reason.as_ref(),
+                        &job.row_stage_timings,
+                        job.detail_pricing_diagnostics.as_ref(),
+                        job.preflight_error.as_deref(),
+                    );
+                    (result, elapsed_millis(diagnostics_started_at.elapsed()))
+                }));
+            }
+        }
+        let mut matched_image_cache: HashMap<String, Option<Vec<u8>>> = HashMap::new();
 
         if !use_mock_candidates && !executable_rows.is_empty() {
             emit_task_phase_event(
@@ -2393,7 +2859,7 @@ where
                 sink,
                 "running_1688_and_ai",
                 "执行 1688 搜款与 AI 复核",
-                "正在基于搜索图执行 1688 搜索与大模型比对",
+                "正在基于 Ozon 源图执行 1688 搜索与大模型比对",
                 false,
             )?;
         }
@@ -2403,7 +2869,10 @@ where
             let mut output_row = empty_output_row(resolved_row, "Excel中无图");
             let mut original_image_url: Option<String> = None;
             let mut original_image_bytes: Option<Vec<u8>> = None;
+            let mut last_source_image_path: Option<PathBuf> = None;
+            let mut recall_mode: Option<RecallMode> = None;
             let mut pending_diagnostics: Option<PendingDiagnosticsJob> = None;
+            let mut detail_pricing_diagnostics: Option<SidecarDetailPricingDiagnostics> = None;
             let mut row_stage_timings = RowStageTimings::default();
 
             if resolved_row.image_bytes.is_some() || use_mock_candidates {
@@ -2412,15 +2881,15 @@ where
                 emit_row_stage_event(
                     sink,
                     &resolved_row,
-                    "planning_search_image",
-                    "正在生成搜索图",
+                    "searching_1688_source_image",
+                    "正在使用源图执行 1688 搜索",
                 )?;
                 emit_event(
                     sink,
                     EVENT_LOG,
                     &LogEvent {
                         level: "info".to_string(),
-                        message: "正在生成搜索图".to_string(),
+                        message: "正在使用源图执行 1688 搜索".to_string(),
                     },
                 )?;
                 match write_source_image_or_mock_png(&resolved_row, &temp_dir, use_mock_candidates)
@@ -2432,8 +2901,9 @@ where
                             sink,
                             resolved_row.excel_row_index,
                             &resolved_row.sku,
-                            "planning_search_image",
-                            "正在生成搜索图".to_string(),
+                            "searching_1688_source_image",
+                            "正在使用源图执行 1688 搜索".to_string(),
+                            None,
                             original_image_url.clone(),
                             None,
                             None,
@@ -2442,264 +2912,198 @@ where
                             false,
                         )?;
                         let source_image_path = source_image.path.clone();
+                        last_source_image_path = Some(source_image_path.clone());
                         let ozon_base64 = source_image.source_data_url.clone();
-                        let search_plan_started_at = Instant::now();
-                        match resolve_search_image_plan(
-                            &vlm_client,
-                            &ozon_base64,
-                            &resolved_row.ozon_name,
-                        ) {
-                            Ok(search_plan) => {
-                                row_stage_timings.search_plan_ms =
-                                    Some(elapsed_millis(search_plan_started_at.elapsed()));
-                                let render_search_images_started_at = Instant::now();
-                                match generate_search_images(
-                                    &source_image_path,
-                                    &search_plan,
-                                    &temp_dir,
+                        emit_row_event(
+                            sink,
+                            resolved_row.excel_row_index,
+                            &resolved_row.sku,
+                            "searching_1688_source_image",
+                            "源图搜索中".to_string(),
+                            None,
+                            original_image_url.clone(),
+                            None,
+                            None,
+                            None,
+                            None,
+                            false,
+                        )?;
+                        emit_event(
+                            sink,
+                            EVENT_LOG,
+                            &LogEvent {
+                                level: "info".to_string(),
+                                message: "源图搜索中".to_string(),
+                            },
+                        )?;
+
+                        let search_started_at = Instant::now();
+                        let fetch_result = fetch_candidates_with_session_recovery(
+                            sink,
+                            &client,
+                            &source_image_path,
+                            false,
+                            &mut mock_candidate_sequence,
+                        );
+                        row_stage_timings.primary_search_ms =
+                            Some(elapsed_millis(search_started_at.elapsed()));
+
+                        match fetch_result {
+                            Ok((candidates, recall_metadata)) => {
+                                let resolved_recall_mode =
+                                    RecallMode::from_sidecar_metadata(recall_metadata);
+                                recall_mode = Some(resolved_recall_mode);
+                                emit_row_event(
+                                    sink,
+                                    resolved_row.excel_row_index,
                                     &resolved_row.sku,
+                                    "screening_candidates",
+                                    resolved_recall_mode.screening_status(candidates.len()),
+                                    Some(resolved_recall_mode.as_event_value()),
+                                    original_image_url.clone(),
+                                    None,
+                                    None,
+                                    None,
+                                    row_stage_timings
+                                        .primary_search_ms
+                                        .map(format_elapsed_text),
+                                    false,
+                                )?;
+                                let match_hint = build_match_hint(
+                                    &resolved_row.ozon_name,
+                                    &resolved_row.ozon_name,
+                                );
+                                match process_candidates_with_diagnostics(
+                                    &vlm_client,
+                                    &ozon_base64,
+                                    Some(&ozon_base64),
+                                    candidates,
+                                    Some(&match_hint),
+                                    "source",
                                 ) {
-                                    Ok(search_images) => {
-                                        row_stage_timings.search_image_render_ms =
-                                            Some(elapsed_millis(
-                                                render_search_images_started_at.elapsed(),
-                                            ));
-                                        match (
-                                            encode_image_file_as_data_url(
-                                                &search_images.primary_path,
-                                            ),
-                                            encode_image_file_as_data_url(
-                                                &search_images.fallback_path,
-                                            ),
-                                        ) {
-                                            (
-                                                Ok(primary_search_base64),
-                                                Ok(fallback_search_base64),
-                                            ) => {
-                                                let match_hint = build_match_hint(
-                                                    &resolved_row.ozon_name,
-                                                    &search_plan.target_product,
-                                                );
-                                                let fetcher = SidecarCandidateFetcher::new(
-                                                    sink,
-                                                    &client,
-                                                    mock_candidate_sequence.take(),
-                                                    resolved_row.excel_row_index,
-                                                    resolved_row.sku.clone(),
-                                                );
-                                                let result = orchestrate_match(
-                                                    &fetcher,
-                                                    &vlm_client,
-                                                    SearchPass {
-                                                        image_path: &search_images.primary_path,
-                                                        reference_image_base64:
-                                                            &primary_search_base64,
-                                                    },
-                                                    SearchPass {
-                                                        image_path: &search_images.fallback_path,
-                                                        reference_image_base64:
-                                                            &fallback_search_base64,
-                                                    },
-                                                    &ozon_base64,
-                                                    Some(&match_hint),
-                                                );
-                                                let search_timings = fetcher.timings();
-                                                row_stage_timings.primary_search_ms =
-                                                    search_timings.primary_search_ms;
-                                                row_stage_timings.fallback_search_ms =
-                                                    search_timings.fallback_search_ms;
-                                                mock_candidate_sequence =
-                                                    fetcher.into_mock_sequence();
+                                    Ok((summary, diagnostics, no_match_reason)) => {
+                                        let elapsed = format_elapsed_text(elapsed_millis(
+                                            compare_started_at.elapsed(),
+                                        ));
+                                        row_stage_timings.screening_ms =
+                                            Some(diagnostics.screening_elapsed_ms);
+                                        row_stage_timings.screening_candidate_count =
+                                            diagnostics.screening_candidate_count;
+                                        row_stage_timings.screening_chunk_count =
+                                            diagnostics.screening_chunk_count;
+                                        if diagnostics.final_review_batch_count > 0 {
+                                            row_stage_timings.final_review_ms =
+                                                Some(diagnostics.final_review_elapsed_ms);
+                                        }
+                                        row_stage_timings.final_review_candidate_count =
+                                            diagnostics.final_review_candidate_count;
+                                        row_stage_timings.final_review_batch_count =
+                                            diagnostics.final_review_batch_count;
 
-                                                match result {
-                                                    Ok(orchestration) => {
-                                                        let elapsed =
-                                                            format_elapsed_text(elapsed_millis(
-                                                                compare_started_at.elapsed(),
-                                                            ));
-                                                        let summary = orchestration.summary.clone();
-                                                        let no_match_reason =
-                                                            orchestration.no_match_reason.clone();
-                                                        let used_fallback_image =
-                                                            orchestration.used_fallback_image;
-                                                        row_stage_timings.screening_ms = Some(
-                                                            orchestration
-                                                                .diagnostics
-                                                                .screening_elapsed_ms,
-                                                        );
-                                                        row_stage_timings
-                                                            .screening_candidate_count =
-                                                            orchestration
-                                                                .diagnostics
-                                                                .screening_candidate_count;
-                                                        row_stage_timings.screening_chunk_count =
-                                                            orchestration
-                                                                .diagnostics
-                                                                .screening_chunk_count;
-                                                        if orchestration
-                                                            .diagnostics
-                                                            .final_review_batch_count
-                                                            > 0
-                                                        {
-                                                            row_stage_timings.final_review_ms =
-                                                                Some(
-                                                                    orchestration
-                                                                        .diagnostics
-                                                                        .final_review_elapsed_ms,
-                                                                );
-                                                        }
-                                                        row_stage_timings
-                                                            .final_review_candidate_count =
-                                                            orchestration
-                                                                .diagnostics
-                                                                .final_review_candidate_count;
-                                                        row_stage_timings
-                                                            .final_review_batch_count =
-                                                            orchestration
-                                                                .diagnostics
-                                                                .final_review_batch_count;
-                                                        output_row = match summary.clone() {
-                                                            MatchSummary::Cheapest(cheapest) => {
-                                                                let status = if used_fallback_image {
-                                                                    "AI比对成功(备用搜索图召回)"
-                                                                } else {
-                                                                    "AI比对成功(主搜索图召回)"
-                                                                };
-                                                                output_row_from_match(
-                                                                    &resolved_row,
-                                                                    MatchSummary::Cheapest(
-                                                                        cheapest,
-                                                                    ),
-                                                                    status.to_string(),
-                                                                    elapsed,
-                                                                )
-                                                            }
-                                                            MatchSummary::NoMatch => {
-                                                                output_row_from_match(
-                                                                    &resolved_row,
-                                                                    MatchSummary::NoMatch,
-                                                                    no_match_status(
-                                                                        no_match_reason.as_ref(),
-                                                                    )
-                                                                    .to_string(),
-                                                                    elapsed,
-                                                                )
-                                                            }
-                                                            MatchSummary::MatchedButPriceUnavailable {
-                                                                total_matches,
-                                                            } => output_row_from_match(
-                                                                &resolved_row,
-                                                                MatchSummary::MatchedButPriceUnavailable {
-                                                                    total_matches,
-                                                                },
-                                                                "命中同款但价格不可解析"
-                                                                    .to_string(),
-                                                                elapsed,
-                                                            ),
-                                                        };
-
-                                                        if should_write_diagnostics(
-                                                            &summary,
-                                                            no_match_reason.as_ref(),
-                                                        ) {
-                                                            pending_diagnostics =
-                                                                Some(PendingDiagnosticsJob {
-                                                                    row: resolved_row.clone(),
-                                                                    status: output_row
-                                                                        .status
-                                                                        .clone(),
-                                                                    search_plan: search_plan
-                                                                        .clone(),
-                                                                    search_images: search_images
-                                                                        .clone(),
-                                                                    source_image_path:
-                                                                        source_image_path.clone(),
-                                                                    diagnostics: orchestration
-                                                                        .diagnostics
-                                                                        .clone(),
-                                                                    used_fallback_image,
-                                                                    no_match_reason:
-                                                                        no_match_reason.clone(),
-                                                                    row_stage_timings:
-                                                                        row_stage_timings.clone(),
-                                                                });
-                                                        }
-                                                    }
-                                                    Err(code) => {
-                                                        if code == CODE_ANTI_BOT_CHALLENGE {
-                                                            GLOBAL_RECOVERY_GATE.pause();
-                                                            emit_blocking_alert_if_needed(
-                                                                sink, &code,
-                                                            )?;
-                                                            return Err(code);
-                                                        }
-                                                        if code == CODE_CHROME_NOT_FOUND {
-                                                            emit_blocking_alert_if_needed(
-                                                                sink,
-                                                                CODE_CHROME_NOT_FOUND,
-                                                            )?;
-                                                            return Err(
-                                                                CODE_CHROME_NOT_FOUND.to_string()
-                                                            );
-                                                        }
-
-                                                        let status = if code.contains("大模型API")
-                                                        {
-                                                            format!("大模型API异常: {code}")
-                                                        } else if code.contains("sidecar")
-                                                            || code.contains("LOGIN_REQUIRED")
-                                                            || code.contains("ANTI_BOT")
-                                                        {
-                                                            "Node爬虫获取失败".to_string()
-                                                        } else {
-                                                            format!("sidecar_error({code})")
-                                                        };
-                                                        output_row = output_row_from_match(
-                                                            &resolved_row,
-                                                            MatchSummary::NoMatch,
-                                                            status,
-                                                            format_elapsed_text(elapsed_millis(
-                                                                compare_started_at.elapsed(),
-                                                            )),
-                                                        );
-                                                    }
-                                                }
-                                            }
-                                            (Err(error), _) | (_, Err(error)) => {
-                                                output_row = output_row_from_match(
+                                        output_row = match summary.clone() {
+                                            MatchSummary::Cheapest(cheapest) => {
+                                                output_row_from_match(
                                                     &resolved_row,
-                                                    MatchSummary::NoMatch,
-                                                    format!("搜索图编码失败: {error}"),
-                                                    format_elapsed_text(elapsed_millis(
-                                                        compare_started_at.elapsed(),
-                                                    )),
-                                                );
+                                                    MatchSummary::Cheapest(cheapest),
+                                                    resolved_recall_mode.success_status(),
+                                                    elapsed,
+                                                )
                                             }
+                                            MatchSummary::NoMatch => output_row_from_match(
+                                                &resolved_row,
+                                                MatchSummary::NoMatch,
+                                                no_match_status(no_match_reason.as_ref())
+                                                    .to_string(),
+                                                elapsed,
+                                            ),
+                                            MatchSummary::MatchedButPriceUnavailable {
+                                                total_matches,
+                                            } => output_row_from_match(
+                                                &resolved_row,
+                                                MatchSummary::MatchedButPriceUnavailable {
+                                                    total_matches,
+                                                },
+                                                "命中同款但价格不可解析".to_string(),
+                                                elapsed,
+                                            ),
+                                        };
+
+                                        if should_write_diagnostics(
+                                            &summary,
+                                            no_match_reason.as_ref(),
+                                        ) {
+                                            pending_diagnostics =
+                                                Some(PendingDiagnosticsJob {
+                                                    row: resolved_row.clone(),
+                                                    status: output_row.status.clone(),
+                                                    search_plan: None,
+                                                    search_images: None,
+                                                    source_image_path: Some(source_image_path.clone()),
+                                                    diagnostics: diagnostics.clone(),
+                                                    used_fallback_image: false,
+                                                    no_match_reason: no_match_reason.clone(),
+                                                    row_stage_timings: row_stage_timings.clone(),
+                                                    detail_pricing_diagnostics: None,
+                                                    preflight_error: None,
+                                                });
                                         }
                                     }
                                     Err(error) => {
-                                        row_stage_timings.search_image_render_ms =
-                                            Some(elapsed_millis(
-                                                render_search_images_started_at.elapsed(),
-                                            ));
+                                        let status = if error.message.contains("大模型API") {
+                                            format!("大模型API异常: {}", error.message)
+                                        } else {
+                                            format!("AI复核失败: {}", error.message)
+                                        };
                                         output_row = output_row_from_match(
                                             &resolved_row,
                                             MatchSummary::NoMatch,
-                                            format!("搜索图生成失败: {error}"),
+                                            status,
                                             format_elapsed_text(elapsed_millis(
                                                 compare_started_at.elapsed(),
                                             )),
                                         );
+                                        pending_diagnostics = Some(PendingDiagnosticsJob {
+                                            row: resolved_row.clone(),
+                                            status: output_row.status.clone(),
+                                            search_plan: None,
+                                            search_images: None,
+                                            source_image_path: Some(source_image_path.clone()),
+                                            diagnostics: error.diagnostics,
+                                            used_fallback_image: false,
+                                            no_match_reason: None,
+                                            row_stage_timings: row_stage_timings.clone(),
+                                            detail_pricing_diagnostics: None,
+                                            preflight_error: None,
+                                        });
                                     }
                                 }
                             }
-                            Err(error) => {
-                                row_stage_timings.search_plan_ms =
-                                    Some(elapsed_millis(search_plan_started_at.elapsed()));
+                            Err(code) => {
+                                if code == CODE_ANTI_BOT_CHALLENGE {
+                                    GLOBAL_RECOVERY_GATE.pause();
+                                    emit_blocking_alert_if_needed(sink, &code)?;
+                                    return Err(code);
+                                }
+                                if code == CODE_CHROME_NOT_FOUND {
+                                    emit_blocking_alert_if_needed(
+                                        sink,
+                                        CODE_CHROME_NOT_FOUND,
+                                    )?;
+                                    return Err(CODE_CHROME_NOT_FOUND.to_string());
+                                }
+
+                                let status = if code.contains("sidecar")
+                                    || code.contains("LOGIN_REQUIRED")
+                                    || code.contains("ANTI_BOT")
+                                {
+                                    "Node爬虫获取失败".to_string()
+                                } else {
+                                    format!("sidecar_error({code})")
+                                };
                                 output_row = output_row_from_match(
                                     &resolved_row,
                                     MatchSummary::NoMatch,
-                                    format!("搜索图生成失败: {error}"),
+                                    status,
                                     format_elapsed_text(elapsed_millis(
                                         compare_started_at.elapsed(),
                                     )),
@@ -2711,7 +3115,7 @@ where
                         output_row = output_row_from_match(
                             &resolved_row,
                             MatchSummary::NoMatch,
-                            format!("搜索图生成失败: {error}"),
+                            format!("源图准备失败: {error}"),
                             format_elapsed_text(elapsed_millis(compare_started_at.elapsed())),
                         );
                     }
@@ -2720,6 +3124,58 @@ where
 
             output_row.original_image_url = original_image_url;
             output_row.original_image_bytes = original_image_bytes;
+            if output_row.item_url.is_some()
+                && output_row.price.is_some()
+                && output_row.matched_image_url.is_some()
+                && !resolved_row.ozon_name.trim().is_empty()
+            {
+                match apply_1688_detail_pricing(&client, &resolved_row, &mut output_row) {
+                    Ok(Some(outcome)) => {
+                        detail_pricing_diagnostics = outcome.diagnostics.clone();
+                        emit_event(
+                            sink,
+                            EVENT_LOG,
+                            &LogEvent {
+                                level: "info".to_string(),
+                                message: outcome.log_message,
+                            },
+                        )?;
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        detail_pricing_diagnostics = error.diagnostics.clone();
+                        output_row.price = None;
+                        output_row.status =
+                            map_detail_pricing_failure_status(error.diagnostics.as_ref());
+                        output_row.ai_analysis_conclusion = Some(output_row.status.clone());
+                        emit_event(
+                            sink,
+                            EVENT_LOG,
+                            &LogEvent {
+                                level: "warn".to_string(),
+                                message: format!(
+                                    "1688 详情页定价失败，将保留匹配结果但不写价格: sku={} item_url={:?} matched_image={:?} variant={:?} error={} detail_diag={}",
+                                    resolved_row.sku,
+                                    output_row.item_url,
+                                    output_row.matched_image_url,
+                                    output_row.matched_variant_label,
+                                    error.message,
+                                    serialize_detail_pricing_diagnostics(
+                                        error.diagnostics.as_ref()
+                                    )
+                                ),
+                            },
+                        )?;
+                    }
+                }
+            }
+            output_row.matched_image_bytes = output_row
+                .matched_image_url
+                .as_deref()
+                .and_then(|image_url| {
+                    resolve_matched_image_bytes(&client, image_url, &mut matched_image_cache)
+                });
+            output_row.recall_mode = recall_mode.map(RecallMode::as_event_value);
             emit_final_row_result_event(sink, &output_row)?;
             if has_stage_timing_data(&row_stage_timings) {
                 emit_event(
@@ -2733,6 +3189,32 @@ where
             }
 
             output_rows.push(output_row);
+
+            if pending_diagnostics.is_none() {
+                if let (Some(source_image_path), Some(detail_pricing_diagnostics)) = (
+                    last_source_image_path.clone(),
+                    detail_pricing_diagnostics.clone(),
+                ) {
+                    pending_diagnostics = Some(PendingDiagnosticsJob {
+                        row: resolved_row.clone(),
+                        status: output_rows
+                            .last()
+                            .map(|row| row.status.clone())
+                            .unwrap_or_else(|| "UNKNOWN".to_string()),
+                        search_plan: None,
+                        search_images: None,
+                        source_image_path: Some(source_image_path),
+                        diagnostics: OrchestrationDiagnostics::default(),
+                        used_fallback_image: false,
+                        no_match_reason: None,
+                        row_stage_timings: row_stage_timings.clone(),
+                        detail_pricing_diagnostics: Some(detail_pricing_diagnostics),
+                        preflight_error: None,
+                    });
+                }
+            } else if let Some(job) = pending_diagnostics.as_mut() {
+                job.detail_pricing_diagnostics = detail_pricing_diagnostics.clone();
+            }
 
             emit_event(
                 sink,
@@ -2749,13 +3231,15 @@ where
                     let result = session.save_row_bundle(
                         &job.row,
                         &job.status,
-                        &job.search_plan,
-                        &job.search_images,
-                        &job.source_image_path,
+                        job.search_plan.as_ref(),
+                        job.search_images.as_ref(),
+                        job.source_image_path.as_deref(),
                         &job.diagnostics,
                         job.used_fallback_image,
                         job.no_match_reason.as_ref(),
                         &job.row_stage_timings,
+                        job.detail_pricing_diagnostics.as_ref(),
+                        job.preflight_error.as_deref(),
                     );
                     (result, elapsed_millis(diagnostics_started_at.elapsed()))
                 }));
@@ -2770,7 +3254,18 @@ where
             false,
         )?;
         output_rows.sort_by_key(|row| row.row_index);
-        write_result_workbook(&result_path, &task_workbook.headers, &output_rows, &client)?;
+        let export_warnings =
+            write_result_workbook(&result_path, &task_workbook.headers, &output_rows, &client)?;
+        for warning in export_warnings {
+            emit_event(
+                sink,
+                EVENT_LOG,
+                &LogEvent {
+                    level: "warn".to_string(),
+                    message: warning,
+                },
+            )?;
+        }
 
         for handle in diagnostics_handles {
             match handle.join() {
@@ -3089,6 +3584,56 @@ fn wait_for_sidecar_ready(client: &Client, timeout: Duration) -> Result<(), Stri
     Err("自动启动 sidecar 超时，请检查 engine 二进制是否可执行。".to_string())
 }
 
+#[cfg(not(target_os = "windows"))]
+fn parse_stale_sidecar_pids(ps_output: &str, binary: &Path) -> Vec<u32> {
+    let target = binary.to_string_lossy();
+    ps_output
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+            let mut parts = trimmed.split_whitespace();
+            let pid = parts.next()?.parse::<u32>().ok()?;
+            let ppid = parts.next()?.parse::<u32>().ok()?;
+            let command = parts.collect::<Vec<_>>().join(" ");
+            if ppid != 1 {
+                return None;
+            }
+            if !command.contains(target.as_ref()) {
+                return None;
+            }
+            Some(pid)
+        })
+        .collect()
+}
+
+#[cfg(not(target_os = "windows"))]
+fn cleanup_stale_sidecar_processes(binary: &Path) -> Result<(), String> {
+    let output = Command::new("ps")
+        .args(["-axo", "pid,ppid,command"])
+        .output()
+        .map_err(|e| format!("list sidecar processes failed: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "list sidecar processes exited with status {}",
+            output.status
+        ));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for pid in parse_stale_sidecar_pids(&stdout, binary) {
+        let _ = Command::new("kill").arg(pid.to_string()).status();
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn cleanup_stale_sidecar_processes(_binary: &Path) -> Result<(), String> {
+    Ok(())
+}
+
 fn ensure_sidecar_running(
     app: &tauri::AppHandle,
     settings: Option<&AppSettings>,
@@ -3122,6 +3667,7 @@ fn ensure_sidecar_running(
     }
 
     let binary = resolve_sidecar_executable(app)?;
+    let _ = cleanup_stale_sidecar_processes(&binary);
     let runtime_dir = resolve_sidecar_runtime_dir(app)?;
     let profile_dir = resolve_sidecar_profile_dir(app)?;
     let mut cmd = Command::new(&binary);
@@ -3391,6 +3937,7 @@ mod tests {
             excel_row_index: 2,
             ozon_url: "https://www.ozon.ru/product/3570411011".to_string(),
             ozon_name: String::new(),
+            ozon_spec_profile: OzonSpecProfile::default(),
             sku: "SKU-EMBEDDED-UNAVAILABLE".to_string(),
             original_cells: vec![
                 "https://www.ozon.ru/product/3570411011".to_string(),
@@ -3429,5 +3976,100 @@ mod tests {
             prepared.finalized_rows[0].status,
             "Ozon商品已下架或不可访问"
         );
+        assert_eq!(prepared.finalized_diagnostics_jobs.len(), 1);
+        assert!(
+            prepared.finalized_diagnostics_jobs[0]
+                .preflight_error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Unavailable"),
+            "raw preflight failure should be retained for diagnostics"
+        );
+    }
+
+    #[test]
+    fn save_row_bundle_without_source_image_persists_preflight_error() {
+        let row_root = std::env::temp_dir().join(format!(
+            "desktop-app-preflight-diagnostics-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time should be monotonic")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&row_root).expect("create diagnostics root");
+        let session = TaskDiagnosticsSession {
+            root_dir: row_root.clone(),
+        };
+        let row = TaskRow {
+            excel_row_index: 2,
+            ozon_url: "https://www.ozon.ru/product/3577631265".to_string(),
+            ozon_name: "sample".to_string(),
+            ozon_spec_profile: OzonSpecProfile::default(),
+            sku: "3577631265".to_string(),
+            original_cells: Vec::new(),
+            image_bytes: None,
+        };
+
+        let row_dir = session
+            .save_row_bundle(
+                &row,
+                "Ozon主图抓取失败",
+                None,
+                None,
+                None,
+                &OrchestrationDiagnostics::default(),
+                false,
+                None,
+                &RowStageTimings::default(),
+                None,
+                Some("FetchFailed(\"fetch image failed: timeout\")"),
+            )
+            .expect("save preflight diagnostics");
+
+        let manifest =
+            std::fs::read_to_string(row_dir.join("manifest.json")).expect("read manifest");
+        assert!(manifest.contains("Ozon主图抓取失败"));
+        assert!(manifest.contains("fetch image failed: timeout"));
+        assert!(
+            !row_dir.join("source_image.png").exists() && !row_dir.join("source_image.jpg").exists()
+        );
+
+        let _ = std::fs::remove_dir_all(&row_root);
+    }
+
+    #[test]
+    fn choose_sidecar_detail_pricing_error_message_prefers_raw_error_text() {
+        assert_eq!(
+            choose_sidecar_detail_pricing_error_message(
+                Some("[DETAIL_PRICE_NOT_REFRESHED] stale".to_string()),
+                Some("UNKNOWN_SIDECAR_DETAIL_PRICING_ERROR".to_string()),
+                || "fallback".to_string(),
+            ),
+            "[DETAIL_PRICE_NOT_REFRESHED] stale (UNKNOWN_SIDECAR_DETAIL_PRICING_ERROR)"
+        );
+        assert_eq!(
+            choose_sidecar_detail_pricing_error_message(
+                None,
+                Some("ONLY_CODE".to_string()),
+                || "fallback".to_string(),
+            ),
+            "ONLY_CODE"
+        );
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn parse_stale_sidecar_pids_only_matches_orphaned_same_binary_processes() {
+        let binary = PathBuf::from(
+            "/Users/jiaoyumin/workspace/ozon_toolkit/desktop_app/src-tauri/binaries/engine-aarch64-apple-darwin",
+        );
+        let output = r#"
+41001 1 /Users/jiaoyumin/workspace/ozon_toolkit/desktop_app/src-tauri/binaries/engine-aarch64-apple-darwin
+41002 45704 /Users/jiaoyumin/workspace/ozon_toolkit/desktop_app/src-tauri/binaries/engine-aarch64-apple-darwin
+41003 1 /tmp/other-engine-aarch64-apple-darwin
+"#;
+
+        assert_eq!(parse_stale_sidecar_pids(output, &binary), vec![41001]);
     }
 }

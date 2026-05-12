@@ -64,17 +64,33 @@ pub struct RecordedVlmCall {
     pub trace: VlmCallTrace,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordedVlmError {
+    pub pass_label: String,
+    pub stage: VlmCallStage,
+    pub chunk_index: usize,
+    pub error_message: String,
+    pub candidates: Vec<Candidate>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct OrchestrationDiagnostics {
     pub primary_candidates: Vec<Candidate>,
     pub fallback_candidates: Vec<Candidate>,
     pub vlm_calls: Vec<RecordedVlmCall>,
+    pub vlm_errors: Vec<RecordedVlmError>,
     pub screening_candidate_count: usize,
     pub screening_chunk_count: usize,
     pub screening_elapsed_ms: u64,
     pub final_review_candidate_count: usize,
     pub final_review_batch_count: usize,
     pub final_review_elapsed_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrchestrationFailure {
+    pub message: String,
+    pub diagnostics: OrchestrationDiagnostics,
 }
 
 pub fn orchestrate_match<F, V>(
@@ -259,7 +275,15 @@ where
                     confirmed_matches.extend(collect_matched_candidates(candidates, &normalized));
                 }
             }
-            Err(_) => {}
+            Err(error) => {
+                diagnostics.vlm_errors.push(RecordedVlmError {
+                    pass_label: pass_label.to_string(),
+                    stage: VlmCallStage::FinalReview,
+                    chunk_index: review_index + 1,
+                    error_message: error,
+                    candidates: candidates.to_vec(),
+                });
+            }
         }
     }
     diagnostics.final_review_elapsed_ms += elapsed_millis(final_review_started_at.elapsed());
@@ -317,6 +341,47 @@ where
         "primary",
     )
     .map(|result| result.summary)
+}
+
+pub fn process_candidates_with_diagnostics<V>(
+    vlm: &V,
+    search_reference_image_base64: &str,
+    auxiliary_reference_image_base64: Option<&str>,
+    candidates: Vec<Candidate>,
+    ozon_name_opt: Option<&str>,
+    pass_label: &str,
+) -> Result<
+    (MatchSummary, OrchestrationDiagnostics, Option<NoMatchReason>),
+    OrchestrationFailure,
+>
+where
+    V: VlmClient,
+{
+    let mut diagnostics = OrchestrationDiagnostics::default();
+    diagnostics.primary_candidates = candidates.clone();
+    let result = process_candidates_detailed(
+        vlm,
+        search_reference_image_base64,
+        auxiliary_reference_image_base64,
+        candidates,
+        ozon_name_opt,
+        &mut diagnostics,
+        pass_label,
+    )
+    .map_err(|message| OrchestrationFailure {
+        message,
+        diagnostics: diagnostics.clone(),
+    })?;
+    let no_match_reason = matches!(result.summary, MatchSummary::NoMatch).then(|| {
+        if result.diagnostics.final_review_rejected {
+            NoMatchReason::FinalReviewRejected
+        } else if result.diagnostics.had_candidates {
+            NoMatchReason::InitialScreenNoMatch
+        } else {
+            NoMatchReason::NoCandidates
+        }
+    });
+    Ok((result.summary, diagnostics, no_match_reason))
 }
 
 fn process_candidates_detailed<V>(
@@ -380,6 +445,12 @@ where
     diagnostics.screening_elapsed_ms += elapsed_millis(screening_started_at.elapsed());
 
     if !has_success_group {
+        if let Some(first_error) = diagnostics.vlm_errors.first() {
+            return Err(format!(
+                "大模型API调用异常/超时: {}",
+                first_error.error_message
+            ));
+        }
         return Err("大模型API调用异常/超时".to_string());
     }
 
@@ -461,7 +532,15 @@ where
                 has_success_group = true;
                 matched_candidates.extend(collect_matched_candidates(chunk, &normalized));
             }
-            Err(_) => {}
+            Err(error) => {
+                diagnostics.vlm_errors.push(RecordedVlmError {
+                    pass_label: pass_label.to_string(),
+                    stage: VlmCallStage::Screening,
+                    chunk_index: chunk_offset + chunk_index + 1,
+                    error_message: error,
+                    candidates: chunk.to_vec(),
+                });
+            }
         }
     }
 

@@ -39,17 +39,7 @@ export interface OutcomeSummaryCard {
 const STAGE_PRESENTATIONS: Record<string, StagePresentation> = {
   queued: { label: "排队中", tone: "info", emphasis: "live" },
   resolving_ozon_sku: { label: "Ozon 搜索 SKU", tone: "info", emphasis: "live" },
-  planning_search_image: { label: "生成搜索图", tone: "info", emphasis: "live" },
-  searching_1688_primary: {
-    label: "1688 首轮搜索",
-    tone: "info",
-    emphasis: "live",
-  },
-  searching_1688_fallback: {
-    label: "1688 兜底搜索",
-    tone: "warn",
-    emphasis: "live",
-  },
+  searching_1688_source_image: { label: "源图搜索中", tone: "info", emphasis: "live" },
   candidates_recalled: {
     label: "候选已召回",
     tone: "info",

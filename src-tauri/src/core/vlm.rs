@@ -15,9 +15,8 @@ use super::matcher::GRID_CANDIDATE_SIZE;
 use super::search_image::{parse_search_image_plan, SearchImagePlan};
 use super::types::Candidate;
 
-const DASHSCOPE_API_URL: &str =
-    "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions";
-const DASHSCOPE_MODEL_NAME: &str = "qwen3-vl-plus";
+const OPENAI_COMPAT_API_URL: &str = "https://api.vveai.com/v1/chat/completions";
+const OPENAI_COMPAT_MODEL_NAME: &str = "gpt-5.4-mini";
 const MAX_PARALLEL_TILE_DOWNLOADS: usize = 4;
 const DEFAULT_MAX_PARALLEL_VLM_BATCHES: usize = 3;
 
@@ -114,13 +113,13 @@ impl DashScopeVlmClient {
     pub fn new(api_key: impl Into<String>) -> Result<Self, String> {
         let api_key = api_key.into();
         if api_key.trim().is_empty() {
-            return Err("❌ 找不到 DASHSCOPE_API_KEY".to_string());
+            return Err("❌ 找不到 API_KEY".to_string());
         }
 
         let client = Client::builder()
             .timeout(Duration::from_secs(30))
             .build()
-            .map_err(|e| format!("初始化 DashScope HTTP 客户端失败: {e}"))?;
+            .map_err(|e| format!("初始化 OpenAI 兼容 HTTP 客户端失败: {e}"))?;
 
         Ok(Self {
             client,
@@ -130,8 +129,7 @@ impl DashScopeVlmClient {
     }
 
     pub fn from_env() -> Result<Self, String> {
-        let api_key =
-            env::var("DASHSCOPE_API_KEY").map_err(|_| "❌ 找不到 DASHSCOPE_API_KEY".to_string())?;
+        let api_key = env::var("DASHSCOPE_API_KEY").map_err(|_| "❌ 找不到 API_KEY".to_string())?;
         Self::new(api_key)
     }
 
@@ -400,7 +398,7 @@ fn match_candidate_grid_with_shared_cache(
         });
     };
 
-    verify_with_qwen_vl(
+    verify_with_openai_compat_vlm(
         client,
         api_key,
         references,
@@ -863,7 +861,7 @@ fn build_search_image_planning_prompts(ozon_name: &str) -> (String, String) {
     (system_prompt, user_prompt)
 }
 
-fn verify_with_qwen_vl(
+fn verify_with_openai_compat_vlm(
     client: &Client,
     api_key: &str,
     references: ReferenceImages<'_>,
@@ -894,7 +892,7 @@ fn verify_with_qwen_vl(
         "image_url": { "url": grid_base64 }
     }));
     let payload = json!({
-        "model": DASHSCOPE_MODEL_NAME,
+        "model": OPENAI_COMPAT_MODEL_NAME,
         "temperature": 0.01,
         "max_tokens": 220,
         "response_format": { "type": "json_object" },
@@ -905,7 +903,7 @@ fn verify_with_qwen_vl(
     });
 
     let response = client
-        .post(DASHSCOPE_API_URL)
+        .post(OPENAI_COMPAT_API_URL)
         .header("Authorization", format!("Bearer {api_key}"))
         .json(&payload)
         .send()
@@ -922,7 +920,7 @@ fn verify_with_qwen_vl(
 
     let body = response
         .json::<serde_json::Value>()
-        .map_err(|e| format!("parse dashscope response failed: {e}"))?;
+        .map_err(|e| format!("parse openai-compatible response failed: {e}"))?;
     let content = extract_message_content_text(&body["choices"][0]["message"]["content"]);
 
     Ok(VlmMatchResult {
@@ -967,7 +965,7 @@ fn verify_search_image_plan(
 ) -> Result<SearchImagePlan, String> {
     let (system_prompt, user_prompt) = build_search_image_planning_prompts(ozon_name);
     let payload = json!({
-        "model": DASHSCOPE_MODEL_NAME,
+        "model": OPENAI_COMPAT_MODEL_NAME,
         "temperature": 0.01,
         "max_tokens": 500,
         "response_format": { "type": "json_object" },
@@ -981,7 +979,7 @@ fn verify_search_image_plan(
     });
 
     let response = client
-        .post(DASHSCOPE_API_URL)
+        .post(OPENAI_COMPAT_API_URL)
         .header("Authorization", format!("Bearer {api_key}"))
         .json(&payload)
         .send()
@@ -998,7 +996,7 @@ fn verify_search_image_plan(
 
     let body = response
         .json::<serde_json::Value>()
-        .map_err(|e| format!("parse dashscope planner response failed: {e}"))?;
+        .map_err(|e| format!("parse openai-compatible planner response failed: {e}"))?;
     let content = body["choices"][0]["message"]["content"]
         .as_str()
         .unwrap_or_default();

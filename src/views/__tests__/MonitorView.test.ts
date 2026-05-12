@@ -14,8 +14,9 @@ describe("Monitor helpers", () => {
     appendRowResult(state, {
       row_index: 2,
       sku: "SKU-2",
-      stage: "planning_search_image",
+      stage: "searching_1688_source_image",
       status: "processing",
+      recall_mode: null,
       image_url: null,
       original_image_url: "data:image/png;base64,source-preview",
       matched_image_url: null,
@@ -29,6 +30,7 @@ describe("Monitor helpers", () => {
       sku: "SKU-2",
       stage: "completed",
       status: "processed",
+      recall_mode: "source_first_pass",
       image_url: null,
       original_image_url: "data:image/png;base64,source-preview",
       matched_image_url: "https://img.1688.com/2.jpg",
@@ -44,6 +46,7 @@ describe("Monitor helpers", () => {
     expect(state.rows[0]?.price).toBe("¥5.20");
     expect(state.rows[0]?.elapsedText).toBe("12.3s");
     expect(state.rows[0]?.isFinal).toBe(true);
+    expect(Reflect.get(state.rows[0] as object, "recallMode")).toBe("source_first_pass");
     expect(Reflect.get(state.rows[0] as object, "originalImageUrl")).toBe(
       "data:image/png;base64,source-preview",
     );
@@ -59,6 +62,7 @@ describe("Monitor helpers", () => {
       sku: "SKU-3",
       stage: "queued",
       status: "queued",
+      recall_mode: null,
       image_url: null,
       original_image_url: null,
       matched_image_url: null,
@@ -72,6 +76,7 @@ describe("Monitor helpers", () => {
       sku: "SKU-1",
       stage: "queued",
       status: "queued",
+      recall_mode: null,
       image_url: null,
       original_image_url: null,
       matched_image_url: null,
@@ -89,8 +94,9 @@ describe("Monitor helpers", () => {
     appendRowResult(state, {
       row_index: 1,
       sku: "SKU-1",
-      stage: "planning_search_image",
+      stage: "searching_1688_source_image",
       status: "processing",
+      recall_mode: null,
       image_url: null,
       original_image_url: "data:image/png;base64,source-preview",
       matched_image_url: null,
@@ -103,7 +109,8 @@ describe("Monitor helpers", () => {
       row_index: 1,
       sku: "SKU-1",
       stage: "screening_candidates",
-      status: "AI复核中",
+      status: "整图纠偏后已召回 8 个候选，AI复核中",
+      recall_mode: "full_crop_second_pass",
       image_url: null,
       original_image_url: null,
       matched_image_url: null,
@@ -116,6 +123,7 @@ describe("Monitor helpers", () => {
     expect(Reflect.get(state.rows[0] as object, "originalImageUrl")).toBe(
       "data:image/png;base64,source-preview",
     );
+    expect(Reflect.get(state.rows[0] as object, "recallMode")).toBe("full_crop_second_pass");
     expect(state.rows[0]?.elapsedText).toBe("4.2s");
   });
 
@@ -133,6 +141,7 @@ describe("Monitor helpers", () => {
       sku: "SKU-1",
       stage: "completed",
       status: "processed",
+      recall_mode: "source_first_pass",
       image_url: null,
       original_image_url: "data:image/png;base64,source-preview",
       matched_image_url: "https://img.1688.com/1.jpg",
